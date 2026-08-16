@@ -106,8 +106,7 @@ Options: `-d/--interval SECONDS` (default 300), `-l/--label LABEL`, `--docker-so
 
 ## Relationship to portical
 
-Tidewaiter is the sibling of [**portical**](https://github.com/danielbodart/portical) and shares its spine — a label-driven reconcile loop over the Docker Engine API in Bun/TypeScript, with a pure decision core wrapped by a thin impure shell and an in-memory fake for every I/O seam. It was built by lifting and adapting portical's `http.ts` (the `Handler` seam), `docker.ts`, the daemon loop, CI and versioning; the doc-comments throughout `src/` note where a pattern came from. That harvesting is done, so Tidewaiter no longer vendors portical — it stands on its own.
-
+Tidewaiter is the sibling of [**portical**](https://github.com/danielbodart/portical) and shares its spine — a label-driven reconcile loop over the Docker Engine API in Bun/TypeScript
 ## License
 
 Apache-2.0.
