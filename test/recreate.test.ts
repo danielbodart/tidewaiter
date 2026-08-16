@@ -19,7 +19,7 @@ describe("toCreatePayload", () => {
     expect(payload.Env).toEqual(["PATH=/usr/local/sbin:/usr/local/bin", "NGINX_VERSION=1.27"]);
     expect(payload.Cmd).toEqual(["nginx", "-g", "daemon off;"]);
     expect(payload.Entrypoint).toEqual(["/docker-entrypoint.sh"]);
-    expect((payload.Labels as Record<string, string>)["tidewaiter.enable"]).toBe("true");
+    expect((payload.Labels as Record<string, string>)["tidewaiter.autoupdate"]).toBe("registry");
   });
 
   test("puts bind mounts in Binds with the read-only flag", () => {

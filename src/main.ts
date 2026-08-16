@@ -28,10 +28,12 @@ Environment:
   DOCKER_SOCKET           Same as --docker-socket
   TIDEWAITER_INTERVAL     Same as --interval
 
-Opt a container in with 'tidewaiter.enable=true'. Tidewaiter compares the
-registry digest for its tag against the running image, and when a newer one
-exists it waits until the container is idle (no live network flows), pulls,
-recreates, health-checks, and rolls back if the new image is unhealthy.
+Opt a container in with 'tidewaiter.autoupdate=registry' (or =local). Tidewaiter
+compares the image the container runs against what its tag should resolve to -
+the registry's digest, or the locally-stored image for 'local' - and when they
+differ it waits until the container is idle (no live network flows), pulls (for
+registry), recreates, health-checks, and rolls back if the new image is
+unhealthy. A container with no autoupdate label is never touched.
 `;
 
 interface Parsed {
@@ -126,21 +128,29 @@ export async function main(argv: readonly string[]): Promise<number> {
     }
     for (const container of containers) {
       const { policy } = parseLabels(container.spec.labels, container.spec.published);
-      let desired = "unknown";
-      try {
-        desired = await registry.digest(container.spec.image);
-      } catch {
-        desired = "unreachable";
+      if (policy === undefined) {
+        // Has the label key but an unrecognised value - shown so a typo is visible.
+        console.log(`${container.spec.name}  ${container.spec.image}  [not a known autoupdate policy]`);
+        continue;
       }
-      // Compare like with like: the registry's manifest digest against the local
-      // image's RepoDigest (imageDigest), not inspect's config ID.
-      const current = await docker.imageDigest(container.spec.image).catch(() => undefined);
-      const state = desired === "unreachable" ? "registry unreachable"
+      // Source the desired digest the same way the daemon would for this policy.
+      let desired: string;
+      try {
+        desired = policy.autoupdate === "local"
+          ? (await docker.imageDigest(container.spec.image)) ?? "no local image"
+          : await registry.digest(container.spec.image);
+      } catch {
+        desired = policy.autoupdate === "local" ? "no local image" : "registry unreachable";
+      }
+      // Compare like with like: manifest digest vs the running image's RepoDigest
+      // (by its config id), not inspect's config id directly.
+      const current = await docker.imageDigest(container.imageId).catch(() => undefined);
+      const state = desired.startsWith("no ") || desired.endsWith("unreachable") ? desired
         : desired === current ? "up to date"
         : "update available";
       console.log(
         `${container.spec.name}  ${container.spec.image}  [${state}]  ` +
-          `detector=${policy.detector} health=${policy.health} idle-samples=${policy.idleSamples}`,
+          `autoupdate=${policy.autoupdate} detector=${policy.detector} health=${policy.health} idle-samples=${policy.idleSamples}`,
       );
     }
     return 0;

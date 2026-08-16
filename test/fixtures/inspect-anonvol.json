@@ -6,7 +6,7 @@
   "Config": {
     "Image": "legacy:latest",
     "Env": [],
-    "Labels": { "tidewaiter.enable": "true" }
+    "Labels": { "tidewaiter.autoupdate": "registry" }
   },
   "HostConfig": {
     "Binds": null,

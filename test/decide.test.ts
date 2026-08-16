@@ -1,7 +1,9 @@
 import { describe, expect, test } from "bun:test";
 import { decide, type ContainerState, type Snapshot } from "../src/decide.ts";
-import { DEFAULT_POLICY, type ContainerPolicy } from "../src/labels.ts";
+import { POLICY_DEFAULTS, type ContainerPolicy } from "../src/labels.ts";
 import { runningContainer } from "./fakes/docker.ts";
+
+const BASE_POLICY: ContainerPolicy = { ...POLICY_DEFAULTS, autoupdate: "registry", idleSamples: 3 };
 
 function snapshot(overrides: Partial<Snapshot> = {}, policy: Partial<ContainerPolicy> = {}): Snapshot {
   return {
@@ -9,7 +11,7 @@ function snapshot(overrides: Partial<Snapshot> = {}, policy: Partial<ContainerPo
     // The manifest digest the container is on now - a real digest in the same
     // namespace as `desired`, so the two genuinely compare.
     currentDigest: "sha256:old",
-    policy: { ...DEFAULT_POLICY, enable: true, idleSamples: 3, ...policy },
+    policy: { ...BASE_POLICY, ...policy },
     desired: { container: "app", ref: "app:latest", digest: "sha256:new" },
     inUse: false,
     idleStreak: 3,

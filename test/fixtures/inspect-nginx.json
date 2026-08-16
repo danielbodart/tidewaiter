@@ -8,7 +8,7 @@
     "Env": ["PATH=/usr/local/sbin:/usr/local/bin", "NGINX_VERSION=1.27"],
     "Cmd": ["nginx", "-g", "daemon off;"],
     "Entrypoint": ["/docker-entrypoint.sh"],
-    "Labels": { "tidewaiter.enable": "true", "com.docker.compose.project": "site" },
+    "Labels": { "tidewaiter.autoupdate": "registry", "com.docker.compose.project": "site" },
     "ExposedPorts": { "80/tcp": {} },
     "WorkingDir": "",
     "StopSignal": "SIGQUIT",

@@ -3,9 +3,13 @@ import { PROTOCOLS, type Protocol, type PublishedPort } from "./model.ts";
 /**
  * The labels Tidewaiter reads off a container, mirroring portical's
  * `portical.upnp.*` convention so the two read as a family.
+ *
+ * `AUTOUPDATE` is the opt-in, Podman-style: its *value* is the update policy,
+ * and a container is managed only if it carries the label with a value we
+ * recognise. There is no separate boolean - presence of a valid policy is the
+ * opt-in, absence (or an unrecognised value) means "leave it alone entirely".
  */
-export const ENABLE = "tidewaiter.enable";
-export const POLICY = "tidewaiter.policy";
+export const AUTOUPDATE = "tidewaiter.autoupdate";
 export const DETECTOR = "tidewaiter.detector";
 export const PORTS = "tidewaiter.ports";
 export const IDLE_SAMPLES = "tidewaiter.idle-samples";
@@ -14,24 +18,30 @@ export const HEALTH_TIMEOUT = "tidewaiter.health-timeout";
 export const GRACE = "tidewaiter.grace";
 export const KEEP_IMAGES = "tidewaiter.keep-images";
 
+/**
+ * The update policies, mirroring Podman's `io.containers.autoupdate`:
+ *   registry - compare the tag against the registry, pull if the digest moved.
+ *   local    - compare the tag against the locally-stored image, no registry
+ *              contact; recreate if a build/pull changed it under us.
+ */
+export type PolicyName = "registry" | "local";
 export type DetectorName = "conntrack" | "tcp" | "netio" | "none";
 export type HealthName = "docker" | "port" | "uptime";
-export type PolicyName = "registry";
 
+const POLICY_NAMES: readonly PolicyName[] = ["registry", "local"];
 const DETECTOR_NAMES: readonly DetectorName[] = ["conntrack", "tcp", "netio", "none"];
 const HEALTH_NAMES: readonly HealthName[] = ["docker", "port", "uptime"];
 
 /**
  * A container's resolved Tidewaiter policy.
  *
- * Every field has a default, so an opted-in container with only
- * `tidewaiter.enable=true` gets a complete, sensible policy. `ports` is left
- * undefined to mean "use whatever the container publishes"; a bad override is
- * reported as a warning and dropped rather than silently narrowing the set.
+ * Only ever built for a container that is validly opted in, so `autoupdate` is
+ * always a real policy, never absent. The rest have defaults, so an opted-in
+ * container with only `tidewaiter.autoupdate=registry` gets a complete, sensible
+ * policy. `ports` undefined means "use whatever the container publishes".
  */
 export interface ContainerPolicy {
-  readonly enable: boolean;
-  readonly policy: PolicyName;
+  readonly autoupdate: PolicyName;
   readonly detector: DetectorName;
   /** Undefined means "every port the container publishes". */
   readonly ports?: readonly PublishedPort[];
@@ -43,32 +53,43 @@ export interface ContainerPolicy {
   readonly keepImages: number;
 }
 
-export const DEFAULT_POLICY: ContainerPolicy = {
-  enable: false,
-  policy: "registry",
+/** The defaults every field but `autoupdate` falls back to. */
+export const POLICY_DEFAULTS = {
   detector: "conntrack",
   idleSamples: 3,
   health: "port",
   healthTimeoutSeconds: 120,
   keepImages: 1,
-};
+} as const satisfies Omit<ContainerPolicy, "autoupdate" | "ports" | "graceSeconds">;
 
 export interface ParsedPolicy {
-  readonly policy: ContainerPolicy;
+  /**
+   * The resolved policy, or undefined when the container is not opted in.
+   *
+   * Undefined is the important state: no `tidewaiter.autoupdate` label, or one
+   * whose value is not a known policy. The daemon leaves such a container
+   * completely alone - it is never inspected for activity, never updated.
+   */
+  readonly policy?: ContainerPolicy;
   readonly warnings: readonly string[];
 }
 
 /**
  * Read a container's labels into a policy, collecting problems as data.
  *
- * Warnings are returned rather than thrown, following portical's `parseLabel`:
- * one misconfigured label must not stop the container being managed with the
- * defaults, nor take the daemon down. The caller logs them.
+ * Opt-in is decided first and decisively: without a `tidewaiter.autoupdate`
+ * label whose value is a known policy, this returns `{ policy: undefined }` and
+ * the container is not managed at all. An unrecognised value is a warning (a
+ * typo like `autoupdate=registy` should say so, not silently do nothing).
+ *
+ * Once opted in, the rest of the labels are parsed with defaults, warnings
+ * returned rather than thrown, following portical's `parseLabel`: one
+ * misconfigured secondary label must not stop the container being managed with
+ * the default for that setting.
  *
  * `published` is the container's actual published ports, needed to validate a
  * `tidewaiter.ports` override against reality - an override naming a port the
- * container does not publish is a warning, and (see the detector) is treated as
- * "cannot tell", never as "idle".
+ * container does not publish is a warning and dropped.
  */
 export function parseLabels(
   labels: Readonly<Record<string, string>>,
@@ -76,17 +97,30 @@ export function parseLabels(
 ): ParsedPolicy {
   const warnings: string[] = [];
 
-  const enable = boolean(labels[ENABLE], DEFAULT_POLICY.enable, ENABLE, warnings);
+  const autoupdateValue = labels[AUTOUPDATE];
+  if (autoupdateValue === undefined) {
+    // No opt-in label at all: not ours to manage. Silent - this is the common
+    // case for the vast majority of containers on a host.
+    return { policy: undefined, warnings };
+  }
+  const autoupdate = POLICY_NAMES.find((name) => name === autoupdateValue.trim().toLowerCase());
+  if (autoupdate === undefined) {
+    // Opted in by the key, but the value is not a policy we know. Warn and leave
+    // it alone rather than guess - never update on an ambiguous instruction.
+    return {
+      policy: undefined,
+      warnings: [`${AUTOUPDATE}: '${autoupdateValue}' is not a known policy (${POLICY_NAMES.join(", ")}); ignoring this container`],
+    };
+  }
 
-  const policy = oneOf(labels[POLICY], ["registry"], DEFAULT_POLICY.policy, POLICY, warnings);
-  const detector = oneOf(labels[DETECTOR], DETECTOR_NAMES, DEFAULT_POLICY.detector, DETECTOR, warnings);
-  const health = oneOf(labels[HEALTH], HEALTH_NAMES, DEFAULT_POLICY.health, HEALTH, warnings);
+  const detector = oneOf(labels[DETECTOR], DETECTOR_NAMES, POLICY_DEFAULTS.detector, DETECTOR, warnings);
+  const health = oneOf(labels[HEALTH], HEALTH_NAMES, POLICY_DEFAULTS.health, HEALTH, warnings);
 
-  const idleSamples = positiveInt(labels[IDLE_SAMPLES], DEFAULT_POLICY.idleSamples, IDLE_SAMPLES, warnings);
+  const idleSamples = positiveInt(labels[IDLE_SAMPLES], POLICY_DEFAULTS.idleSamples, IDLE_SAMPLES, warnings);
   const healthTimeoutSeconds = positiveInt(
-    labels[HEALTH_TIMEOUT], DEFAULT_POLICY.healthTimeoutSeconds, HEALTH_TIMEOUT, warnings,
+    labels[HEALTH_TIMEOUT], POLICY_DEFAULTS.healthTimeoutSeconds, HEALTH_TIMEOUT, warnings,
   );
-  const keepImages = nonNegativeInt(labels[KEEP_IMAGES], DEFAULT_POLICY.keepImages, KEEP_IMAGES, warnings);
+  const keepImages = nonNegativeInt(labels[KEEP_IMAGES], POLICY_DEFAULTS.keepImages, KEEP_IMAGES, warnings);
 
   const graceSeconds = labels[GRACE] === undefined
     ? undefined
@@ -98,7 +132,7 @@ export function parseLabels(
 
   return {
     policy: {
-      enable, policy, detector, ports, idleSamples, health, healthTimeoutSeconds, graceSeconds, keepImages,
+      autoupdate, detector, ports, idleSamples, health, healthTimeoutSeconds, graceSeconds, keepImages,
     },
     warnings,
   };
@@ -163,15 +197,6 @@ function dedupePorts(ports: readonly PublishedPort[]): PublishedPort[] {
     if (!byKey.has(key)) byKey.set(key, port);
   }
   return [...byKey.values()];
-}
-
-function boolean(value: string | undefined, fallback: boolean, name: string, warnings: string[]): boolean {
-  if (value === undefined) return fallback;
-  const lower = value.trim().toLowerCase();
-  if (lower === "true" || lower === "1" || lower === "yes") return true;
-  if (lower === "false" || lower === "0" || lower === "no") return false;
-  warnings.push(`${name}: '${value}' is not a boolean; using ${fallback}`);
-  return fallback;
 }
 
 function oneOf<T extends string>(

@@ -55,7 +55,7 @@ function opted(
     runningContainer(name, {
       imageId,
       health,
-      spec: { image, labels: { "tidewaiter.enable": "true", ...labels }, published: [port(8080)] },
+      spec: { image, labels: { "tidewaiter.autoupdate": "registry", ...labels }, published: [port(8080)] },
     }),
   );
   registry.digests[image] = desired;
@@ -269,6 +269,52 @@ describe("an idle container with a newer image", () => {
     // pin cleared -> still idle from before, so it updates immediately.
     const actions = await daemon.once();
     expect(actions.map((a) => a.kind)).toEqual(["update"]);
+  });
+});
+
+describe("opt-in and policy", () => {
+  test("a container with an unrecognised autoupdate value is left alone", async () => {
+    const { docker, registry, daemon, log } = tidewaiter();
+    // Opted in by the key but with a typo'd value: the container is listed
+    // (the daemon filters on the key), but must not be touched.
+    opted(docker, registry, "web", "sha256:old", "sha256:new", { "tidewaiter.autoupdate": "registy" });
+
+    const actions = await daemon.once();
+
+    expect(actions.map((a) => a.kind)).toEqual(["keep"]);
+    expect(docker.pulls).toEqual([]);
+    expect(docker.creates).toEqual([]);
+    expect(log.join("\n")).toContain("not a known policy");
+  });
+
+  test("the local policy updates from the local image without contacting the registry or pulling", async () => {
+    const { docker, registry, daemon } = tidewaiter();
+    // Running config-old; the tag's LOCAL image has been rebuilt to sha256:built.
+    const imageId = "config-old";
+    docker.running.push(
+      runningContainer("web", {
+        imageId,
+        spec: {
+          image: "app:latest",
+          labels: { "tidewaiter.autoupdate": "local", "tidewaiter.health": "docker", "tidewaiter.health-timeout": "1" },
+          published: [port(8080)],
+        },
+      }),
+    );
+    docker.images[imageId] = "sha256:old";        // what the container runs
+    docker.images["app:latest"] = "sha256:built"; // what the tag resolves to locally now
+    docker.healthByName["web"] = "healthy";
+
+    await daemon.once();
+    await daemon.once();
+    const actions = await daemon.once();
+
+    expect(actions.map((a) => a.kind)).toEqual(["update"]);
+    // local never pulls and never asks the registry.
+    expect(docker.pulls).toEqual([]);
+    expect(registry.calls).toEqual([]);
+    // it still recreates onto the new local image.
+    expect(docker.creates.map((c) => c.name)).toEqual(["web"]);
   });
 });
 

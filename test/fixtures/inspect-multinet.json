@@ -8,7 +8,7 @@
     "Env": ["APP_ENV=production"],
     "Cmd": null,
     "Entrypoint": ["/app/server"],
-    "Labels": { "tidewaiter.enable": "true", "tidewaiter.health": "docker" },
+    "Labels": { "tidewaiter.autoupdate": "registry", "tidewaiter.health": "docker" },
     "ExposedPorts": { "9000/tcp": {} },
     "User": "app",
     "WorkingDir": "/app"

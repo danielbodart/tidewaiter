@@ -202,7 +202,7 @@ export function spec(name: string, overrides: Partial<ContainerSpec> = {}): Cont
     name,
     image: "app:latest",
     env: [],
-    labels: { "tidewaiter.enable": "true" },
+    labels: { "tidewaiter.autoupdate": "registry" },
     mounts: [],
     published: [],
     exposed: [],

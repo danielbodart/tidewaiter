@@ -41,7 +41,7 @@ export interface Options {
 }
 
 export const DEFAULTS: Options = {
-  label: "tidewaiter.enable",
+  label: "tidewaiter.autoupdate",
   interval: 300,
   dryRun: false,
   defaultGraceSeconds: 10,
@@ -156,16 +156,36 @@ export class Tidewaiter {
     const { policy, warnings } = parseLabels(container.spec.labels, container.spec.published);
     for (const warning of warnings) this.log(`${name}: ${warning}`);
 
+    // Not opted in (or an unrecognised autoupdate value - the warning above said
+    // so): leave it completely alone. The Docker query already filters on the
+    // label key, so reaching here with no policy means a bad value, not a
+    // missing label.
+    if (policy === undefined) {
+      return { kind: "keep", reason: "not opted in" };
+    }
+
     let previous = this.state.get(name) ?? INITIAL;
 
-    // Resolve what the tag should be now. A registry that cannot be reached is
-    // reported and the container left alone this pass - never updated on a guess.
-    let desiredDigest: Digest;
+    // What the tag should resolve to now, per the container's autoupdate policy:
+    //   registry - ask the registry for the tag's current manifest digest.
+    //   local    - read the locally-stored image for the tag; no registry
+    //              contact, so it updates when a build/pull changed it on the
+    //              host. Undefined (image gone locally) means nothing to do.
+    // Either source failing leaves the container alone this pass - never updated
+    // on a guess.
+    let desiredDigest: Digest | undefined;
     try {
-      desiredDigest = await this.registry.digest(container.spec.image);
+      desiredDigest = policy.autoupdate === "local"
+        ? await this.docker.imageDigest(container.spec.image)
+        : await this.registry.digest(container.spec.image);
     } catch (error) {
-      this.log(`${name}: could not resolve registry digest (${(error as Error).message}); leaving it alone`);
-      return { kind: "keep", reason: "registry unreachable" };
+      const source = policy.autoupdate === "local" ? "local image" : "registry";
+      this.log(`${name}: could not resolve ${source} digest (${(error as Error).message}); leaving it alone`);
+      return { kind: "keep", reason: `${source} unreachable` };
+    }
+    if (desiredDigest === undefined) {
+      // local policy and the tag is not present locally - nothing to move to.
+      return { kind: "keep", reason: "no local image for the tag to update to" };
     }
 
     // The manifest digest the container is actually running: the RepoDigest of
@@ -364,11 +384,17 @@ export class Tidewaiter {
     const newSpec = { ...spec, image: spec.image };
     const plan = planSwap(spec, newSpec, grace);
 
-    try {
-      await this.docker.pull(spec.image, this.authFor(spec.image));
-    } catch (error) {
-      this.log(`${name}: FAILED to pull ${spec.image} (${(error as Error).message}); leaving it running`);
-      return base;
+    // Only the registry policy pulls: `local` deliberately never touches the
+    // network - the newer image is already on the host (that is the whole point
+    // of the policy), so pulling would defeat it and could even fail on an
+    // air-gapped or build-on-host box.
+    if (policy.autoupdate === "registry") {
+      try {
+        await this.docker.pull(spec.image, this.authFor(spec.image));
+      } catch (error) {
+        this.log(`${name}: FAILED to pull ${spec.image} (${(error as Error).message}); leaving it running`);
+        return base;
+      }
     }
 
     // Stand up the new container, tracking progress so a failure rolls back

@@ -13,9 +13,9 @@ Watchtower is archived, Podman auto-update isn't available on Flatcar, and nothi
 
 ## How it works
 
-Once per interval, for each container labelled `tidewaiter.enable=true`:
+Once per interval, for each container opted in with `tidewaiter.autoupdate=registry` (or `=local`):
 
-1. **Compare digests.** Resolve the registry's manifest digest for the container's tag and compare it against the digest of the image the container is actually running. Equal ⇒ nothing to do.
+1. **Compare digests.** Resolve what the tag should be — the registry's manifest digest (`registry`) or the locally-stored image for the tag (`local`) — and compare it against the digest of the image the container is actually running. Equal ⇒ nothing to do.
 2. **Wait for the tide to go out.** If a newer image exists, check whether the container is idle — no live network flows to its published ports. Busy, or not yet idle for long enough ⇒ defer to the next pass. *If it can't tell, it assumes busy and defers* — a live session is never kicked to chase a version.
 3. **Swap, health-gate, commit or roll back.** When idle: pull → graceful-stop → recreate faithfully (same name, env, mounts, ports, networks, labels, restart policy, caps) → wait for healthy up to a timeout → keep it; otherwise **roll back** to the exact previous image and pin that digest out until the tag moves on.
 
@@ -44,8 +44,7 @@ What "healthy" means for the commit/rollback gate, chosen per container by `tide
 
 | Label | Meaning | Default |
 | --- | --- | --- |
-| `tidewaiter.enable` | opt this container in | `false` |
-| `tidewaiter.policy` | `registry` (digest); room for more later | `registry` |
+| `tidewaiter.autoupdate` | **the opt-in.** `registry` (compare against the registry) or `local` (compare against the locally-stored image, no network). A container is managed only if it carries this label with a known value; absence — or an unrecognised value — means it is left completely alone. | *(none — required to opt in)* |
 | `tidewaiter.detector` | `conntrack` \| `tcp` \| `netio` \| `none` | `conntrack` |
 | `tidewaiter.ports` | override which published ports count as "in use" and get health-probed | container's published ports |
 | `tidewaiter.idle-samples` | consecutive idle passes required before updating | `3` |
@@ -71,7 +70,7 @@ services:
     restart: unless-stopped
 ```
 
-Then label any container you want kept current with `tidewaiter.enable=true`. See [`docker-compose.yaml`](./docker-compose.yaml) for a worked example.
+Then opt any container in with `tidewaiter.autoupdate=registry`. See [`docker-compose.yaml`](./docker-compose.yaml) for a worked example.
 
 Private registries: Tidewaiter reads `~/.docker/config.json` for credentials and sends them both when resolving digests and when pulling.
 

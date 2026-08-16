@@ -24,6 +24,8 @@ services:
     ports:
       - '8080:80'
     labels:
-      - 'tidewaiter.enable=true'
+      # The opt-in: its value is the policy. 'registry' compares the tag against
+      # the registry; 'local' compares against the locally-stored image.
+      - 'tidewaiter.autoupdate=registry'
       # port health is the default; spelled out here for illustration.
       - 'tidewaiter.health=port'
