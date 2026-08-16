@@ -3,7 +3,7 @@
 
 # Tidewaiter
 
-**Label-driven Docker auto-updater that waits for the tide to go out.** It watches the registry for a newer image, updates a container **only when it's idle** (no live network flows), health-checks the swap, and **rolls back** on failure.
+**Docker auto-updater that waits for the tide to go out.** It watches the registry for a newer image, updates a container **only when it's idle** (no live network flows), health-checks the swap, and **rolls back** on failure.
 
 > A *tidewaiter* was a customs officer who boarded an incoming ship only once the tide allowed. This one waits for the tide of traffic to ebb before it goes aboard — and steps back the instant anyone's on.
 
