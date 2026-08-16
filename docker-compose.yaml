@@ -1,0 +1,29 @@
+services:
+
+  tidewaiter:
+    image: 'danielbodart/tidewaiter:latest'
+    container_name: tidewaiter
+    # Share the host's network namespace, where the flows the activity gate
+    # reads actually live, and where /proc/<pid>/net/* is reachable for the
+    # backup detector and the port health probe.
+    network_mode: host
+    cap_add:
+      # conntrack netlink dump - not in Docker's default capability set.
+      - NET_ADMIN
+    volumes:
+      # Read-write: Tidewaiter pulls, recreates, stops and removes containers.
+      - '/var/run/docker.sock:/var/run/docker.sock'
+    restart: unless-stopped
+
+  # An illustrative opted-in service. Tidewaiter watches nginx:latest for a new
+  # digest and, when the container is idle, pulls, recreates, health-checks the
+  # published port, and rolls back if the new image never starts listening.
+  web:
+    image: 'nginx:latest'
+    restart: unless-stopped
+    ports:
+      - '8080:80'
+    labels:
+      - 'tidewaiter.enable=true'
+      # port health is the default; spelled out here for illustration.
+      - 'tidewaiter.health=port'

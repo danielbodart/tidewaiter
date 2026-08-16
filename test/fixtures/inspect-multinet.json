@@ -1,0 +1,41 @@
+{
+  "Id": "multi789",
+  "Name": "/api",
+  "Image": "sha256:bbbb2222",
+  "State": { "Pid": 5150, "Health": { "Status": "starting" } },
+  "Config": {
+    "Image": "registry.example.com/api:2",
+    "Env": ["APP_ENV=production"],
+    "Cmd": null,
+    "Entrypoint": ["/app/server"],
+    "Labels": { "tidewaiter.enable": "true", "tidewaiter.health": "docker" },
+    "ExposedPorts": { "9000/tcp": {} },
+    "User": "app",
+    "WorkingDir": "/app"
+  },
+  "HostConfig": {
+    "Binds": null,
+    "Mounts": [
+      { "Type": "volume", "Name": "api-data", "Source": "/var/lib/docker/volumes/api-data/_data", "Destination": "/data", "RW": true }
+    ],
+    "PortBindings": {
+      "9000/tcp": [{ "HostIp": "0.0.0.0", "HostPort": "9000" }]
+    },
+    "RestartPolicy": { "Name": "always", "MaximumRetryCount": 0 },
+    "CapAdd": ["NET_ADMIN"],
+    "CapDrop": ["MKNOD"],
+    "Privileged": false,
+    "NetworkMode": "frontend",
+    "ExtraHosts": ["db:10.0.0.9"],
+    "Sysctls": { "net.core.somaxconn": "1024" }
+  },
+  "Mounts": [
+    { "Type": "volume", "Name": "api-data", "Source": "/var/lib/docker/volumes/api-data/_data", "Destination": "/data", "RW": true }
+  ],
+  "NetworkSettings": {
+    "Networks": {
+      "frontend": { "Aliases": ["api"], "IPAMConfig": null },
+      "backend": { "Aliases": ["api-internal"], "IPAMConfig": { "IPv4Address": "172.28.0.5" } }
+    }
+  }
+}

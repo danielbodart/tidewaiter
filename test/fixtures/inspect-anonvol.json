@@ -1,0 +1,28 @@
+{
+  "Id": "anon555",
+  "Name": "/legacy",
+  "Image": "sha256:cccc3333",
+  "State": { "Pid": 6000 },
+  "Config": {
+    "Image": "legacy:latest",
+    "Env": [],
+    "Labels": { "tidewaiter.enable": "true" }
+  },
+  "HostConfig": {
+    "Binds": null,
+    "PortBindings": {},
+    "NetworkMode": "bridge"
+  },
+  "Mounts": [
+    {
+      "Type": "volume",
+      "Name": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      "Source": "/var/lib/docker/volumes/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef/_data",
+      "Destination": "/var/lib/legacy",
+      "RW": true
+    }
+  ],
+  "NetworkSettings": {
+    "Networks": { "bridge": { "Aliases": null, "IPAMConfig": null } }
+  }
+}

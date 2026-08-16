@@ -1,0 +1,41 @@
+{
+  "Id": "abc123def456",
+  "Name": "/web",
+  "Image": "sha256:aaaa1111",
+  "State": { "Pid": 4242, "Health": { "Status": "healthy" } },
+  "Config": {
+    "Image": "nginx:1.27",
+    "Env": ["PATH=/usr/local/sbin:/usr/local/bin", "NGINX_VERSION=1.27"],
+    "Cmd": ["nginx", "-g", "daemon off;"],
+    "Entrypoint": ["/docker-entrypoint.sh"],
+    "Labels": { "tidewaiter.enable": "true", "com.docker.compose.project": "site" },
+    "ExposedPorts": { "80/tcp": {} },
+    "WorkingDir": "",
+    "StopSignal": "SIGQUIT",
+    "StopTimeout": 15,
+    "Healthcheck": {
+      "Test": ["CMD-SHELL", "curl -f http://localhost/ || exit 1"],
+      "Interval": 30000000000,
+      "Timeout": 3000000000,
+      "Retries": 3
+    }
+  },
+  "HostConfig": {
+    "Binds": ["/srv/site:/usr/share/nginx/html:ro"],
+    "PortBindings": {
+      "80/tcp": [{ "HostIp": "0.0.0.0", "HostPort": "8080" }, { "HostIp": "::", "HostPort": "8080" }]
+    },
+    "RestartPolicy": { "Name": "unless-stopped", "MaximumRetryCount": 0 },
+    "CapAdd": null,
+    "Privileged": false,
+    "NetworkMode": "bridge"
+  },
+  "Mounts": [
+    { "Type": "bind", "Source": "/srv/site", "Destination": "/usr/share/nginx/html", "Mode": "ro", "RW": false }
+  ],
+  "NetworkSettings": {
+    "Networks": {
+      "bridge": { "Aliases": null, "IPAMConfig": null }
+    }
+  }
+}
