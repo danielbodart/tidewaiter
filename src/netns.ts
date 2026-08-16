@@ -16,9 +16,19 @@
 /** The four socket tables a detector or probe might read. */
 export type NetTable = "tcp" | "tcp6" | "udp" | "udp6";
 
-/** The /proc path for one of a container process's netns-scoped socket tables. */
-export function procNetPath(pid: number, table: NetTable): string {
-  return `/proc/${pid}/net/${table}`;
+/**
+ * The path to one of a container process's netns-scoped socket tables.
+ *
+ * `procRoot` is normally `/proc`, but in the deployed container it is
+ * `/host/proc` - the host's /proc bind-mounted read-only. That mount is what
+ * lets the daemon reach *another* container's /proc/<pid>/net/* at all: sharing
+ * the host network namespace (network_mode: host) does NOT share the host PID
+ * namespace, so without either `pid: host` or this read-only /proc mount the
+ * daemon cannot see other containers' PIDs. The read-only mount is the smaller
+ * grant, so it is what the compose uses.
+ */
+export function procNetPath(pid: number, table: NetTable, procRoot = "/proc"): string {
+  return `${procRoot}/${pid}/net/${table}`;
 }
 
 /**
@@ -32,11 +42,33 @@ export interface NetnsReader {
   read(pid: number, table: NetTable): Promise<string>;
 }
 
-/** Reads the real /proc, for production. */
+/**
+ * Reads the real /proc, for production.
+ *
+ * `procRoot` defaults to `/host/proc` when that path exists (the deployed
+ * container, where the host's /proc is bind-mounted read-only) and `/proc`
+ * otherwise (running natively on a host). main.ts resolves it once at startup.
+ */
 export class ProcNetnsReader implements NetnsReader {
+  constructor(private readonly procRoot: string = "/proc") {}
+
   async read(pid: number, table: NetTable): Promise<string> {
-    return Bun.file(procNetPath(pid, table)).text();
+    return Bun.file(procNetPath(pid, table, this.procRoot)).text();
   }
+}
+
+/**
+ * Where to read PIDs' /proc from: the host's /proc bind-mounted at /host/proc if
+ * present, else the local /proc. Resolved once at startup and handed to the
+ * reader, so a missing mount degrades to /proc rather than being a hard error.
+ */
+export async function resolveProcRoot(): Promise<string> {
+  try {
+    if (await Bun.file("/host/proc/self/net/tcp").exists()) return "/host/proc";
+  } catch {
+    // fall through
+  }
+  return "/proc";
 }
 
 export interface ProcNetEntry {

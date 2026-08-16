@@ -3,21 +3,31 @@ services:
   tidewaiter:
     image: 'danielbodart/tidewaiter:latest'
     container_name: tidewaiter
-    # Share the host's network namespace, where the flows the activity gate
-    # reads actually live, and where /proc/<pid>/net/* is reachable for the
-    # backup detector and the port health probe.
+    # Share the host's network namespace, so the activity gate reads the same
+    # conntrack table the flows actually pass through, and port-connect health
+    # reaches published ports at 127.0.0.1 the way a client does.
     network_mode: host
     cap_add:
-      # conntrack netlink dump - not in Docker's default capability set.
+      # ACTIVITY GATE: dump the host conntrack table over netlink ("is anyone
+      # using this container right now?"). Not in Docker's default capability
+      # set. This is the only capability Tidewaiter needs - it never uses
+      # CAP_SYS_ADMIN (it reads /proc, it does not enter namespaces).
       - NET_ADMIN
     volumes:
       # Read-write: Tidewaiter pulls, recreates, stops and removes containers.
       - '/var/run/docker.sock:/var/run/docker.sock'
+      # DETECT LISTENING: the host's /proc, read-only. Tidewaiter reads
+      # /host/proc/<pid>/net/* to see what a target container has bound INSIDE
+      # its own network namespace - the port-bound health check and the tcp
+      # backup detector. Host networking shares the net namespace but NOT the
+      # pid namespace, so without this the daemon cannot see other containers'
+      # PIDs. A read-only /proc mount is a smaller grant than `pid: host`.
+      - '/proc:/host/proc:ro'
     restart: unless-stopped
 
   # An illustrative opted-in service. Tidewaiter watches nginx:latest for a new
-  # digest and, when the container is idle, pulls, recreates, health-checks the
-  # published port, and rolls back if the new image never starts listening.
+  # digest and, when the container is idle, pulls, recreates, runs the combined
+  # health gate, and rolls back if the new image does not come up serving.
   web:
     image: 'nginx:latest'
     restart: unless-stopped
@@ -27,5 +37,6 @@ services:
       # The opt-in: its value is the policy. 'registry' compares the tag against
       # the registry; 'local' compares against the locally-stored image.
       - 'tidewaiter.autoupdate=registry'
-      # port health is the default; spelled out here for illustration.
-      - 'tidewaiter.health=port'
+      # Health defaults to all four checks combined (docker,port-connect,
+      # port-bound,uptime). Set tidewaiter.health to a comma-separated subset to
+      # override, e.g. 'tidewaiter.health=docker,uptime'.

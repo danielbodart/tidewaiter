@@ -3,7 +3,7 @@ import { DEFAULTS, Tidewaiter, type Options } from "./daemon.ts";
 import { HttpDockerClient } from "./docker.ts";
 import { http, overUnixSocket, withTimeout } from "./http.ts";
 import { parseLabels } from "./labels.ts";
-import { ProcNetnsReader } from "./netns.ts";
+import { ProcNetnsReader, resolveProcRoot } from "./netns.ts";
 import { dockerConfigAuth, HttpRegistryClient } from "./registry.ts";
 import { version } from "./version.ts";
 
@@ -118,7 +118,11 @@ export async function main(argv: readonly string[]): Promise<number> {
   const auth = await dockerConfigAuth();
   const registry = new HttpRegistryClient(withTimeout(http, 30_000), auth);
   const conntrack = new CliConntrackSource();
-  const netns = new ProcNetnsReader();
+  // The host's /proc, bind-mounted read-only at /host/proc in the container, is
+  // what lets us read another container's /proc/<pid>/net/* (host networking
+  // shares the net ns, not the pid ns). Falls back to /proc when running native.
+  const procRoot = await resolveProcRoot();
+  const netns = new ProcNetnsReader(procRoot);
 
   if (parsed.command === "list") {
     const containers = await docker.containers(parsed.options.label);
@@ -150,7 +154,7 @@ export async function main(argv: readonly string[]): Promise<number> {
         : "update available";
       console.log(
         `${container.spec.name}  ${container.spec.image}  [${state}]  ` +
-          `autoupdate=${policy.autoupdate} detector=${policy.detector} health=${policy.health} idle-samples=${policy.idleSamples}`,
+          `autoupdate=${policy.autoupdate} detector=${policy.detector} health=${policy.health.join(",")} idle-samples=${policy.idleSamples}`,
       );
     }
     return 0;

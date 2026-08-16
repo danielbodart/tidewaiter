@@ -34,11 +34,16 @@ A debounce (`tidewaiter.idle-samples`, default 3) requires several consecutive i
 
 ## Health strategy
 
-What "healthy" means for the commit/rollback gate, chosen per container by `tidewaiter.health`:
+`tidewaiter.health` is a **comma-separated set of checks, run together** — the swap commits only if none of them actively fails, and rolls back the moment one does. Each check covers a different blind spot (empirically: no single check is enough — an app's own healthcheck can pass while the port is unreachable; a TCP connect can pass through docker-proxy with no backend behind it). Default is all four:
 
-- **port** (default) — probe from outside: for TCP, a LISTEN socket on the published port; for UDP, a bound socket in the container's netns. Needs nothing baked into the image, which is why it's the default.
-- **docker** — read `.State.Health.Status`; use it when the container defines a `HEALTHCHECK`. Watched live via the Docker event stream during the gate.
-- **uptime** — weakest: the container simply stays running for a while. Last resort.
+- **docker** — read `.State.Health.Status` (authoritative about the app's *internal* self-check, when the image defines a `HEALTHCHECK`; watched live via the Docker event stream). Blind to external reachability.
+- **port-connect** — a real `connect()` to a published host port, the path a client takes. Blind to whether there's actually a backend (docker-proxy answers the handshake).
+- **port-bound** — reads the container's own netns (`/proc/<pid>/net/*`) for a bound/listening socket on a published port. Sees the *inside* truth — bypasses docker-proxy — and is the only generic signal for UDP.
+- **uptime** — the container stays up, and by the time it has (a short grace), if it publishes ports at least one must be bound. This is what catches "the process runs and the port accepts, but nothing is actually serving."
+
+The gate leans deliberately toward *trusting the update*: a check that merely never confirms (a slow probe) does not veto — only an active failure (the app reports unhealthy, the container exits, or it comes up not serving) rolls back. A wrongly-rejected good update is the worse error; a genuinely-broken one is caught next cycle by the activity gate too.
+
+Override per container, e.g. `tidewaiter.health=docker,uptime`.
 
 ## Labels
 
@@ -48,7 +53,7 @@ What "healthy" means for the commit/rollback gate, chosen per container by `tide
 | `tidewaiter.detector` | `conntrack` \| `tcp` \| `netio` \| `none` | `conntrack` |
 | `tidewaiter.ports` | scope the idle check and health probe to specific published ports — use it when a container also exposes a metrics/admin port that gets constant automated traffic (which would otherwise keep it looking "busy" forever) | all published ports |
 | `tidewaiter.idle-samples` | consecutive idle passes required before updating | `3` |
-| `tidewaiter.health` | `docker` \| `port` \| `uptime` | `port` |
+| `tidewaiter.health` | comma-separated checks: `docker`, `port-connect`, `port-bound`, `uptime` (run together, any active failure rolls back) | all four |
 | `tidewaiter.health-timeout` | seconds to wait for healthy before rolling back | `120` |
 | `tidewaiter.grace` | stop-grace (drain) seconds | container's own stop timeout |
 | `tidewaiter.keep-images` | previous images to retain for rollback before pruning | `1` |
@@ -64,13 +69,19 @@ services:
   tidewaiter:
     image: danielbodart/tidewaiter:latest
     container_name: tidewaiter
-    network_mode: host          # where the flows live, and where /proc/<pid>/net/* is reachable
+    network_mode: host          # share the net ns: conntrack + connect to host ports
     cap_add:
-      - NET_ADMIN               # conntrack netlink dump; not in Docker's default set
+      - NET_ADMIN               # ACTIVITY GATE: dump the host conntrack table (netlink)
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock   # rw: it pulls, recreates, stops, removes
+      - /proc:/host/proc:ro     # DETECT LISTENING: read /proc/<pid>/net/* to see what a
+                                # container has bound inside its own netns (host networking
+                                # shares the net ns but NOT the pid ns; a read-only /proc
+                                # mount is a smaller grant than `pid: host`)
     restart: unless-stopped
 ```
+
+Two grants, two jobs: **`CAP_NET_ADMIN`** is the *activity gate* (conntrack — "is anyone using this container?"); the read-only **`/proc` mount** is the *health/detector* read ("is it actually listening inside?"). Tidewaiter never needs `CAP_SYS_ADMIN` — it reads `/proc`, it doesn't enter namespaces. Without the `/proc` mount, `port-bound` health and the `tcp` detector degrade to inconclusive; conntrack, `port-connect`, `docker` and `uptime` still work.
 
 Then opt any container in with `tidewaiter.autoupdate=registry`. See [`docker-compose.yaml`](./docker-compose.yaml) for a worked example.
 

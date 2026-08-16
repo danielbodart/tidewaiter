@@ -130,6 +130,14 @@ export interface RunningContainer {
    */
   readonly imageId: string;
   readonly health: HealthStatus;
+  /**
+   * Whether the container is genuinely up right now: `State.Running` true AND
+   * `State.Restarting` false. A container that has exited (`Status=exited`) or
+   * is crash-looping under a restart policy (`Status=restarting`) is NOT
+   * running by this measure - both mean the new image failed to stay up, which
+   * the uptime health check reads as an active failure.
+   */
+  readonly running: boolean;
 }
 
 /** What the registry says this container's tag should resolve to, this pass. */

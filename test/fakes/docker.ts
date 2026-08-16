@@ -80,12 +80,22 @@ export class FakeDocker implements DockerClient {
     return this.running.filter((container) => container.spec.labels[label] !== undefined);
   }
 
+  /**
+   * Per-container run state as inspect() should report it, keyed by name.
+   *
+   * Lets a test say "after the swap this container exited/crash-looped", which
+   * drives the uptime check's active-failure path. Defaults to the container's
+   * own `running` field (true) when not overridden.
+   */
+  runningByName: Record<string, boolean> = {};
+
   async inspect(container: string): Promise<RunningContainer> {
     if (this.failWith) throw this.failWith;
     const found = this.find(container);
     if (!found) throw new Error(`no such container: ${container}`);
     const health = this.healthByName[found.spec.name] ?? found.health;
-    return { ...found, health };
+    const running = this.runningByName[found.spec.name] ?? found.running;
+    return { ...found, health, running };
   }
 
   /** Accepts an image id or a tag ref, as Docker's /images/{name}/json does. */
@@ -118,6 +128,7 @@ export class FakeDocker implements DockerClient {
       spec,
       imageId: this.imageIdFor(spec.image),
       health: "none",
+      running: true,
     });
     return id;
   }
@@ -228,6 +239,7 @@ export function runningContainer(
     pid: 4242,
     imageId: "config-current",
     health: "none",
+    running: true,
     spec: spec(name, specOverrides),
     ...rest,
   };

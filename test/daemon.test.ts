@@ -154,18 +154,23 @@ describe("an idle container with a newer image", () => {
     expect(docker.removes.some((r) => r.container === "web-tidewaiter-rollback")).toBe(true);
   });
 
-  // The default health=port path, end to end - the one that failed on a live
-  // host. Health is confirmed by a real connect() to the published HOST port
-  // (18080 here), not by reading /proc, so there is no PID/netns timing to race.
-  test("commits a port-health update once the published host port accepts a connection", async () => {
+  // The port-connect path, end to end - the one that failed on a live host.
+  // Health is confirmed by a real connect() to the published HOST port (18080),
+  // not by reading /proc, so there is no PID/netns timing to race. Scoped to
+  // health=port-connect so the single connect pass commits it.
+  test("commits a port-connect update once the published host port accepts a connection", async () => {
     const { docker, registry, daemon, tcp } = tidewaiter();
-    // health defaults to port; publish 18080:80.
     docker.running.push(
       runningContainer("web", {
         imageId: "config-sha256:old",
         spec: {
           image: "app:latest",
-          labels: { "tidewaiter.autoupdate": "registry", "tidewaiter.idle-samples": "2", "tidewaiter.health-timeout": "5" },
+          labels: {
+            "tidewaiter.autoupdate": "registry",
+            "tidewaiter.idle-samples": "2",
+            "tidewaiter.health": "port-connect",
+            "tidewaiter.health-timeout": "5",
+          },
           published: [port(18080, 80, "tcp")],
         },
       }),
@@ -185,10 +190,11 @@ describe("an idle container with a newer image", () => {
     expect(docker.removes.some((r) => r.container === "web-tidewaiter-rollback")).toBe(true); // committed
   });
 
-  test("rolls back a port-health update when the host port never accepts within the timeout", async () => {
-    // A clock that ticks forward on every read, so the health-timeout deadline is
-    // genuinely reached without real waiting. The tcp probe never opens 18080, so
-    // every poll returns "not up yet" until the deadline -> rollback.
+  // The combination rule leaning toward TRUST: a port that never accepts is NOT
+  // an active failure, so at the health-timeout the update COMMITS anyway (a
+  // flaky/slow probe must not veto a good update). uptime passes and nothing
+  // fails. Contrast with the exited-container test below, which DOES roll back.
+  test("commits at the timeout even when the port never accepts (no active failure)", async () => {
     const docker = new FakeDocker();
     const registry = new FakeRegistry();
     let now = 1_000_000;
@@ -196,16 +202,21 @@ describe("an idle container with a newer image", () => {
       docker, registry, new FakeConntrackSource(), new FakeNetnsReader(),
       { ...DEFAULTS, healthPollMillis: 0 },
       () => {},
-      () => (now += 250), // 250ms per read -> crosses a 1s health-timeout in a few polls
+      () => (now += 250), // clock advances so the 1s timeout is reached
       undefined,
-      new FakeTcpProbe(), // nothing listening -> connect always refused
+      new FakeTcpProbe(), // nothing listening -> connect always inconclusive
     );
     docker.running.push(
       runningContainer("web", {
         imageId: "config-sha256:old",
         spec: {
           image: "app:latest",
-          labels: { "tidewaiter.autoupdate": "registry", "tidewaiter.idle-samples": "1", "tidewaiter.health-timeout": "1" },
+          labels: {
+            "tidewaiter.autoupdate": "registry",
+            "tidewaiter.idle-samples": "1",
+            "tidewaiter.health": "port-connect",
+            "tidewaiter.health-timeout": "1",
+          },
           published: [port(18080, 80, "tcp")],
         },
       }),
@@ -217,7 +228,40 @@ describe("an idle container with a newer image", () => {
 
     await daemon.once();
 
-    // rolled back to the old container, never left broken.
+    // Committed: the parked old container was removed, not restored.
+    expect(docker.removes.some((r) => r.container === "web-tidewaiter-rollback")).toBe(true);
+    expect(docker.renames.some((r) => r.container === "web-tidewaiter-rollback" && r.to === "web")).toBe(false);
+  });
+
+  // The uptime check's active-failure path: a new container that EXITS (or
+  // crash-loops) is a genuine failure and rolls back, even under the
+  // trust-the-update rule.
+  test("rolls back when the new container exits (uptime active failure)", async () => {
+    const { docker, registry, daemon } = tidewaiter();
+    docker.running.push(
+      runningContainer("web", {
+        imageId: "config-sha256:old",
+        spec: {
+          image: "app:latest",
+          labels: {
+            "tidewaiter.autoupdate": "registry",
+            "tidewaiter.idle-samples": "1",
+            "tidewaiter.health": "uptime",
+            "tidewaiter.health-timeout": "5",
+          },
+          published: [port(18080, 80, "tcp")],
+        },
+      }),
+    );
+    registry.digests["app:latest"] = "sha256:new";
+    docker.images["config-sha256:old"] = "sha256:old";
+    docker.images["app:latest"] = "sha256:old";
+    docker.pullLands["app:latest"] = "sha256:new";
+    // The recreated container is reported as exited by inspect.
+    docker.runningByName["web"] = false;
+
+    await daemon.once();
+
     expect(docker.renames.some((r) => r.container === "web-tidewaiter-rollback" && r.to === "web")).toBe(true);
   });
 

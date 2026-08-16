@@ -62,11 +62,45 @@ describe("parseLabels", () => {
     });
     expect(policy).toMatchObject({
       detector: "tcp",
-      health: "docker",
+      health: ["docker"],
       idleSamples: 5,
       healthTimeoutSeconds: 60,
       graceSeconds: 20,
       keepImages: 3,
+    });
+  });
+
+  describe("tidewaiter.health (comma-separated check list)", () => {
+    test("defaults to all four checks", () => {
+      expect(opted({ "tidewaiter.autoupdate": "registry" }).health).toEqual([
+        "docker", "port-connect", "port-bound", "uptime",
+      ]);
+    });
+
+    test("reads a comma-separated subset, deduped and in order", () => {
+      const policy = opted({ "tidewaiter.autoupdate": "registry", "tidewaiter.health": "uptime, docker ,uptime" });
+      expect(policy.health).toEqual(["uptime", "docker"]);
+    });
+
+    test("an unknown check name warns and is dropped, keeping the rest", () => {
+      const { policy, warnings } = parseLabels(
+        { "tidewaiter.autoupdate": "registry", "tidewaiter.health": "docker,psychic" },
+        [],
+      );
+      expect(policy?.health).toEqual(["docker"]);
+      expect(warnings.join("\n")).toContain("not a known check");
+    });
+
+    test("the legacy 'port' value maps to port-connect + port-bound", () => {
+      expect(opted({ "tidewaiter.autoupdate": "registry", "tidewaiter.health": "port" }).health).toEqual([
+        "port-connect", "port-bound",
+      ]);
+    });
+
+    test("an all-unknown list falls back to the default rather than no gate", () => {
+      expect(opted({ "tidewaiter.autoupdate": "registry", "tidewaiter.health": "nonsense" }).health).toEqual([
+        "docker", "port-connect", "port-bound", "uptime",
+      ]);
     });
   });
 

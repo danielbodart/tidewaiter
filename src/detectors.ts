@@ -140,7 +140,7 @@ export interface NetioDeps {
  *
  * A rate needs two samples an interval apart, so this is a factory holding the
  * previous {bytes, at} per container between passes - the same shape as
- * uptimeHealthProber, which is why (like uptime) the daemon constructs it rather
+ * uptimeCheck, which is why (like uptime) the daemon constructs it rather
  * than resolving a singleton. The first sample for a container has nothing to
  * compare against, so it reports "cannot tell" (low confidence), which the
  * fail-safe reads as in use - it never green-lights an update on a single
@@ -194,7 +194,7 @@ export const noneDetector: Detector = {
  *
  * netio is absent on purpose: it is stateful (it remembers the previous byte
  * sample) and needs Docker + a clock, so the daemon builds it per its
- * dependencies via netioDetector(), exactly as it builds uptimeHealthProber().
+ * dependencies via netioDetector(), exactly as it builds uptimeCheck().
  */
 const DETECTORS: Record<string, Detector> = {
   conntrack: conntrackDetector,

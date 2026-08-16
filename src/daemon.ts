@@ -4,10 +4,12 @@ import { combine, detectorByName, netioDetector, type Detector, type DetectorRes
 import type { DockerClient } from "./docker.ts";
 import {
   BunTcpProbe,
-  healthProberByName,
-  uptimeHealthProber,
-  verdictForDockerHealth,
-  type HealthProber,
+  checkByName,
+  combine as combineHealth,
+  dockerVerdict,
+  uptimeCheck,
+  type CheckResult,
+  type HealthCheck,
   type HealthResult,
   type TcpProbe,
 } from "./health.ts";
@@ -568,62 +570,72 @@ export class Tidewaiter {
   /**
    * Wait for the new container to prove healthy, up to the policy timeout.
    *
-   * For health=docker, this races two sources: a watch on the Docker event
-   * stream for the container's `health_status` events, and the inspect-poll
-   * below. The event watch settles the instant Docker's probe flips, without
-   * waiting out a poll interval; the poll is kept as a belt-and-braces fallback
-   * in case the stream drops or an event is missed. For every other prober the
-   * event stream carries nothing useful, so only the poll runs.
+   * Builds the container's set of health checks (from `tidewaiter.health`) ONCE,
+   * so the stateful `uptime` check keeps its start time across every evaluation.
+   * Then races two arms under one AbortController:
+   *   - the inspect-poll, the always-present arm, which re-evaluates every check
+   *     each interval and combines them;
+   *   - a Docker `health_status` event watch, present only when `docker` is one
+   *     of the checks, which re-runs the same combination the instant Docker's
+   *     own probe flips (overriding just the docker check with the event's
+   *     verdict) - so a healthy/unhealthy event settles the gate without waiting
+   *     out a poll interval.
    *
-   * One AbortController scopes both to the timeout and tears them down on any
-   * outcome, so no event listener or poll timer leaks. Times out to a definite
-   * "unhealthy" so a container that never settles rolls back rather than
-   * hanging the pass forever.
+   * The controller tears both down on any outcome, so no listener or timer
+   * leaks. The gate's verdict follows combine()'s rule: roll back only on an
+   * active failure; at the timeout, commit unless something failed.
    */
   private async waitHealthy(name: string, policy: ContainerPolicy): Promise<HealthResult> {
     const controller = new AbortController();
-    const timeout = { healthy: false as const, reason: `did not become healthy within ${policy.healthTimeoutSeconds}s` };
+    const checks = this.checksFor(policy);
 
-    const races: Promise<HealthResult>[] = [this.pollHealthy(name, policy, controller.signal, timeout)];
-    if (policy.health === "docker") {
-      races.push(this.watchHealthEvents(name, controller.signal));
+    const races: Promise<HealthResult>[] = [this.pollHealthy(name, policy, checks, controller.signal)];
+    if (policy.health.includes("docker")) {
+      races.push(this.watchHealthEvents(name, policy, checks, controller.signal));
     }
 
     try {
       return await Promise.race(races);
     } finally {
-      // Settle the watch/poll and free the event listener and any timer.
       controller.abort();
     }
   }
 
+  /** Evaluate every check against a freshly-inspected container, in order. */
+  private async evaluateChecks(
+    name: string,
+    policy: ContainerPolicy,
+    checks: readonly HealthCheck[],
+    signal: AbortSignal,
+    dockerOverride?: CheckResult,
+  ): Promise<CheckResult[]> {
+    const fresh = await this.docker.inspect(name);
+    const input = { container: fresh, ports: policy.ports ?? fresh.spec.published, netns: this.netns, tcp: this.tcp };
+    const results: CheckResult[] = [];
+    for (const check of checks) {
+      // The event watch already has Docker's verdict from the event; use it
+      // rather than re-reading a possibly-stale inspect for the docker check.
+      results.push(check.name === "docker" && dockerOverride ? dockerOverride : await check.evaluate(input, signal));
+    }
+    return results;
+  }
+
   /**
-   * Poll the chosen prober until it settles or the timeout elapses.
-   *
-   * The always-present arm of waitHealthy. Aborts cleanly when the controller
-   * fires (the event watch won the race, or the whole wait is being torn down).
+   * The always-present arm: poll the combined gate until it settles or times out.
    */
   private async pollHealthy(
     name: string,
     policy: ContainerPolicy,
+    checks: readonly HealthCheck[],
     signal: AbortSignal,
-    timeout: HealthResult,
   ): Promise<HealthResult> {
-    const prober = this.proberFor(policy);
     const deadline = this.now() + policy.healthTimeoutSeconds * 1000;
 
     try {
       while (this.now() < deadline && !signal.aborted) {
-        const fresh = await this.docker.inspect(name);
-        const result =
-          prober.name === "docker"
-            ? verdictForDockerHealth(fresh.health)
-            : await prober.check(
-                { container: fresh, ports: policy.ports ?? fresh.spec.published, netns: this.netns, tcp: this.tcp },
-                signal,
-              );
-
-        if (result !== undefined) return result;
+        const results = await this.evaluateChecks(name, policy, checks, signal);
+        const verdict = combineHealth(results, false);
+        if (verdict !== undefined) return verdict;
         await this.sleep(this.options.healthPollMillis, signal);
       }
     } catch (error) {
@@ -631,30 +643,35 @@ export class Tidewaiter {
       return { healthy: false, reason: `health check errored: ${(error as Error).message}` };
     }
 
-    // Aborted because the event watch already answered: yield the race rather
-    // than reporting a spurious timeout.
     if (signal.aborted) return neverResolves<HealthResult>(signal);
-    return timeout;
+    // Deadline reached: commit unless something actively failed (combine with
+    // timedOut=true), so a check that merely never confirmed cannot veto.
+    const results = await this.evaluateChecks(name, policy, checks, signal).catch(() => [] as CheckResult[]);
+    return combineHealth(results, true) ?? { healthy: true };
   }
 
   /**
-   * Resolve as soon as a `health_status` event for the container arrives.
-   *
-   * The fast path for health=docker: Docker emits `health_status: healthy` /
-   * `unhealthy` the moment its probe flips, so this beats the poll by up to a
-   * whole interval. Filtered to this container. If the stream errors or ends,
-   * it hands the decision back to the poll by never resolving (the poll's own
-   * timeout still bounds the wait).
+   * The fast path when `docker` is one of the checks: settle on a health_status
+   * event by re-running the full combination with docker's result taken from the
+   * event. A healthy event commits (if the other checks pass/skip); an unhealthy
+   * event fails the docker check and rolls back at once. If the stream drops it
+   * never resolves and the poll carries the wait.
    */
-  private async watchHealthEvents(name: string, signal: AbortSignal): Promise<HealthResult> {
+  private async watchHealthEvents(
+    name: string,
+    policy: ContainerPolicy,
+    checks: readonly HealthCheck[],
+    signal: AbortSignal,
+  ): Promise<HealthResult> {
     try {
       for await (const event of this.docker.events(this.options.label, signal)) {
         if (signal.aborted) break;
         if (event.container !== name || !event.action.startsWith("health_status")) continue;
-        if (event.status === "healthy") return { healthy: true };
-        if (event.status === "unhealthy") {
-          return { healthy: false, reason: "Docker reports the container unhealthy" };
-        }
+        if (event.status !== "healthy" && event.status !== "unhealthy") continue;
+
+        const results = await this.evaluateChecks(name, policy, checks, signal, dockerVerdict(event.status));
+        const verdict = combineHealth(results, false);
+        if (verdict !== undefined) return verdict;
       }
     } catch {
       // Stream dropped - let the poll carry the wait.
@@ -662,11 +679,11 @@ export class Tidewaiter {
     return neverResolves<HealthResult>(signal);
   }
 
-  private proberFor(policy: ContainerPolicy): HealthProber {
-    if (policy.health === "uptime") {
-      return uptimeHealthProber(policy.healthTimeoutSeconds > 30 ? 30 : policy.healthTimeoutSeconds, this.now);
-    }
-    return healthProberByName(policy.health) ?? healthProberByName("port")!;
+  /** The set of health checks for a container, from its `tidewaiter.health`. */
+  private checksFor(policy: ContainerPolicy): HealthCheck[] {
+    return policy.health.map((name) =>
+      name === "uptime" ? uptimeCheck(uptimeSeconds(policy.healthTimeoutSeconds), this.now) : checkByName(name)!,
+    );
   }
 
   /**
@@ -758,6 +775,25 @@ export class Tidewaiter {
  */
 function neverResolves<T>(_signal: AbortSignal): Promise<T> {
   return new Promise<T>(() => {});
+}
+
+/**
+ * How long uptime waits before it decides, given the overall health-timeout.
+ *
+ * This MUST be strictly less than the health-timeout, and with real margin. The
+ * uptime check is the one that can FAIL (container exited, or up-but-not-serving)
+ * - but its verdict only matters if it lands *before* the overall gate times
+ * out, because a timed-out gate commits ("trust the update unless something
+ * failed"). If uptime's deadline equalled the health-timeout, the two would race
+ * and the timeout's commit would usually win, so a no-backend container would
+ * commit instead of rolling back - a real bug this avoids.
+ *
+ * So: about two-thirds of the health-timeout, capped at 30s (a real service
+ * binds within seconds; no need to wait longer), floored at a few seconds so a
+ * tiny health-timeout still gives a just-started container a moment to bind.
+ */
+function uptimeSeconds(healthTimeoutSeconds: number): number {
+  return Math.max(2, Math.min(30, Math.floor(healthTimeoutSeconds * 0.66)));
 }
 
 /**

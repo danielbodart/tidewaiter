@@ -26,11 +26,14 @@ export const KEEP_IMAGES = "tidewaiter.keep-images";
  */
 export type PolicyName = "registry" | "local";
 export type DetectorName = "conntrack" | "tcp" | "netio" | "none";
-export type HealthName = "docker" | "port" | "uptime";
+export type HealthName = "docker" | "port-connect" | "port-bound" | "uptime";
 
 const POLICY_NAMES: readonly PolicyName[] = ["registry", "local"];
 const DETECTOR_NAMES: readonly DetectorName[] = ["conntrack", "tcp", "netio", "none"];
-const HEALTH_NAMES: readonly HealthName[] = ["docker", "port", "uptime"];
+const HEALTH_NAMES: readonly HealthName[] = ["docker", "port-connect", "port-bound", "uptime"];
+
+/** The default health gate: every check, combined (any active failure rolls back). */
+export const DEFAULT_HEALTH: readonly HealthName[] = ["docker", "port-connect", "port-bound", "uptime"];
 
 /**
  * A container's resolved Tidewaiter policy.
@@ -60,7 +63,18 @@ export interface ContainerPolicy {
    */
   readonly ports?: readonly PublishedPort[];
   readonly idleSamples: number;
-  readonly health: HealthName;
+  /**
+   * The set of health checks that gate the swap, combined.
+   *
+   * A comma-separated `tidewaiter.health` list, default all four
+   * (docker, port-connect, port-bound, uptime). The gate rolls back only if a
+   * check ACTIVELY fails; a check that merely never confirms does not veto (see
+   * health.ts combine()), because false-unhealthy is the worse error. Each check
+   * covers a different blind spot - docker tests app internals, port-connect
+   * tests reachability, port-bound bypasses docker-proxy and is the only UDP
+   * signal, uptime catches a container that exits or crash-loops.
+   */
+  readonly health: readonly HealthName[];
   readonly healthTimeoutSeconds: number;
   /** Undefined means "use the container's own stop timeout". */
   readonly graceSeconds?: number;
@@ -71,7 +85,7 @@ export interface ContainerPolicy {
 export const POLICY_DEFAULTS = {
   detector: "conntrack",
   idleSamples: 3,
-  health: "port",
+  health: DEFAULT_HEALTH,
   healthTimeoutSeconds: 120,
   keepImages: 1,
 } as const satisfies Omit<ContainerPolicy, "autoupdate" | "ports" | "graceSeconds">;
@@ -128,7 +142,7 @@ export function parseLabels(
   }
 
   const detector = oneOf(labels[DETECTOR], DETECTOR_NAMES, POLICY_DEFAULTS.detector, DETECTOR, warnings);
-  const health = oneOf(labels[HEALTH], HEALTH_NAMES, POLICY_DEFAULTS.health, HEALTH, warnings);
+  const health = parseHealth(labels[HEALTH], warnings);
 
   const idleSamples = positiveInt(labels[IDLE_SAMPLES], POLICY_DEFAULTS.idleSamples, IDLE_SAMPLES, warnings);
   const healthTimeoutSeconds = positiveInt(
@@ -150,6 +164,42 @@ export function parseLabels(
     },
     warnings,
   };
+}
+
+/**
+ * Parse a comma-separated `tidewaiter.health` list into the checks to run.
+ *
+ * Absent -> the default set (all four). Unknown names are warned about and
+ * dropped, keeping the recognised ones. `port` (the old single value) is no
+ * longer a check name; it is mapped to `port-connect,port-bound` with a note so
+ * old labels keep meaning what they did. An empty or all-unknown list falls back
+ * to the default rather than leaving a container with no gate.
+ */
+function parseHealth(value: string | undefined, warnings: string[]): readonly HealthName[] {
+  if (value === undefined) return DEFAULT_HEALTH;
+
+  const chosen: HealthName[] = [];
+  for (const raw of value.split(",")) {
+    const term = raw.trim().toLowerCase();
+    if (term === "") continue;
+
+    if (term === "port") {
+      // The former all-in-one value, split into its two mechanisms.
+      for (const name of ["port-connect", "port-bound"] as const) {
+        if (!chosen.includes(name)) chosen.push(name);
+      }
+      continue;
+    }
+
+    const name = HEALTH_NAMES.find((n) => n === term);
+    if (name === undefined) {
+      warnings.push(`${HEALTH}: '${raw.trim()}' is not a known check (${HEALTH_NAMES.join(", ")}); ignoring it`);
+      continue;
+    }
+    if (!chosen.includes(name)) chosen.push(name);
+  }
+
+  return chosen.length > 0 ? chosen : DEFAULT_HEALTH;
 }
 
 const MAX_PORT = 65535;

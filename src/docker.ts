@@ -289,7 +289,7 @@ export interface RawContainerInspect {
   Id: string;
   Name?: string;
   Image?: string;
-  State?: { Pid?: number; Health?: { Status?: string } };
+  State?: { Pid?: number; Health?: { Status?: string }; Running?: boolean; Restarting?: boolean; Status?: string };
   Config?: {
     Image?: string;
     Env?: string[];
@@ -386,6 +386,10 @@ export function toRunning(raw: RawContainerInspect): RunningContainer {
     // imageDigest(ref), because inspect does not carry it.
     imageId: raw.Image ?? "",
     health: healthOf(raw.State?.Health?.Status),
+    // Genuinely up: Running true and NOT mid-restart. An exited container has
+    // Running=false; a crash-looping one has Running=true but Restarting=true -
+    // both are "not staying up", which the uptime check treats as a failure.
+    running: raw.State?.Running === true && raw.State?.Restarting !== true,
     spec: toSpec(raw),
   };
 }
