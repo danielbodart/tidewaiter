@@ -36,6 +36,8 @@ export class FakeDocker implements DockerClient {
   pullLands: Record<string, Digest> = {};
   /** Set to make listing/inspect fail, as a Docker restart would. */
   failWith?: Error;
+  /** Set to make a pull throw, e.g. a registry hiccup during a prefetch. */
+  failPull?: Error;
   /**
    * Make one lifecycle operation throw, to exercise a mid-swap failure.
    *
@@ -105,6 +107,7 @@ export class FakeDocker implements DockerClient {
 
   async pull(ref: string, auth?: string): Promise<void> {
     this.pulls.push({ ref, auth });
+    if (this.failPull) throw this.failPull;
     // A pull fetches the registry's current manifest for the tag into a fresh
     // local image (a new config id), and points the tag at it. The digest is
     // reachable by both the tag and the new id afterwards.

@@ -102,7 +102,10 @@ describe("an idle container with a newer image", () => {
     const actions = await daemon.once();
 
     expect(actions.map((a) => a.kind)).toEqual(["update"]);
-    expect(docker.pulls.map((p) => p.ref)).toEqual(["app:latest"]);
+    // Two pulls of the same ref: the background prefetch on the first idle pass
+    // (a newer digest appeared), then the authoritative re-pull at swap time
+    // (cache-warm, so cheap on a real host).
+    expect(docker.pulls.map((p) => p.ref)).toEqual(["app:latest", "app:latest"]);
     // rename-not-delete: old parked, new created, old removed on commit.
     expect(docker.renames[0]).toEqual({ container: "web", to: "web-tidewaiter-rollback" });
     expect(docker.creates.map((c) => c.name)).toEqual(["web"]);
@@ -374,7 +377,11 @@ describe("an idle container with a newer image", () => {
     await daemon.once();
     await daemon.once();
 
-    expect(docker.pulls).toEqual([{ ref: "app:latest", auth: "base64-creds" }]);
+    // Both the background prefetch and the swap-time pull carry the credential.
+    expect(docker.pulls).toEqual([
+      { ref: "app:latest", auth: "base64-creds" },
+      { ref: "app:latest", auth: "base64-creds" },
+    ]);
     void now;
   });
 
@@ -474,7 +481,10 @@ describe("the activity gate", () => {
     for (let i = 0; i < 5; i += 1) {
       expect((await daemon.once()).map((a) => a.kind)).toEqual(["defer"]);
     }
-    expect(docker.pulls).toEqual([]);
+    // Busy, so it never swaps - but it DOES warm the cache in the background
+    // (once, deduped across passes), so the eventual idle swap needs no download.
+    expect(docker.creates).toEqual([]);
+    expect(docker.pulls.map((p) => p.ref)).toEqual(["app:latest"]);
   });
 
   test("requires N consecutive idle samples before updating", async () => {
@@ -531,8 +541,95 @@ describe("the activity gate", () => {
     // updating or aborting the pass.
     const actions = await daemon.once();
     expect(actions.map((a) => a.kind)).toEqual(["defer"]);
-    expect(docker.pulls).toEqual([]);
+    // Assumed busy, so it must not swap; the prefetch may still warm the cache.
+    expect(docker.creates).toEqual([]);
     expect(log.join("\n")).toContain("netio");
+  });
+});
+
+describe("prefetching a newer image", () => {
+  test("pulls in the background while the container is still busy", async () => {
+    const { docker, registry, conntrack, daemon } = tidewaiter();
+    opted(docker, registry, "web", "sha256:old", "sha256:new");
+    // Busy the whole time: an ASSURED flow to the published host port.
+    conntrack.text = "tcp 6 300 ESTABLISHED src=10.0.0.9 dst=10.0.0.1 sport=5000 dport=8080 [ASSURED]";
+
+    const actions = await daemon.once();
+    // Never swaps while busy...
+    expect(actions.map((a) => a.kind)).toEqual(["defer"]);
+    expect(docker.creates).toEqual([]);
+    // ...but the newer image was fetched ahead of time, so the eventual swap is
+    // download-free.
+    expect(docker.pulls.map((p) => p.ref)).toEqual(["app:latest"]);
+
+    // Deduped: further busy passes on the same digest do not re-pull.
+    await daemon.once();
+    await daemon.once();
+    expect(docker.pulls.map((p) => p.ref)).toEqual(["app:latest"]);
+  });
+
+  test("does not prefetch when already on the latest, pinned, local, or dry-run", async () => {
+    // Already current: nothing newer to fetch.
+    {
+      const { docker, registry, daemon } = tidewaiter();
+      opted(docker, registry, "web", "sha256:same", "sha256:same");
+      await daemon.once();
+      expect(docker.pulls).toEqual([]);
+    }
+    // local policy never touches the network.
+    {
+      const { docker, daemon } = tidewaiter();
+      docker.running.push(
+        runningContainer("web", {
+          imageId: "config-old",
+          spec: { image: "app:latest", labels: { "tidewaiter.autoupdate": "local" }, published: [port(8080)] },
+        }),
+      );
+      docker.images["config-old"] = "sha256:old";
+      docker.images["app:latest"] = "sha256:built";
+      await daemon.once();
+      expect(docker.pulls).toEqual([]);
+    }
+    // dry run touches nothing.
+    {
+      const { docker, registry, daemon } = tidewaiter({ dryRun: true });
+      opted(docker, registry, "web", "sha256:old", "sha256:new");
+      await daemon.once();
+      expect(docker.pulls).toEqual([]);
+    }
+  });
+
+  test("relaunches when the tag moves to a different digest while busy", async () => {
+    const { docker, registry, conntrack, daemon } = tidewaiter();
+    opted(docker, registry, "web", "sha256:old", "sha256:new");
+    conntrack.text = "tcp 6 300 ESTABLISHED dport=8080 [ASSURED]"; // busy throughout
+
+    await daemon.once();
+    expect(docker.pulls.map((p) => p.ref)).toEqual(["app:latest"]);
+
+    // The registry tag moves again before the container ever went idle.
+    registry.digests["app:latest"] = "sha256:newer";
+    docker.pullLands["app:latest"] = "sha256:newer";
+    await daemon.once();
+    // A second prefetch fires for the new target digest.
+    expect(docker.pulls.map((p) => p.ref)).toEqual(["app:latest", "app:latest"]);
+  });
+
+  test("a failed prefetch never pins and is retried on the next pass", async () => {
+    const { docker, registry, conntrack, daemon, log } = tidewaiter();
+    opted(docker, registry, "web", "sha256:old", "sha256:new");
+    conntrack.text = "tcp 6 300 ESTABLISHED dport=8080 [ASSURED]"; // busy, so only the prefetch runs
+    docker.failPull = new Error("registry 500");
+
+    const first = await daemon.once();
+    expect(first.map((a) => a.kind)).toEqual(["defer"]); // a failed warm-up never pins
+    expect(docker.pulls.length).toBe(1);
+    expect(log.join("\n")).toContain("prefetch of app:latest failed");
+
+    // The record was cleared, so the next pass retries the pull.
+    docker.failPull = undefined;
+    await daemon.once();
+    expect(docker.pulls.length).toBe(2);
   });
 });
 

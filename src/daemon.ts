@@ -125,6 +125,19 @@ export class Tidewaiter {
   private lastSummary?: string;
 
   /**
+   * The target digest of the in-flight (or completed) background pull per
+   * container, keyed by name.
+   *
+   * Deliberately NOT part of the per-container State that decide() reads: a
+   * warmed cache changes nothing about the *decision*, only how fast the
+   * eventual swap runs, so it lives here as daemon plumbing alongside
+   * netioSingleton rather than in decide()'s memory. The recorded digest is the
+   * dedupe key - one pull per target digest, relaunched only when the tag moves
+   * to a different one, or when a prior pull failed and cleared its entry.
+   */
+  private readonly prefetches = new Map<string, Digest>();
+
+  /**
    * The netio detector, built once on first use and kept, because it is
    * stateful - it remembers each container's previous byte sample to compute a
    * rate across passes. Lazy rather than a field initializer so it does not race
@@ -255,6 +268,14 @@ export class Tidewaiter {
       previous = { ...previous, adopted: true };
     }
 
+    // Warm the cache ahead of the swap: the moment a newer digest appears, start
+    // pulling it in the background - even while the container is still busy - so
+    // that when the tide finally goes out the swap is a fast local recreate, not
+    // a multi-minute download inside the very idle window we were waiting for.
+    // Fire-and-forget: a pull can take minutes and must never stall the
+    // single-flight pass or starve the other containers.
+    this.prefetch(container, policy, desiredDigest, currentDigest, previous.pinnedDigest);
+
     const ports = policy.ports ?? container.spec.published;
     const activity = await this.sample(container, policy, ports, conntrack);
     const idleStreak = activity.inUse ? 0 : previous.idleStreak + 1;
@@ -350,6 +371,46 @@ export class Tidewaiter {
         return this.performUpdate(container, policy, base, desiredDigest, currentDigest);
       }
     }
+  }
+
+  /**
+   * Start (or skip) a background pull of a newer image, so it is already on the
+   * host by the time the container goes idle enough to swap.
+   *
+   * Detached on purpose - the promise is not awaited, so the reconcile pass
+   * moves straight on. The gates mirror performUpdate's own pull:
+   *   - `registry` only: `local` deliberately never touches the network.
+   *   - nothing to fetch when already on the desired digest.
+   *   - a pinned-out (health-failed) digest is a bad image; do not warm it.
+   *   - dry run touches nothing.
+   * Dedupe: the recorded digest means one pull per target, launched once and
+   * left in flight across passes; a different desired digest supersedes it. A
+   * failed pull is purely speculative - it never pins and never disrupts; it
+   * just clears its record so the next pass retries, and the real swap does its
+   * own pull with full error handling regardless.
+   */
+  private prefetch(
+    container: RunningContainer,
+    policy: ContainerPolicy,
+    desiredDigest: Digest,
+    currentDigest: Digest | undefined,
+    pinnedDigest: Digest | undefined,
+  ): void {
+    if (this.options.dryRun) return;
+    if (policy.autoupdate !== "registry") return;
+    if (desiredDigest === currentDigest) return;
+    if (pinnedDigest === desiredDigest) return;
+
+    const name = container.spec.name;
+    if (this.prefetches.get(name) === desiredDigest) return;
+
+    const ref = container.spec.image;
+    this.prefetches.set(name, desiredDigest);
+    this.log(`${name}: prefetching ${ref} in the background so the swap is ready when the tide goes out`);
+    this.docker.pull(ref, this.authFor(ref)).catch((error) => {
+      this.prefetches.delete(name);
+      this.log(`${name}: prefetch of ${ref} failed (${(error as Error).message}); will retry`);
+    });
   }
 
   /**
