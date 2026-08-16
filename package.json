@@ -1,0 +1,19 @@
+{
+  "name": "tidewaiter",
+  "version": "1.0.0",
+  "description": "Label-driven Docker auto-updater that updates containers only when idle, health-gates the swap, and rolls back on failure",
+  "license": "Apache-2.0",
+  "type": "module",
+  "module": "src/main.ts",
+  "scripts": {
+    "test": "bun run.ts test",
+    "start": "bun run src/main.ts",
+    "check": "bun run.ts check",
+    "build": "bun run.ts build",
+    "image": "bun run.ts image"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "typescript": "^5"
+  }
+}
