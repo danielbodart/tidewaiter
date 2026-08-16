@@ -55,6 +55,8 @@ What "healthy" means for the commit/rollback gate, chosen per container by `tide
 
 A malformed label is reported and the default used — one bad label never stops a container being managed.
 
+`tidewaiter.ports` takes a comma-separated list where each term is a port with an optional protocol: `25565/tcp` (TCP only), `19132/udp` (UDP only), or a bare `25565` (both, or whichever the container actually publishes) — e.g. `tidewaiter.ports=25565,19132/udp`.
+
 ## Deploy
 
 ```yaml

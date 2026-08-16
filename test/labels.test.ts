@@ -114,6 +114,32 @@ describe("parseLabels", () => {
       expect(policy.ports).toEqual([port(19132, "udp")]);
     });
 
+    test("a bare port matches whichever protocols the container publishes (both, here)", () => {
+      // Unlike portical (where bare = both unconditionally), a bare port selects
+      // the protocols actually published - both when both exist.
+      const policy = opted(
+        { "tidewaiter.autoupdate": "registry", "tidewaiter.ports": "19132" },
+        [port(19132, "tcp"), port(19132, "udp")],
+      );
+      expect(policy.ports).toEqual([port(19132, "tcp"), port(19132, "udp")]);
+    });
+
+    test("a bare port matches just the one protocol when only one is published", () => {
+      const policy = opted(
+        { "tidewaiter.autoupdate": "registry", "tidewaiter.ports": "19132" },
+        [port(19132, "udp")],
+      );
+      expect(policy.ports).toEqual([port(19132, "udp")]);
+    });
+
+    test("multiple comma-separated terms combine", () => {
+      const policy = opted(
+        { "tidewaiter.autoupdate": "registry", "tidewaiter.ports": "25565/tcp,19132/udp" },
+        [port(25565, "tcp"), port(25565, "udp"), port(19132, "udp")],
+      );
+      expect(policy.ports).toEqual([port(25565, "tcp"), port(19132, "udp")]);
+    });
+
     test("a port the container does not publish is a warning and dropped", () => {
       const { policy, warnings } = parseLabels(
         { "tidewaiter.autoupdate": "registry", "tidewaiter.ports": "1234" },
