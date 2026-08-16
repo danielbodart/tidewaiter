@@ -1,3 +1,6 @@
+![Tidewaiter Logo](https://raw.githubusercontent.com/danielbodart/tidewaiter/master/logo.png)
+
+
 # Tidewaiter
 
 **Label-driven Docker auto-updater that waits for the tide to go out.** It watches the registry for a newer image, updates a container **only when it's idle** (no live network flows), health-checks the swap, and **rolls back** on failure.
