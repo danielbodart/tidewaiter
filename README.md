@@ -46,7 +46,7 @@ What "healthy" means for the commit/rollback gate, chosen per container by `tide
 | --- | --- | --- |
 | `tidewaiter.autoupdate` | **the opt-in.** `registry` (compare against the registry) or `local` (compare against the locally-stored image, no network). A container is managed only if it carries this label with a known value; absence — or an unrecognised value — means it is left completely alone. | *(none — required to opt in)* |
 | `tidewaiter.detector` | `conntrack` \| `tcp` \| `netio` \| `none` | `conntrack` |
-| `tidewaiter.ports` | override which published ports count as "in use" and get health-probed | container's published ports |
+| `tidewaiter.ports` | scope the idle check and health probe to specific published ports — use it when a container also exposes a metrics/admin port that gets constant automated traffic (which would otherwise keep it looking "busy" forever) | all published ports |
 | `tidewaiter.idle-samples` | consecutive idle passes required before updating | `3` |
 | `tidewaiter.health` | `docker` \| `port` \| `uptime` | `port` |
 | `tidewaiter.health-timeout` | seconds to wait for healthy before rolling back | `120` |

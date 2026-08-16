@@ -43,7 +43,21 @@ const HEALTH_NAMES: readonly HealthName[] = ["docker", "port", "uptime"];
 export interface ContainerPolicy {
   readonly autoupdate: PolicyName;
   readonly detector: DetectorName;
-  /** Undefined means "every port the container publishes". */
+  /**
+   * Which published ports the activity gate and health probe should consider.
+   *
+   * Undefined means "every port the container publishes", which is the right
+   * default. The override exists for a specific, real case: a container that
+   * publishes a service port *and* a port that gets constant automated traffic -
+   * a Prometheus metrics endpoint scraped every few seconds, an admin/health
+   * port a load balancer polls. Those keep live flows open the whole time, so
+   * the gate would read the container "busy" forever and it would never update.
+   * Naming just the service port (e.g. `tidewaiter.ports=25565`) scopes both the
+   * idle check and the health probe to the port that actually matters. (Note
+   * this is unrelated to the TIME_WAIT filtering in the conntrack detector -
+   * that drops *closed* connections; this drops a whole *port* from
+   * consideration, including its live traffic.)
+   */
   readonly ports?: readonly PublishedPort[];
   readonly idleSamples: number;
   readonly health: HealthName;
