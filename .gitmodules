@@ -1,0 +1,3 @@
+[submodule "vendor/portical"]
+	path = vendor/portical
+	url = https://github.com/danielbodart/portical

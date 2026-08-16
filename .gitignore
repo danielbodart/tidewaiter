@@ -1,0 +1,9 @@
+node_modules/
+dist/
+/tidewaiter
+*.log
+.env
+.env.*
+config.ign
+.DS_Store
+.claude/
