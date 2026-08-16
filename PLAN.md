@@ -100,7 +100,18 @@ for each container with tidewaiter.enable=true:
 
 Notes:
 - **Recreate faithfully.** Preserve name, env, mounts, ports, networks, labels, restart policy, caps — read them off the running container's inspect and re-apply. (This is the fiddliest part; portical's `docker.ts` already models containers/inspect — extend it with create/remove.)
-- **Rollback** mirrors Podman's "restart failed → previous image": we keep the previous image ID and, on health failure, put it straight back. Health signal = Docker `HEALTHCHECK` status (fall back to "container stays running for T seconds" when no healthcheck is defined).
+- **Rollback** mirrors Podman's "restart failed → previous image": we keep the previous image ID and, on health failure, put it straight back.
+
+### Health strategy (what "healthy" means for the commit/rollback gate)
+`HEALTHCHECK` is a real Docker feature (Dockerfile instruction or runtime override; daemon runs the probe; status at `docker inspect .State.Health.Status`) — but it is **optional** and, when present, runs a command **inside** the container (needs tooling baked in). So it can't be the only signal. Tidewaiter probes from **outside** (it already has host net + netns access + `CAP_NET_ADMIN` + each container's ports from the activity gate), giving a health ladder, chosen per container by `tidewaiter.health`:
+
+1. **`docker`** — read `.State.Health.Status`; use it when the container defines a HEALTHCHECK. Authoritative.
+2. **`port`** (default) — network probe from outside, no in-container tooling needed:
+   - TCP: `connect()` to the published TCP port(s) — accepts ⇒ up and listening.
+   - TCP **and** UDP: confirm a LISTEN/bound socket on the expected port via `/proc/net/{tcp,udp}` in the container's netns. This is the **only generic UDP signal** (UDP has no connect handshake). Reuses the detector's netns machinery.
+3. **`uptime`** — weakest: "stays running for T seconds." Last resort.
+
+Honest limit: "bound" ≠ "fully functional" — but that matches what most real TCP/HTTP healthchecks actually test. Truly confirming a UDP game server is healthy needs a **protocol-aware ping** (RakNet/A2S); that's the deferred per-game `game-query` path, and the bound-socket check is the generic stand-in until then. Because the outside probe needs no baked-in tooling, `port` is arguably a *better* default than trusting image-provided HEALTHCHECKs.
 - **Registry auth**: support anonymous + `~/.docker/config.json` creds for private registries; Docker Hub rate-limit awareness (Dockcheck does this — reference it).
 - **Digest, not tag-chasing**: compare manifest digests for the pinned tag (e.g. `:latest`, `:2`), like Podman's registry policy — do not silently jump tags.
 
@@ -149,8 +160,9 @@ Attribution: portical is the author's own (Apache-2.0); copying is fine. Keep a 
 | `tidewaiter.enable` | opt this container in | `false` |
 | `tidewaiter.policy` | `registry` (digest) — room for `local` later | `registry` |
 | `tidewaiter.detector` | `conntrack` \| `tcp` \| `netio` \| `none` | `conntrack` |
-| `tidewaiter.ports` | override which ports count as "in use" | container's published ports |
+| `tidewaiter.ports` | override which ports count as "in use" (and which to health-probe) | container's published ports |
 | `tidewaiter.idle-samples` | consecutive idle checks required | e.g. `3` |
+| `tidewaiter.health` | `docker` \| `port` \| `uptime` (see §5 health ladder) | `port` |
 | `tidewaiter.health-timeout` | seconds to wait for healthy before rollback | e.g. `120` |
 | `tidewaiter.grace` | stop grace (drain) seconds | container's `stop_grace_period` |
 
@@ -173,7 +185,7 @@ Mirror portical's convention (`portical.upnp.forward`) so the two read as a fami
 ## 10. Assumptions & open questions (confirm during build)
 
 - **"UDP and TCP, backup TCP only, ignore all others"** is read as: conntrack sees UDP+TCP; the *fallback* is TCP-only (UDP has no socket-state fallback); other protocols ignored. Confirm this matches intent.
-- Health signal when a container has **no HEALTHCHECK**: use "stays up for T seconds" — is that enough, or require an explicit health label to be eligible for auto-update?
+- ~~Health signal when a container has no HEALTHCHECK~~ **Resolved (§5):** default to an outside network `port`/bound-socket probe (works TCP+UDP, no in-container tooling); `docker` health when defined; `uptime` as last resort. Selectable via `tidewaiter.health`.
 - Rollback bookkeeping: keep the previous image for one cycle then prune, vs keep last-known-good indefinitely.
 - Multi-arch / private-registry auth scope for v1.
 - Does the reconcile also want an `/events`-driven fast path (like portical) or is a plain interval enough for updates? (Interval is probably fine; events matter less for image changes.)
