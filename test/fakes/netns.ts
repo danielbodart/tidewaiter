@@ -9,6 +9,12 @@ import type { NetnsReader, NetTable } from "../../src/netns.ts";
  */
 export class FakeNetnsReader implements NetnsReader {
   readonly tables = new Map<string, string>();
+  /**
+   * Make read() throw, as the real reader does when /proc/<pid>/net/* is not
+   * there yet - a freshly-started or just-exited container. Models the ENOENT a
+   * live host throws that an in-memory default of "" would hide.
+   */
+  failWith?: Error;
 
   set(pid: number, table: NetTable, text: string): this {
     this.tables.set(`${pid}:${table}`, text);
@@ -16,6 +22,7 @@ export class FakeNetnsReader implements NetnsReader {
   }
 
   async read(pid: number, table: NetTable): Promise<string> {
+    if (this.failWith) throw this.failWith;
     return this.tables.get(`${pid}:${table}`) ?? "";
   }
 }

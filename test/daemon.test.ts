@@ -5,6 +5,7 @@ import { FakeConntrackSource } from "./fakes/conntrack.ts";
 import { FakeDocker, port, runningContainer } from "./fakes/docker.ts";
 import { FakeNetnsReader } from "./fakes/netns.ts";
 import { FakeRegistry } from "./fakes/registry.ts";
+import { FakeTcpProbe } from "./fakes/tcp.ts";
 
 /**
  * The whole daemon, wired to a Docker, registry, conntrack and netns that exist
@@ -17,6 +18,7 @@ function tidewaiter(overrides: Partial<Options> = {}) {
   const registry = new FakeRegistry();
   const conntrack = new FakeConntrackSource();
   const netns = new FakeNetnsReader();
+  const tcp = new FakeTcpProbe();
   const log: string[] = [];
   let now = 1_000_000;
   const daemon = new Tidewaiter(
@@ -27,12 +29,15 @@ function tidewaiter(overrides: Partial<Options> = {}) {
     { ...DEFAULTS, healthPollMillis: 1, ...overrides },
     (message) => log.push(message),
     () => now,
+    undefined,
+    tcp,
   );
   return {
     docker,
     registry,
     conntrack,
     netns,
+    tcp,
     daemon,
     log,
     advance(ms: number) { now += ms; },
@@ -149,6 +154,73 @@ describe("an idle container with a newer image", () => {
     expect(docker.removes.some((r) => r.container === "web-tidewaiter-rollback")).toBe(true);
   });
 
+  // The default health=port path, end to end - the one that failed on a live
+  // host. Health is confirmed by a real connect() to the published HOST port
+  // (18080 here), not by reading /proc, so there is no PID/netns timing to race.
+  test("commits a port-health update once the published host port accepts a connection", async () => {
+    const { docker, registry, daemon, tcp } = tidewaiter();
+    // health defaults to port; publish 18080:80.
+    docker.running.push(
+      runningContainer("web", {
+        imageId: "config-sha256:old",
+        spec: {
+          image: "app:latest",
+          labels: { "tidewaiter.autoupdate": "registry", "tidewaiter.idle-samples": "2", "tidewaiter.health-timeout": "5" },
+          published: [port(18080, 80, "tcp")],
+        },
+      }),
+    );
+    registry.digests["app:latest"] = "sha256:new";
+    docker.images["config-sha256:old"] = "sha256:old";
+    docker.images["app:latest"] = "sha256:old";
+    docker.pullLands["app:latest"] = "sha256:new";
+    // The new container will accept connections on its published host port.
+    tcp.listening(18080);
+
+    await daemon.once();
+    const actions = await daemon.once(); // idle-samples=2 -> updates on the 2nd pass
+
+    expect(actions.map((a) => a.kind)).toEqual(["update"]);
+    expect(tcp.probed).toContain(18080); // health was confirmed by connecting to the host port
+    expect(docker.removes.some((r) => r.container === "web-tidewaiter-rollback")).toBe(true); // committed
+  });
+
+  test("rolls back a port-health update when the host port never accepts within the timeout", async () => {
+    // A clock that ticks forward on every read, so the health-timeout deadline is
+    // genuinely reached without real waiting. The tcp probe never opens 18080, so
+    // every poll returns "not up yet" until the deadline -> rollback.
+    const docker = new FakeDocker();
+    const registry = new FakeRegistry();
+    let now = 1_000_000;
+    const daemon = new Tidewaiter(
+      docker, registry, new FakeConntrackSource(), new FakeNetnsReader(),
+      { ...DEFAULTS, healthPollMillis: 0 },
+      () => {},
+      () => (now += 250), // 250ms per read -> crosses a 1s health-timeout in a few polls
+      undefined,
+      new FakeTcpProbe(), // nothing listening -> connect always refused
+    );
+    docker.running.push(
+      runningContainer("web", {
+        imageId: "config-sha256:old",
+        spec: {
+          image: "app:latest",
+          labels: { "tidewaiter.autoupdate": "registry", "tidewaiter.idle-samples": "1", "tidewaiter.health-timeout": "1" },
+          published: [port(18080, 80, "tcp")],
+        },
+      }),
+    );
+    registry.digests["app:latest"] = "sha256:new";
+    docker.images["config-sha256:old"] = "sha256:old";
+    docker.images["app:latest"] = "sha256:old";
+    docker.pullLands["app:latest"] = "sha256:new";
+
+    await daemon.once();
+
+    // rolled back to the old container, never left broken.
+    expect(docker.renames.some((r) => r.container === "web-tidewaiter-rollback" && r.to === "web")).toBe(true);
+  });
+
   test("rolls back on a health_status:unhealthy event", async () => {
     const { docker, registry, daemon, log } = tidewaiter({ healthPollMillis: 60_000 });
     opted(docker, registry, "web", "sha256:old", "sha256:bad", {
@@ -204,6 +276,36 @@ describe("an idle container with a newer image", () => {
     docker.healthByName["web"] = "healthy";
     const actions = await daemon.once();
     expect(actions.map((a) => a.kind)).toEqual(["update"]);
+  });
+
+  // A DETERMINISTIC swap failure (a genuinely broken image, not a blip) must not
+  // retry forever: after a few consecutive failures on the same digest it pins
+  // out, and the service stays up throughout.
+  test("backs off and pins out after repeated swap failures on the same digest", async () => {
+    const { docker, registry, daemon, log } = tidewaiter();
+    opted(docker, registry, "web", "sha256:old", "sha256:new", {
+      "tidewaiter.idle-samples": "1",
+      "tidewaiter.health": "docker",
+      "tidewaiter.health-timeout": "1",
+    });
+    // Every start fails - a deterministically broken image.
+    docker.failOp.start = new Error("exec: entrypoint not found");
+
+    // MAX_SWAP_FAILURES is 3: passes 1-3 attempt+fail, pass 4 is pinned.
+    expect((await daemon.once()).map((a) => a.kind)).toEqual(["update"]); // fail 1
+    expect((await daemon.once()).map((a) => a.kind)).toEqual(["update"]); // fail 2
+    expect((await daemon.once()).map((a) => a.kind)).toEqual(["update"]); // fail 3 -> pins
+    expect((await daemon.once()).map((a) => a.kind)).toEqual(["pinned"]); // now pinned, no more attempts
+    expect(log.join("\n")).toContain("pinning it out");
+    // The original container survived every failed swap.
+    expect(docker.running.some((c) => c.spec.name === "web")).toBe(true);
+
+    // A new digest clears the back-off and it tries again.
+    registry.digests["app:latest"] = "sha256:fixed";
+    docker.pullLands["app:latest"] = "sha256:fixed";
+    docker.failOp.start = undefined;
+    docker.healthByName["web"] = "healthy";
+    expect((await daemon.once()).map((a) => a.kind)).toEqual(["update"]);
   });
 
   // Regression: private-registry credentials must reach docker pull, not just

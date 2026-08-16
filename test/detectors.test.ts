@@ -49,6 +49,20 @@ describe("conntrackDetector", () => {
     const result = await detect([tcp(1234)]);
     expect(result).toEqual({ inUse: false, confidence: "high" });
   });
+
+  // The live-host bug: port 28080 has only a TIME_WAIT flow (a finished
+  // connection cooling down ~2 min). It must NOT read as in use, or a container
+  // would look busy for minutes after its last request ended and never update.
+  test("a TIME_WAIT-only (closed) TCP flow reads as idle, not in use", async () => {
+    const result = await detect([tcp(28080)]);
+    expect(result).toEqual({ inUse: false, confidence: "high" });
+  });
+
+  test("an ESTABLISHED flow to the same port would read as in use", async () => {
+    const established: ConntrackEntry = { protocol: "tcp", destinationPort: 28080, assured: true, state: "ESTABLISHED" };
+    const result = await detect([tcp(28080)], [established]);
+    expect(result.inUse).toBe(true);
+  });
 });
 
 describe("tcpDetector", () => {

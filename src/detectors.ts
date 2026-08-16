@@ -51,12 +51,30 @@ export interface Detector {
  * packet is not. Presence is high-confidence; ASSURED flows are counted as
  * sessions, unassured ones still mark "in use" but are not counted.
  */
+/**
+ * TCP states that mean the connection is closing or closed.
+ *
+ * A conntrack entry in one of these is a *finished* connection cooling down -
+ * TIME_WAIT alone lingers ~2 minutes. Counting it as "in use" would keep a
+ * container busy long after its last request ended, so the detector drops these
+ * and counts only genuinely-active TCP flows. UDP has no state, so UDP flows are
+ * never excluded here (their liveness is judged by ASSURED instead).
+ */
+const CLOSING_TCP_STATES: ReadonlySet<string> = new Set([
+  "TIME_WAIT", "CLOSE_WAIT", "CLOSE", "CLOSING", "FIN_WAIT", "LAST_ACK",
+]);
+
+/** Whether a flow is an active session, not a closing/closed TCP connection. */
+function isActive(entry: ConntrackEntry): boolean {
+  return entry.state === undefined || !CLOSING_TCP_STATES.has(entry.state);
+}
+
 export const conntrackDetector: Detector = {
   name: "conntrack",
   async inUse(input) {
     const ports = new Set(input.published.map((port) => `${port.protocol}/${port.hostPort}`));
-    const flows = input.conntrack.filter((entry) =>
-      ports.has(`${entry.protocol}/${entry.destinationPort}`),
+    const flows = input.conntrack.filter(
+      (entry) => ports.has(`${entry.protocol}/${entry.destinationPort}`) && isActive(entry),
     );
     const assured = flows.filter((flow) => flow.assured);
 

@@ -11,10 +11,26 @@ import type { HealthStatus, PublishedPort, RunningContainer } from "./model.ts";
  */
 export type HealthResult = { readonly healthy: true } | { readonly healthy: false; readonly reason: string };
 
+/**
+ * Can a TCP connection be opened to a host port right now?
+ *
+ * The seam for the TCP health probe, so tests decide the answer without a real
+ * socket - the same "inject the I/O boundary" move as NetnsReader. Tidewaiter
+ * runs host-networked, so the real implementation just connect()s to the port on
+ * the host: the very port a client hits, which is what "healthy" actually means.
+ * Proven on a live host to distinguish open from closed cleanly, where a UDP
+ * send cannot (a published-but-unbound UDP port is silent, indistinguishable
+ * from a bound one - hence UDP still uses the bound-socket check below).
+ */
+export interface TcpProbe {
+  connectable(hostPort: number, signal: AbortSignal): Promise<boolean>;
+}
+
 export interface HealthInput {
   readonly container: RunningContainer;
   readonly ports: readonly PublishedPort[];
   readonly netns: NetnsReader;
+  readonly tcp: TcpProbe;
 }
 
 /**
@@ -64,44 +80,89 @@ export function verdictForDockerHealth(health: HealthStatus): HealthResult | und
 
 /** The `st` code Linux reports for a bound (listening) UDP socket. */
 const UDP_LISTEN = "07";
-/** The `st` code for a listening TCP socket. */
-const TCP_LISTEN = "0A";
 
 /**
- * Probe from outside: is something listening on the published ports?
+ * Probe from outside: can the published ports actually be reached?
  *
- * The default, because it needs nothing inside the container. For TCP it checks
- * for a LISTEN socket in the container's netns (a real connect() would also
- * work, but reading the socket table avoids leaving half-open connections and
- * reuses the detector's netns machinery). For UDP - which has no connect
- * handshake - a bound socket is the only generic signal there is. "Bound" is
- * not "fully functional", but it matches what most real healthchecks test.
+ * The default, because it needs nothing inside the container. Two mechanisms,
+ * each the robust one for its protocol - a distinction proven empirically on a
+ * live host:
+ *
+ *   TCP - a real connect() to the published HOST port, the exact port a client
+ *         hits. Success is unambiguous ("open") and refusal is unambiguous
+ *         ("closed"). No PID, no /proc, no netns - so none of the startup-timing
+ *         fragility that reading a socket table by pid suffers. A connect() that
+ *         is refused mid-startup just reads as "not up yet, keep waiting".
+ *
+ *   UDP - has no connect handshake, and a UDP send cannot tell an open port from
+ *         a published-but-unbound one (Docker's DNAT forwards the datagram either
+ *         way and nothing answers - both go silent, confirmed on a live host).
+ *         So the ONLY generic UDP signal is a bound socket, read from
+ *         /proc/<pid>/net/udp in the container's netns. "Bound" is not "fully
+ *         functional", but it is the ceiling of what is generically knowable;
+ *         a protocol-aware probe (A2S/RakNet) is the deferred game-server path.
  */
 export const portHealthProber: HealthProber = {
   name: "port",
-  async check(input) {
+  async check(input, signal) {
     if (input.ports.length === 0) {
       return { healthy: false, reason: "health=port but the container publishes no ports to probe" };
     }
 
-    const tcpPorts = new Set(input.ports.filter((p) => p.protocol === "tcp").map((p) => p.containerPort));
-    const udpPorts = new Set(input.ports.filter((p) => p.protocol === "udp").map((p) => p.containerPort));
-
-    if (tcpPorts.size > 0) {
-      const listening = await portsInState(input.netns, input.container.pid, "tcp", TCP_LISTEN);
-      const missing = [...tcpPorts].find((port) => !listening.has(port));
-      if (missing !== undefined) return undefined; // not up yet - keep waiting
+    // TCP: connect() to each published host port. Any one not yet accepting means
+    // "not up yet" - keep waiting; only the overall health-timeout fails it.
+    for (const p of input.ports) {
+      if (p.protocol !== "tcp") continue;
+      if (!(await input.tcp.connectable(p.hostPort, signal))) return undefined;
     }
 
+    // UDP: bound-socket check in the container's netns. A read failure means the
+    // netns/proc is not ready yet (freshly started, or the pid briefly moved) -
+    // inconclusive, poll again, never an immediate unhealthy.
+    const udpPorts = new Set(input.ports.filter((p) => p.protocol === "udp").map((p) => p.containerPort));
     if (udpPorts.size > 0) {
-      const bound = await portsInState(input.netns, input.container.pid, "udp", UDP_LISTEN);
-      const missing = [...udpPorts].find((port) => !bound.has(port));
-      if (missing !== undefined) return undefined;
+      try {
+        const bound = await portsInState(input.netns, input.container.pid, "udp", UDP_LISTEN);
+        const missing = [...udpPorts].find((port) => !bound.has(port));
+        if (missing !== undefined) return undefined;
+      } catch {
+        return undefined;
+      }
     }
 
     return { healthy: true };
   },
 };
+
+/**
+ * The real TCP probe: open a connection to a host port, briefly.
+ *
+ * Tidewaiter is host-networked, so a published port is reachable at 127.0.0.1 on
+ * the host - the same path a client takes. Connects, then closes at once; a
+ * refusal (nothing accepting yet) is a clean `false`, any other error is treated
+ * as not-yet-up too, so a startup race never reads as a hard failure.
+ */
+export class BunTcpProbe implements TcpProbe {
+  constructor(private readonly host: string = "127.0.0.1", private readonly timeoutMillis: number = 2000) {}
+
+  async connectable(hostPort: number, signal: AbortSignal): Promise<boolean> {
+    let socket: { end(): void } | undefined;
+    try {
+      socket = await Promise.race([
+        Bun.connect({ hostname: this.host, port: hostPort, socket: { data() {}, open(s) { s.end(); } } }),
+        new Promise<never>((_, reject) => {
+          const timer = setTimeout(() => reject(new Error("timed out")), this.timeoutMillis);
+          signal.addEventListener("abort", () => { clearTimeout(timer); reject(new Error("aborted")); }, { once: true });
+        }),
+      ]);
+      return true;
+    } catch {
+      return false;
+    } finally {
+      socket?.end();
+    }
+  }
+}
 
 /**
  * The weakest gate: the container simply stays running for a while.

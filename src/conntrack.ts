@@ -3,17 +3,24 @@ import type { Protocol } from "./model.ts";
 /**
  * One flow from the host's conntrack table, reduced to what a detector needs.
  *
- * `destinationPort` is the flow's *reply* destination as conntrack reports it
- * on the original-direction tuple - i.e. the host port a client connected to,
- * which is what we match against a container's published host ports. `assured`
- * marks a flow conntrack has seen traffic in both directions on, which is the
- * signal that separates a real session from a lone probe packet or a SYN that
+ * `destinationPort` is the original-direction dport - i.e. the host port a
+ * client connected to, which is what we match against a container's published
+ * host ports. `assured` marks a flow conntrack has seen traffic in both
+ * directions on, which separates a real session from a lone probe or a SYN that
  * went nowhere.
+ *
+ * `state` is the TCP connection state (ESTABLISHED, TIME_WAIT, ...), undefined
+ * for UDP (which conntrack tracks with no such state). It is load-bearing: a
+ * TIME_WAIT / CLOSE_WAIT flow is a connection that has *finished*, and it
+ * lingers in the table for up to ~2 minutes. Counting those as "in use" would
+ * make a container read busy for two minutes after its last request ended, so
+ * the detector uses this to count only genuinely-active flows.
  */
 export interface ConntrackEntry {
   readonly protocol: Protocol;
   readonly destinationPort: number;
   readonly assured: boolean;
+  readonly state?: string;
 }
 
 /**
@@ -73,6 +80,10 @@ export class CliConntrackSource implements ConntrackSource {
 // second belongs to the reply tuple (the client's own source port).
 const LINE = /^(tcp|udp)\s/;
 const DPORT = /\bdport=(\d{1,5})\b/;
+// The TCP connection state is the 4th whitespace field on a tcp line
+// (`tcp  6  431999  ESTABLISHED  src=...`), all caps. UDP lines have no such
+// field, so this simply does not match for them.
+const TCP_STATE = /^tcp\s+\d+\s+\d+\s+([A-Z_]+)/;
 
 /**
  * Parse `conntrack -L` output into flows, keeping only TCP and UDP.
@@ -104,6 +115,7 @@ export function parseConntrack(text: string): ConntrackEntry[] {
       protocol,
       destinationPort,
       assured: line.includes("[ASSURED]"),
+      state: TCP_STATE.exec(line)?.[1],
     });
   }
 

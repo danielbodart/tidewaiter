@@ -3,11 +3,13 @@ import { decide, type Action, type ContainerState, type Snapshot } from "./decid
 import { combine, detectorByName, netioDetector, type Detector, type DetectorResult } from "./detectors.ts";
 import type { DockerClient } from "./docker.ts";
 import {
+  BunTcpProbe,
   healthProberByName,
   uptimeHealthProber,
   verdictForDockerHealth,
   type HealthProber,
   type HealthResult,
+  type TcpProbe,
 } from "./health.ts";
 import { parseLabels, type ContainerPolicy } from "./labels.ts";
 import type { Digest, PublishedPort, RunningContainer } from "./model.ts";
@@ -59,9 +61,24 @@ interface State extends ContainerState {
   readonly keptImages: readonly Digest[];
   /** True once we have logged the "adopting as baseline" note for this container. */
   readonly adopted?: boolean;
+  /**
+   * Consecutive swap-step failures against `failingDigest`, for back-off.
+   *
+   * A single swap-step failure is not pinned (it may be a transient Docker
+   * hiccup - a socket blip, momentary disk pressure - that says nothing about
+   * the image). But a *deterministic* failure (a genuinely broken image) would
+   * otherwise retry every pass forever. After MAX_SWAP_FAILURES in a row on the
+   * same target digest, the container is pinned out just as a health failure
+   * pins it, and a new digest clears the count.
+   */
+  readonly swapFailures?: number;
+  readonly failingDigest?: Digest;
 }
 
 const INITIAL: State = { idleStreak: 0, keptImages: [] };
+
+/** Consecutive swap-step failures on one digest before it is pinned out. */
+const MAX_SWAP_FAILURES = 3;
 
 /**
  * The reconcile loop, reshaped from portical for updates instead of forwards.
@@ -92,6 +109,14 @@ export class Tidewaiter {
      * means "anonymous everywhere", which is fine for public images.
      */
     private readonly auth?: AuthSource,
+    /**
+     * Opens a TCP connection to a host port, for the `port` health probe.
+     *
+     * Injected like netns so tests answer without a real socket. Defaults to a
+     * real connect() against the host, which is where a host-networked
+     * Tidewaiter reaches a container's published ports.
+     */
+    private readonly tcp: TcpProbe = new BunTcpProbe(),
   ) {}
 
   private readonly state = new Map<string, State>();
@@ -403,8 +428,21 @@ export class Tidewaiter {
     if (!progress.ok) {
       this.log(`${name}: FAILED during swap (${progress.error.message}); undoing what was done`);
       await this.undoSwap(plan, progress, name);
-      // A swap-step failure is infrastructure, not a bad image: do not pin.
-      return { ...base, previousImage };
+
+      // Count consecutive failures on THIS digest. One (or a few) may be a
+      // transient Docker hiccup, so we retry - but a deterministic failure (a
+      // genuinely broken image) would retry every pass forever, so after
+      // MAX_SWAP_FAILURES in a row we pin it out, exactly as a health failure
+      // does. A different target digest resets the count.
+      const failures = base.failingDigest === desiredDigest ? (base.swapFailures ?? 0) + 1 : 1;
+      if (failures >= MAX_SWAP_FAILURES) {
+        this.log(
+          `${name}: swap has failed ${failures} times running for ${desiredDigest}; ` +
+            "pinning it out until the tag moves on",
+        );
+        return { ...base, previousImage, pinnedDigest: desiredDigest, swapFailures: failures, failingDigest: desiredDigest };
+      }
+      return { ...base, previousImage, swapFailures: failures, failingDigest: desiredDigest };
     }
 
     const health = await this.waitHealthy(name, policy);
@@ -580,7 +618,10 @@ export class Tidewaiter {
         const result =
           prober.name === "docker"
             ? verdictForDockerHealth(fresh.health)
-            : await prober.check({ container: fresh, ports: policy.ports ?? fresh.spec.published, netns: this.netns }, signal);
+            : await prober.check(
+                { container: fresh, ports: policy.ports ?? fresh.spec.published, netns: this.netns, tcp: this.tcp },
+                signal,
+              );
 
         if (result !== undefined) return result;
         await this.sleep(this.options.healthPollMillis, signal);

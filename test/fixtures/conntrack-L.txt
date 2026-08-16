@@ -3,4 +3,5 @@ tcp      6 117 SYN_SENT src=10.0.0.51 dst=10.0.0.1 sport=52000 dport=25565 [UNRE
 udp      17 29 src=203.0.113.9 dst=10.0.0.1 sport=40000 dport=19132 src=10.0.0.1 dst=203.0.113.9 sport=19132 dport=40000 [ASSURED] mark=0 use=1
 udp      17 10 src=203.0.113.10 dst=10.0.0.1 sport=40001 dport=19132 [UNREPLIED] src=10.0.0.1 dst=203.0.113.10 sport=19132 dport=40001 mark=0 use=1
 tcp      6 300 ESTABLISHED src=10.0.0.60 dst=10.0.0.1 sport=44000 dport=8080 src=10.0.0.1 dst=10.0.0.60 sport=8080 dport=44000 [ASSURED] mark=0 use=1
+tcp      6 117 TIME_WAIT src=127.0.0.1 dst=127.0.0.1 sport=52336 dport=28080 src=127.0.0.1 dst=127.0.0.1 sport=28080 dport=52336 [ASSURED] mark=0 use=1
 icmp     1 29 src=10.0.0.70 dst=10.0.0.1 type=8 code=0 id=1 src=10.0.0.1 dst=10.0.0.70 type=0 code=0 id=1 mark=0 use=1
