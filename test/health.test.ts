@@ -23,6 +23,7 @@ function input(over: Partial<HealthInput> = {}): HealthInput {
     ports: [],
     netns: new FakeNetnsReader(),
     tcp: new FakeTcpProbe(),
+    networkDriver: async () => "bridge", // default: reachable, override for macvlan/overlay
     ...over,
   };
 }
@@ -49,30 +50,123 @@ describe("dockerCheck", () => {
   });
 });
 
-describe("portConnectCheck (TCP only, real connect)", () => {
-  test("passes as soon as ANY published TCP port accepts", async () => {
-    const tcp = new FakeTcpProbe().listening(18081); // only the second port is up
-    const result = await portConnectCheck.evaluate(
+describe("portConnectCheck (real connect to the client-facing address)", () => {
+  /** A container attached to a bridge network with a routable runtime IP. */
+  const onBridge = (ip: string) =>
+    runningContainer("app", { spec: { networks: [{ name: "bridge", aliases: [], ipAddress: ip }] } });
+
+  test("passes as soon as ANY endpoint accepts (proxied host port, no container IP)", async () => {
+    const tcp = new FakeTcpProbe().listening(18081); // only the second host port is up
+    const check = portConnectCheck(10, () => 0);
+    const result = await check.evaluate(
       input({ ports: [port(18080, 80, "tcp"), port(18081, 81, "tcp")], tcp }),
       noSignal,
     );
-    expect(result.outcome).toBe("pass"); // one open port is enough
+    expect(result.outcome).toBe("pass");
   });
 
-  test("connects to the HOST port, not the container port", async () => {
+  test("with no container IP, falls back to connecting to the HOST port", async () => {
     const tcp = new FakeTcpProbe().listening(18080);
-    await portConnectCheck.evaluate(input({ ports: [port(18080, 80, "tcp")], tcp }), noSignal);
-    expect(tcp.probed).toContain(18080);
+    const check = portConnectCheck(10, () => 0);
+    await check.evaluate(input({ ports: [port(18080, 80, "tcp")], tcp }), noSignal);
+    expect(tcp.probed).toContain(18080); // the proxied fallback endpoint
   });
 
-  test("no port accepting yet is inconclusive, never a failure", async () => {
-    const tcp = new FakeTcpProbe();
-    const result = await portConnectCheck.evaluate(input({ ports: [port(18080, 80, "tcp")], tcp }), noSignal);
-    expect(result.outcome).toBe("inconclusive");
+  test("prefers the container IP at the CONTAINER port when the container is on a bridge", async () => {
+    const tcp = new FakeTcpProbe().acceptingAt("172.17.0.2", 80);
+    const check = portConnectCheck(10, () => 0);
+    const result = await check.evaluate(
+      input({ container: onBridge("172.17.0.2"), ports: [port(18080, 80, "tcp")], tcp }),
+      noSignal,
+    );
+    expect(result.outcome).toBe("pass");
+    expect(tcp.probedTargets).toContainEqual({ host: "172.17.0.2", port: 80 });
+  });
+
+  test("FAILS past the grace when the container IP is reachable but REFUSES (wrong-address bind)", async () => {
+    // The unique catch: a socket bound to the container's own loopback passes
+    // port-bound (blind to listen address) but is unreachable to clients here.
+    let now = 1_000_000;
+    const tcp = new FakeTcpProbe().refusingAt("172.17.0.2", 80);
+    const check = portConnectCheck(10, () => now);
+    const inp = input({ container: onBridge("172.17.0.2"), ports: [port(18080, 80, "tcp")], tcp });
+    expect((await check.evaluate(inp, noSignal)).outcome).toBe("inconclusive"); // first sight, within grace
+    now += 10_000;
+    expect((await check.evaluate(inp, noSignal)).outcome).toBe("fail"); // route works, nothing serving
+  });
+
+  test("a macvlan container IP is NEVER probed - a stray RST there must not fail a healthy update", async () => {
+    // The bug driver-gating fixes: a macvlan IP whose subnet is coincidentally
+    // routable to some OTHER host would answer with a foreign RST (refused). If
+    // we probed it, that would fail a perfectly healthy update. So we skip it.
+    let now = 1_000_000;
+    const tcp = new FakeTcpProbe().refusingAt("10.0.0.5", 80); // a foreign RST at that IP
+    const macvlan = runningContainer("app", {
+      spec: { networks: [{ name: "pub", aliases: [], ipAddress: "10.0.0.5" }] },
+    });
+    const check = portConnectCheck(10, () => now);
+    // published on a host port too, so there is still a proxied endpoint.
+    const inp = input({
+      container: macvlan,
+      ports: [port(18080, 80, "tcp")],
+      tcp,
+      networkDriver: async () => "macvlan",
+    });
+    await check.evaluate(inp, noSignal);
+    now += 10_000;
+    const result = await check.evaluate(inp, noSignal);
+    expect(result.outcome).toBe("inconclusive"); // NOT fail
+    expect(tcp.probedTargets).not.toContainEqual({ host: "10.0.0.5", port: 80 }); // never touched
+  });
+
+  test("an overlay container IP is likewise skipped (host is not on the VXLAN)", async () => {
+    const tcp = new FakeTcpProbe().refusingAt("10.1.2.3", 80);
+    const overlay = runningContainer("app", {
+      spec: { networks: [{ name: "mesh", aliases: [], ipAddress: "10.1.2.3" }] },
+    });
+    const check = portConnectCheck(10, () => 0);
+    const inp = input({ container: overlay, ports: [port(80, 80, "tcp")], tcp, networkDriver: async () => "overlay" });
+    await check.evaluate(inp, noSignal);
+    expect(tcp.probedTargets).not.toContainEqual({ host: "10.1.2.3", port: 80 });
+  });
+
+  test("an unresolvable driver (network gone) is treated as not-reachable, never probed", async () => {
+    const tcp = new FakeTcpProbe().refusingAt("172.17.0.2", 80);
+    const check = portConnectCheck(10, () => 0);
+    const inp = input({
+      container: onBridge("172.17.0.2"),
+      ports: [port(80, 80, "tcp")],
+      tcp,
+      networkDriver: async () => undefined,
+    });
+    await check.evaluate(inp, noSignal);
+    expect(tcp.probedTargets).not.toContainEqual({ host: "172.17.0.2", port: 80 });
+  });
+
+  test("firewalled bridge: truthful endpoint unreachable but the proxied fallback accepts => pass", async () => {
+    const tcp = new FakeTcpProbe().unreachableAt("172.17.0.2", 80).listening(18080);
+    const check = portConnectCheck(10, () => 0);
+    const result = await check.evaluate(
+      input({ container: onBridge("172.17.0.2"), ports: [port(18080, 80, "tcp")], tcp }),
+      noSignal,
+    );
+    expect(result.outcome).toBe("pass");
+  });
+
+  test("host network mode: probes 127.0.0.1 at the container port, truthfully", async () => {
+    let now = 1_000_000;
+    const tcp = new FakeTcpProbe().refusingAt("127.0.0.1", 8080);
+    const check = portConnectCheck(10, () => now);
+    const host = runningContainer("app", { spec: { networkMode: "host" } });
+    const inp = input({ container: host, ports: [port(8080, 8080, "tcp")], tcp });
+    await check.evaluate(inp, noSignal);
+    now += 10_000;
+    expect((await check.evaluate(inp, noSignal)).outcome).toBe("fail"); // reachable on loopback, refuses
   });
 
   test("no TCP ports published => skip", async () => {
-    const result = await portConnectCheck.evaluate(input({ ports: [port(19132, 19132, "udp")] }), noSignal);
+    const check = portConnectCheck(10, () => 0);
+    const result = await check.evaluate(input({ ports: [port(19132, 19132, "udp")] }), noSignal);
     expect(result.outcome).toBe("skip");
   });
 });
@@ -221,10 +315,10 @@ describe("combine", () => {
 });
 
 describe("checkByName", () => {
-  test("resolves the stateless checks; uptime is built per swap", () => {
+  test("resolves the stateless checks; uptime and port-connect are built per swap", () => {
     expect(checkByName("docker")).toBe(dockerCheck);
-    expect(checkByName("port-connect")).toBe(portConnectCheck);
     expect(checkByName("port-bound")).toBe(portBoundCheck);
     expect(checkByName("uptime")).toBeUndefined();
+    expect(checkByName("port-connect")).toBeUndefined(); // stateful now, built via portConnectCheck()
   });
 });

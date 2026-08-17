@@ -86,6 +86,19 @@ export interface NetworkAttachment {
   /** A static address, when one was assigned rather than handed out by IPAM. */
   readonly ipv4Address?: string;
   readonly ipv6Address?: string;
+  /**
+   * The address the container is ACTUALLY reachable at right now, as Docker
+   * reports it under `NetworkSettings.Networks[name].IPAddress` - the runtime
+   * IP IPAM handed out, distinct from the static `ipv4Address` a user pinned.
+   *
+   * Runtime-only, so recreate.ts must NOT send it back to /containers/create
+   * (like the PID, it is live state). It exists for one reader: the port-connect
+   * health probe, which connects to `ipAddress:containerPort` to test the exact
+   * path a client takes on a bridge/user network - bypassing docker-proxy, which
+   * would falsely accept, and the netns bind check, which is blind to *which*
+   * address a socket listens on.
+   */
+  readonly ipAddress?: string;
 }
 
 export interface RestartPolicy {

@@ -105,6 +105,17 @@ export class FakeDocker implements DockerClient {
     return this.images[idOrRef];
   }
 
+  /**
+   * A network's driver, by name. Defaults to "bridge" for any network a test did
+   * not declare - the common case, and what makes a plain container-IP endpoint
+   * truthful without ceremony. Override for macvlan/overlay/etc.
+   */
+  networkDriversByName: Record<string, string | undefined> = {};
+
+  async networkDriver(network: string): Promise<string | undefined> {
+    return network in this.networkDriversByName ? this.networkDriversByName[network] : "bridge";
+  }
+
   async pull(ref: string, auth?: string): Promise<void> {
     this.pulls.push({ ref, auth });
     if (this.failPull) throw this.failPull;

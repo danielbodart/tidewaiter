@@ -40,8 +40,10 @@ describe("toSpec", () => {
   test("reads multiple networks with their aliases and static addresses", () => {
     const spec = toSpec(multinet);
     expect(spec.networks).toEqual([
-      { name: "frontend", aliases: ["api"], ipv4Address: undefined, ipv6Address: undefined },
-      { name: "backend", aliases: ["api-internal"], ipv4Address: "172.28.0.5", ipv6Address: undefined },
+      // frontend: no static pin, but a runtime IP IPAM handed out (what a client
+      // reaches, and what port-connect probes). backend: statically pinned.
+      { name: "frontend", aliases: ["api"], ipv4Address: undefined, ipv6Address: undefined, ipAddress: "172.27.0.9" },
+      { name: "backend", aliases: ["api-internal"], ipv4Address: "172.28.0.5", ipv6Address: undefined, ipAddress: "172.28.0.5" },
     ]);
   });
 
@@ -68,6 +70,18 @@ describe("HttpDockerClient", () => {
     );
     const digest = await new HttpDockerClient(handler).imageDigest("nginx:1.27");
     expect(digest).toBe("sha256:beef");
+  });
+
+  test("networkDriver reads .Driver and asks for the network by name", async () => {
+    const { handler, requests } = recording(() => Response.json({ Driver: "macvlan" }));
+    const driver = await new HttpDockerClient(handler).networkDriver("pub-net");
+    expect(driver).toBe("macvlan");
+    expect(requests[0]?.url).toContain("/networks/pub-net");
+  });
+
+  test("networkDriver returns undefined when the network is gone (404)", async () => {
+    const { handler } = recording(() => new Response("no such network", { status: 404 }));
+    expect(await new HttpDockerClient(handler).networkDriver("ghost-net")).toBeUndefined();
   });
 
   test("imageDigest returns undefined for an image not present locally", async () => {

@@ -34,8 +34,8 @@
   ],
   "NetworkSettings": {
     "Networks": {
-      "frontend": { "Aliases": ["api"], "IPAMConfig": null },
-      "backend": { "Aliases": ["api-internal"], "IPAMConfig": { "IPv4Address": "172.28.0.5" } }
+      "frontend": { "Aliases": ["api"], "IPAMConfig": null, "IPAddress": "172.27.0.9" },
+      "backend": { "Aliases": ["api-internal"], "IPAMConfig": { "IPv4Address": "172.28.0.5" }, "IPAddress": "172.28.0.5" }
     }
   }
 }

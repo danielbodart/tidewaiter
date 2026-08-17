@@ -44,6 +44,15 @@ export interface DockerClient {
   inspect(container: string): Promise<RunningContainer>;
   /** The digest of a local image, as Docker records it in RepoDigests. */
   imageDigest(ref: string): Promise<Digest | undefined>;
+  /**
+   * A network's driver (bridge, macvlan, overlay, host, ...), by name or id.
+   *
+   * Undefined when the network cannot be resolved (gone, or a 404) - the
+   * port-connect probe reads that as not-reachable, so an IP it cannot classify
+   * is never probed. Deliberately a single, cacheable lookup: a network's driver
+   * does not change over its life.
+   */
+  networkDriver(network: string): Promise<string | undefined>;
   /** Pull an image. `auth` is a ready X-Registry-Auth header value, if any. */
   pull(ref: string, auth?: string): Promise<void>;
   /** Create a container from a spec, returning its new id. */
@@ -121,6 +130,21 @@ export class HttpDockerClient implements DockerClient {
     }
     const raw = (await ok(response).then((r) => r.json())) as RawImageInspect;
     return firstDigest(raw.RepoDigests);
+  }
+
+  async networkDriver(network: string): Promise<string | undefined> {
+    // A missing network is a normal answer (removed under us), not an error, so
+    // 404 comes back as undefined rather than throwing - the probe then treats
+    // the IP as not-reachable and simply does not probe it.
+    const response = await this.handler(
+      new Request(`http://docker/${API}/networks/${encodeURIComponent(network)}`),
+    );
+    if (response.status === 404) {
+      await response.text();
+      return undefined;
+    }
+    const raw = (await ok(response).then((r) => r.json())) as { Driver?: string };
+    return raw.Driver || undefined;
   }
 
   async pull(ref: string, auth?: string): Promise<void> {
@@ -326,7 +350,13 @@ export interface RawContainerInspect {
   NetworkSettings?: {
     Networks?: Record<
       string,
-      { Aliases?: string[] | null; IPAMConfig?: { IPv4Address?: string; IPv6Address?: string } | null }
+      {
+        Aliases?: string[] | null;
+        IPAMConfig?: { IPv4Address?: string; IPv6Address?: string } | null;
+        // The runtime address, distinct from the IPAMConfig static one - what
+        // the container is actually reachable at on this network right now.
+        IPAddress?: string;
+      }
     > | null;
   };
 }
@@ -499,7 +529,11 @@ function networksOf(
   networks:
     | Record<
         string,
-        { Aliases?: string[] | null; IPAMConfig?: { IPv4Address?: string; IPv6Address?: string } | null }
+        {
+          Aliases?: string[] | null;
+          IPAMConfig?: { IPv4Address?: string; IPv6Address?: string } | null;
+          IPAddress?: string;
+        }
       >
     | undefined,
 ): NetworkAttachment[] {
@@ -509,6 +543,9 @@ function networksOf(
     aliases: network.Aliases ?? [],
     ipv4Address: network.IPAMConfig?.IPv4Address || undefined,
     ipv6Address: network.IPAMConfig?.IPv6Address || undefined,
+    // Runtime IP, for the port-connect probe. Kept off recreate deliberately -
+    // toCreatePayload reads ipv4Address/ipv6Address (the static pins), never this.
+    ipAddress: network.IPAddress || undefined,
   }));
 }
 

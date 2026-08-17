@@ -7,6 +7,7 @@ import {
   checkByName,
   combine as combineHealth,
   dockerVerdict,
+  portConnectCheck,
   uptimeCheck,
   type CheckResult,
   type HealthCheck,
@@ -649,10 +650,15 @@ export class Tidewaiter {
   private async waitHealthy(name: string, policy: ContainerPolicy): Promise<HealthResult> {
     const controller = new AbortController();
     const checks = this.checksFor(policy);
+    // A resolver scoped to THIS swap: memoised for the gate's life (so the
+    // port-connect probe does not re-query /networks every poll) and rebuilt next
+    // swap (so nothing goes stale, and no restart is ever needed to see a changed
+    // network). Failure-tolerant - see networkDriverResolver.
+    const networkDriver = networkDriverResolver(this.docker);
 
-    const races: Promise<HealthResult>[] = [this.pollHealthy(name, policy, checks, controller.signal)];
+    const races: Promise<HealthResult>[] = [this.pollHealthy(name, policy, checks, networkDriver, controller.signal)];
     if (policy.health.includes("docker")) {
-      races.push(this.watchHealthEvents(name, policy, checks, controller.signal));
+      races.push(this.watchHealthEvents(name, policy, checks, networkDriver, controller.signal));
     }
 
     try {
@@ -667,11 +673,18 @@ export class Tidewaiter {
     name: string,
     policy: ContainerPolicy,
     checks: readonly HealthCheck[],
+    networkDriver: (network: string) => Promise<string | undefined>,
     signal: AbortSignal,
     dockerOverride?: CheckResult,
   ): Promise<CheckResult[]> {
     const fresh = await this.docker.inspect(name);
-    const input = { container: fresh, ports: policy.ports ?? fresh.spec.published, netns: this.netns, tcp: this.tcp };
+    const input = {
+      container: fresh,
+      ports: policy.ports ?? fresh.spec.published,
+      netns: this.netns,
+      tcp: this.tcp,
+      networkDriver,
+    };
     const results: CheckResult[] = [];
     for (const check of checks) {
       // The event watch already has Docker's verdict from the event; use it
@@ -688,13 +701,14 @@ export class Tidewaiter {
     name: string,
     policy: ContainerPolicy,
     checks: readonly HealthCheck[],
+    networkDriver: (network: string) => Promise<string | undefined>,
     signal: AbortSignal,
   ): Promise<HealthResult> {
     const deadline = this.now() + policy.healthTimeoutSeconds * 1000;
 
     try {
       while (this.now() < deadline && !signal.aborted) {
-        const results = await this.evaluateChecks(name, policy, checks, signal);
+        const results = await this.evaluateChecks(name, policy, checks, networkDriver, signal);
         const verdict = combineHealth(results, false);
         if (verdict !== undefined) return verdict;
         await this.sleep(this.options.healthPollMillis, signal);
@@ -707,7 +721,7 @@ export class Tidewaiter {
     if (signal.aborted) return neverResolves<HealthResult>(signal);
     // Deadline reached: commit unless something actively failed (combine with
     // timedOut=true), so a check that merely never confirmed cannot veto.
-    const results = await this.evaluateChecks(name, policy, checks, signal).catch(() => [] as CheckResult[]);
+    const results = await this.evaluateChecks(name, policy, checks, networkDriver, signal).catch(() => [] as CheckResult[]);
     return combineHealth(results, true) ?? { healthy: true };
   }
 
@@ -722,6 +736,7 @@ export class Tidewaiter {
     name: string,
     policy: ContainerPolicy,
     checks: readonly HealthCheck[],
+    networkDriver: (network: string) => Promise<string | undefined>,
     signal: AbortSignal,
   ): Promise<HealthResult> {
     try {
@@ -730,7 +745,7 @@ export class Tidewaiter {
         if (event.container !== name || !event.action.startsWith("health_status")) continue;
         if (event.status !== "healthy" && event.status !== "unhealthy") continue;
 
-        const results = await this.evaluateChecks(name, policy, checks, signal, dockerVerdict(event.status));
+        const results = await this.evaluateChecks(name, policy, checks, networkDriver, signal, dockerVerdict(event.status));
         const verdict = combineHealth(results, false);
         if (verdict !== undefined) return verdict;
       }
@@ -742,9 +757,14 @@ export class Tidewaiter {
 
   /** The set of health checks for a container, from its `tidewaiter.health`. */
   private checksFor(policy: ContainerPolicy): HealthCheck[] {
-    return policy.health.map((name) =>
-      name === "uptime" ? uptimeCheck(uptimeSeconds(policy.healthTimeoutSeconds), this.now) : checkByName(name)!,
-    );
+    return policy.health.map((name) => {
+      // uptime and port-connect are stateful and share the same grace window
+      // (uptimeSeconds), so both are built per swap with the clock rather than
+      // resolved as singletons.
+      if (name === "uptime") return uptimeCheck(uptimeSeconds(policy.healthTimeoutSeconds), this.now);
+      if (name === "port-connect") return portConnectCheck(uptimeSeconds(policy.healthTimeoutSeconds), this.now);
+      return checkByName(name)!;
+    });
   }
 
   /**
@@ -823,6 +843,31 @@ export class Tidewaiter {
       await pending;
     }
   }
+}
+
+/**
+ * A network-driver resolver scoped to a single health gate.
+ *
+ * Two properties, both deliberate:
+ *   - MEMOISED, so the port-connect probe (evaluated every poll, on two racing
+ *     arms) hits /networks once per network per swap, not once per poll. Built
+ *     fresh each swap, so it is never stale and no restart is ever needed to pick
+ *     up a network that changed between swaps.
+ *   - FAILURE-TOLERANT: any lookup error becomes `undefined`, which the probe
+ *     reads as "not a driver we can route to" and simply does not probe. A
+ *     transient /networks hiccup must never surface as a health-check error and
+ *     roll back an otherwise-healthy update.
+ */
+function networkDriverResolver(docker: DockerClient): (network: string) => Promise<string | undefined> {
+  const memo = new Map<string, Promise<string | undefined>>();
+  return (network) => {
+    let hit = memo.get(network);
+    if (hit === undefined) {
+      hit = docker.networkDriver(network).catch(() => undefined);
+      memo.set(network, hit);
+    }
+    return hit;
+  };
 }
 
 /**

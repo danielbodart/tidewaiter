@@ -70,9 +70,13 @@ export interface ContainerPolicy {
    * (docker, port-connect, port-bound, uptime). The gate rolls back only if a
    * check ACTIVELY fails; a check that merely never confirms does not veto (see
    * health.ts combine()), because false-unhealthy is the worse error. Each check
-   * covers a different blind spot - docker tests app internals, port-connect
-   * tests reachability, port-bound bypasses docker-proxy and is the only UDP
-   * signal, uptime catches a container that exits or crash-loops.
+   * covers a different blind spot - docker tests app internals; port-connect
+   * connects to the container's own address (bridge IP, or loopback in host
+   * mode), catching a service bound to the wrong address that port-bound waves
+   * through, and failing when that address refuses; port-bound reads the netns
+   * for a listening socket, the only UDP signal and the check that bypasses
+   * docker-proxy's fake accept; uptime catches a container that exits or
+   * crash-loops.
    */
   readonly health: readonly HealthName[];
   readonly healthTimeoutSeconds: number;
