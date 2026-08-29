@@ -1,4 +1,4 @@
-![Tidewaiter Logo](https://raw.githubusercontent.com/danielbodart/tidewaiter/master/logo.png)
+<p align="center"><img src="logo.png" alt="Logo" width="600"></p>
 
 
 # Tidewaiter
