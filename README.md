@@ -102,7 +102,7 @@ Options: `-d/--interval SECONDS` (default 300), `-l/--label LABEL`, `--docker-so
 - **Anonymous volumes block updates.** A container with an anonymous volume can't be recreated without losing the volume's data, so Tidewaiter defers and says so — give it a named volume to enable updates.
 - **`container:` network mode is copied verbatim.** A container sharing another's netns (`network_mode: "container:x"`) is recreated as-is; if `x` itself was recreated, the reference can break. Logged when detected.
 - **No crash-recovery of an in-flight swap.** If Tidewaiter restarts mid-swap it has no memory of it; it adopts the running image as the current baseline (with a warning) rather than guessing.
-- **`port`/bound-socket health is "listening", not "fully functional."** It matches what most real TCP/HTTP healthchecks test, but a protocol-aware probe (RakNet/A2S) is a future addition.
+- **`port`/bound-socket health is "listening", not "fully functional."** It matches what most real TCP/HTTP healthchecks test, protocol-aware probes should be bakes into images
 
 ## Relationship to portical
 
