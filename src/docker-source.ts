@@ -168,6 +168,12 @@ export class DockerSource implements Source {
     for (const container of containers) {
       const { policy } = parseLabels(container.spec.labels, container.spec.published);
       if (policy === undefined) continue;
+      // A conntrack dump that failed cannot say nobody is on: busy, so the
+      // inhibitor is never released on a read that did not happen.
+      if (conntrack === undefined && policy.detector === "conntrack") {
+        activities.push({ workload: container.spec.name, busy: true });
+        continue;
+      }
       const ports = policy.ports ?? container.spec.published;
       const result = await this.sample(container, policy, ports, conntrack ?? []);
       activities.push({ workload: container.spec.name, busy: result.inUse });

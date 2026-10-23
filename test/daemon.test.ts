@@ -741,3 +741,24 @@ describe("conntrack is dumped once per pass", () => {
     expect(conntrack.calls).toBe(1);
   });
 });
+
+describe("activity for the shutdown lock", () => {
+  function source() {
+    const docker = new FakeDocker();
+    const registry = new FakeRegistry();
+    return { docker, registry, source: new DockerSource(docker, registry, new FakeNetnsReader(), DEFAULTS, () => {}, () => 0, undefined) };
+  }
+
+  test("a conntrack dump that failed reads as busy, not as an empty table", async () => {
+    const { docker, registry, source: subject } = source();
+    opted(docker, registry, "web", "sha256:old", "sha256:new");
+    expect(await subject.activity(undefined)).toEqual([{ workload: "web", busy: true }]);
+    expect(await subject.activity([])).toEqual([{ workload: "web", busy: false }]);
+  });
+
+  test("a detector that needs no conntrack still answers when the dump failed", async () => {
+    const { docker, registry, source: subject } = source();
+    opted(docker, registry, "web", "sha256:old", "sha256:new", { "tidewaiter.detector": "none" });
+    expect(await subject.activity(undefined)).toEqual([{ workload: "web", busy: false }]);
+  });
+});
