@@ -446,7 +446,10 @@ in
           RestrictSUIDSGID = true;
           LockPersonality = true;
           SystemCallArchitectures = "native";
-          SystemCallFilter = [ "@system-service" ];
+          SystemCallFilter = [
+            "@system-service"
+            "~@privileged"
+          ];
           # The drop-ins are for systemd, but an operator should be able to
           # read them too.
           UMask = "0022";

@@ -41,6 +41,7 @@
         # Builds the binary and runs `bun test` on the way.
         package = self.packages.${pkgs.stdenv.hostPlatform.system}.default;
         module = import ./nix/module-check.nix { inherit pkgs self; };
+        vm = import ./nix/vm-test.nix { inherit pkgs self; };
       });
 
       formatter = forAllSystems (pkgs: pkgs.nixfmt);
