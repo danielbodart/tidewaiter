@@ -228,19 +228,13 @@ function selectPorts(
     const term = raw.trim();
     if (term === "") continue;
 
-    const match = PORT.exec(term);
-    if (!match) {
-      warnings.push(`${PORTS}: ignoring unrecognised port '${term}'`);
+    const parsed = parsePortTerm(term);
+    if (typeof parsed === "string") {
+      warnings.push(`${PORTS}: ${parsed}`);
       continue;
     }
 
-    const hostPort = Number(match[1]);
-    if (hostPort < 1 || hostPort > MAX_PORT) {
-      warnings.push(`${PORTS}: ignoring '${term}', ports must be between 1 and ${MAX_PORT}`);
-      continue;
-    }
-
-    const protocol = match[2]?.toLowerCase() as Protocol | undefined;
+    const { port: hostPort, protocol } = parsed;
     const matching = published.filter(
       (p) => p.hostPort === hostPort && (protocol === undefined || p.protocol === protocol),
     );
@@ -258,7 +252,23 @@ function selectPorts(
   return dedupePorts(selected);
 }
 
-function dedupePorts(ports: readonly PublishedPort[]): PublishedPort[] {
+/**
+ * One `port` or `port/proto` term, as `tidewaiter.ports` and a unit file's
+ * `ports` both write it. A string is the reason it was not one, ready to warn
+ * with; `protocol` undefined means the term named no protocol.
+ */
+export function parsePortTerm(term: string): { readonly port: number; readonly protocol?: Protocol } | string {
+  const match = PORT.exec(term);
+  if (!match) return `ignoring unrecognised port '${term}'`;
+
+  const port = Number(match[1]);
+  if (port < 1 || port > MAX_PORT) return `ignoring '${term}', ports must be between 1 and ${MAX_PORT}`;
+
+  const protocol = match[2]?.toLowerCase() as Protocol | undefined;
+  return protocol === undefined ? { port } : { port, protocol };
+}
+
+export function dedupePorts(ports: readonly PublishedPort[]): PublishedPort[] {
   const byKey = new Map<string, PublishedPort>();
   for (const port of ports) {
     const key = `${port.protocol}/${port.hostPort}`;
@@ -267,7 +277,7 @@ function dedupePorts(ports: readonly PublishedPort[]): PublishedPort[] {
   return [...byKey.values()];
 }
 
-function oneOf<T extends string>(
+export function oneOf<T extends string>(
   value: string | undefined, allowed: readonly T[], fallback: T, name: string, warnings: string[],
 ): T {
   if (value === undefined) return fallback;
@@ -277,7 +287,7 @@ function oneOf<T extends string>(
   return fallback;
 }
 
-function positiveInt(value: string | undefined, fallback: number, name: string, warnings: string[]): number {
+export function positiveInt(value: string | undefined, fallback: number, name: string, warnings: string[]): number {
   const parsed = integer(value, name, warnings);
   if (parsed === undefined) return fallback;
   if (parsed < 1) {
@@ -287,7 +297,7 @@ function positiveInt(value: string | undefined, fallback: number, name: string, 
   return parsed;
 }
 
-function nonNegativeInt(value: string | undefined, fallback: number, name: string, warnings: string[]): number {
+export function nonNegativeInt(value: string | undefined, fallback: number, name: string, warnings: string[]): number {
   const parsed = integer(value, name, warnings);
   if (parsed === undefined) return fallback;
   if (parsed < 0) {
