@@ -15,7 +15,7 @@ import { LogindRebooter, NixosBootCheck, parseWindow } from "./reboot.ts";
 import { dockerConfigAuth, HttpRegistryClient } from "./registry.ts";
 import type { Source, SourceName } from "./source.ts";
 import { FileStateStore } from "./state-store.ts";
-import { DEFAULT_STATUS_FILE, describeStatus, FileStatus, isBusy, NoStatus, readStatus } from "./status.ts";
+import { DEFAULT_STATUS_FILE, describeStatus, FileStatus, isBusy, isStale, NoStatus, readStatus } from "./status.ts";
 import { DbusSystemdClient } from "./systemd.ts";
 import { SystemdSource } from "./systemd-source.ts";
 import { DirUnitsDirectory } from "./units.ts";
@@ -346,7 +346,13 @@ async function status(path: string): Promise<number> {
     console.log(`No status at ${path}: is Tidewaiter running, with --status-file?`);
     return 2;
   }
-  console.log(describeStatus(current, Date.now()).join("\n"));
+  const now = Date.now();
+  if (isStale(current, now)) {
+    console.log(`Stale status at ${path}: is Tidewaiter still running? Its last word was:`);
+    console.log(describeStatus(current, now).join("\n"));
+    return 2;
+  }
+  console.log(describeStatus(current, now).join("\n"));
   return isBusy(current) ? 1 : 0;
 }
 

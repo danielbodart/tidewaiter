@@ -171,6 +171,9 @@ export class Daemon {
     }
     return {
       updated: new Date().toISOString(),
+      // Several ticks missed, and never less than a minute, so a slow
+      // conntrack dump or a busy host doesn't read as a dead daemon.
+      staleAfter: Math.max(60, 4 * this.options.activityInterval),
       busy: this.inUse(),
       swapping: this.swapping(),
       workloads,

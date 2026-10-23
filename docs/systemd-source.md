@@ -645,7 +645,9 @@ Commands: `run`, `check`, `list` work across every source. New: `prepare`, which
 seeds missing profiles and writes the closure drop-ins (section 7), reloads
 systemd if it wrote any, then exits; it reads only the units directory and
 needs no Tidewaiter daemon. And `status` (section 6), which reads only the
-status file, prints no banner, and exits 0 idle, 1 busy, 2 no daemon.
+status file, prints no banner, and exits 0 idle, 1 busy, 2 no daemon -- or a
+stale status, older than the `staleAfter` the daemon writes into it (four
+activity ticks, at least a minute), left by a daemon killed outside systemd.
 
 The usage line becomes "update Docker containers and systemd units only when
 they are idle".
@@ -1006,18 +1008,17 @@ check` (package with `bun test` under nixpkgs' Bun 1.4.2, module, VM).
 1. **No catching up.** A host busy through every window never reboots by
    itself, however old its kernel. Add a deadline - reboot in the window
    anyway once a reboot has been needed for N days, with a loud log - or stay
-   strict? The design is strict: a person can always reboot by hand, and
+   strict? Settled: strict. A person can always reboot by hand, and
    `tidewaiter status` says why it has not.
 2. **A broken detector, or an unreachable registry, holds automatic reboots
    off.** Fail-safe says busy; a container whose registry did not answer is
    never sampled that pass, so is not settled. Sample Docker activity before
    resolving digests, or cap how long an unreadable workload may hold a reboot
-   off? Strict for now.
-3. **A status that outlives its daemon.** Under the module systemd removes
-   `/run/tidewaiter` when the daemon stops, and `run` clears the file on the
-   way out, but a daemon killed outside systemd leaves the last one behind;
-   `status` shows its age, not a verdict on it. Exit 2 when it is older than a
-   few intervals?
+   off? Settled: strict. It goes away for a host whose workloads are all
+   systemd units.
+3. **A status that outlives its daemon.** Settled: the daemon writes a
+   `staleAfter` into each status, and `status` exits 2 for one older than
+   that, as it does for none at all.
 4. **Stopped units.** The design moves a stopped unit's profile to `desired`
    with no gate. Leave its profile alone instead, so a manually-stopped unit
    comes back on what it last ran?

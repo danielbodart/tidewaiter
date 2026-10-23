@@ -215,7 +215,7 @@ The design, and what is still open, is in [`docs/systemd-source.md`](./docs/syst
 tidewaiter run      # reconcile continuously on an interval (default)
 tidewaiter check    # reconcile once and exit
 tidewaiter list     # show managed containers and units, and whether an update is waiting
-tidewaiter status   # what the running daemon sees in use or swapping; exit 0 idle, 1 busy, 2 no daemon
+tidewaiter status   # what the running daemon sees in use or swapping; exit 0 idle, 1 busy, 2 no daemon or a stale status
 tidewaiter prepare  # create missing unit profiles and missing closure drop-ins, then exit
 ```
 

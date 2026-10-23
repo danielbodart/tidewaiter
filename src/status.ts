@@ -34,6 +34,11 @@ export interface RebootStatus {
 export interface Status {
   /** When this was written, ISO 8601. */
   readonly updated: string;
+  /**
+   * Seconds after `updated` by which the daemon will have written again: a
+   * status older than that was left by a daemon that is no longer running.
+   */
+  readonly staleAfter?: number;
   /** The workloads in use, sorted. */
   readonly busy: readonly string[];
   /** The workloads being swapped right now, sorted. */
@@ -86,6 +91,14 @@ export async function readStatus(path: string): Promise<Status | undefined> {
     throw error;
   }
   return JSON.parse(text) as Status;
+}
+
+/**
+ * Whether the daemon that wrote this has stopped writing: one killed outside
+ * systemd leaves its last status behind, which says nothing about now.
+ */
+export function isStale(status: Status, now: number): boolean {
+  return status.staleAfter !== undefined && now - Date.parse(status.updated) > status.staleAfter * 1000;
 }
 
 /** Whether anything is in use or being swapped: what `tidewaiter status` exits 1 for. */

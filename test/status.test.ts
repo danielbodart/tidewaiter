@@ -3,7 +3,7 @@ import { mkdtemp, readdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { main } from "../src/main.ts";
-import { describeStatus, FileStatus, isBusy, readStatus, type Status } from "../src/status.ts";
+import { describeStatus, FileStatus, isBusy, isStale, readStatus, type Status } from "../src/status.ts";
 
 const NOW = Date.parse("2026-10-23T03:30:10Z");
 
@@ -60,6 +60,18 @@ describe("describeStatus", () => {
   });
 });
 
+describe("isStale", () => {
+  test("fresh until staleAfter has passed since it was written", () => {
+    expect(isStale(status({ staleAfter: 60 }), NOW)).toBe(false);
+    expect(isStale(status({ staleAfter: 60 }), NOW + 50_000)).toBe(false);
+    expect(isStale(status({ staleAfter: 60 }), NOW + 51_000)).toBe(true);
+  });
+
+  test("never stale without staleAfter: a status from before it was written", () => {
+    expect(isStale(status(), NOW + 86_400_000)).toBe(false);
+  });
+});
+
 describe("the status file", () => {
   let dir: string;
   afterEach(async () => {
@@ -113,6 +125,16 @@ describe("tidewaiter status", () => {
 
   test("exits 1 while a swap is under way", async () => {
     expect((await run(status({ swapping: ["bedrock.service"] }))).code).toBe(1);
+  });
+
+  test("exits 2 for a status the daemon stopped writing, however idle it says it is", async () => {
+    const { code, output } = await run(status({ updated: new Date(Date.now() - 600_000).toISOString(), staleAfter: 60 }));
+    expect(code).toBe(2);
+    expect(output).toContain("Stale status at");
+  });
+
+  test("believes a status written within staleAfter", async () => {
+    expect((await run(status({ updated: new Date().toISOString(), staleAfter: 60, busy: ["bedrock.service"] }))).code).toBe(1);
   });
 
   test("exits 2 when there is no status: no daemon to ask", async () => {
