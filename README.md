@@ -58,6 +58,14 @@ How to opt something in, and run Tidewaiter, depends on where your services run:
   native Tidewaiter can update Docker containers too, and is the one to use on a
   host that has both: one Tidewaiter per host, so two swaps never overlap.
 
+It runs on Linux on `amd64`, `arm64` or 32-bit `armv7`: the published images and
+binaries cover all three, so a Pi - on 64-bit or 32-bit Raspberry Pi OS - or an ARM
+NAS gets the right one. Each is a single static binary, with no runtime and no libc.
+It asks the kernel for the conntrack table and for sockets over netlink itself, so
+nothing else has to be installed for it - only Nix, for the systemd source. The
+systemd source's `port-bound` health needs Linux 5.7 or later, whose socket
+diagnostics say which cgroup a socket belongs to.
+
 ## Commands
 
 ```
@@ -70,14 +78,45 @@ tidewaiter prepare  # create missing unit profiles and missing closure drop-ins,
 
 Options: `-s/--source docker|systemd` (repeat or comma-separate; default `docker`), `-d/--interval SECONDS` (default 300), `-n/--dry-run`, `--status-file PATH` (`run` writes none unless given one; `status` reads `/run/tidewaiter/status.json` by default), `--activity-interval SECONDS` (default 15), `--auto-reboot-window HH:MM-HH:MM` with `--booted-system PATH` and `--current-system PATH` (defaults `/run/booted-system`, `/nix/var/nix/profiles/system`), `--version`. Docker: `-l/--label LABEL`, `--docker-socket PATH`. systemd: `--units-dir DIR` (default `/etc/tidewaiter/units`), `--state-dir DIR` (default `/var/lib/tidewaiter`). Env: `TIDEWAITER_SOURCES`, `TIDEWAITER_INTERVAL`, `TIDEWAITER_STATUS_FILE`, `TIDEWAITER_AUTO_REBOOT_WINDOW`, `DOCKER_SOCKET`, `TIDEWAITER_UNITS_DIR`, `STATE_DIRECTORY`.
 
-## Building
+## Development
 
-`bun run.ts check` and `bun run.ts test` for development, `bun run.ts release` for the release's binaries, unit and checksums; `nix build` builds the binary reproducibly (running the tests on the way) and `nix flake check` adds the module check and the VM test.
+Tidewaiter is Go, and the standard library apart from two modules:
+[godbus](https://github.com/godbus/dbus) for the systemd source's system bus and
+logind, and the author's own [gokit](https://github.com/danielbodart/gokit) -
+itself standard library only - for httpx, clock and sockdiag. The conntrack
+table is read over ctnetlink with the standard library's syscall package.
+
+```shell
+mise install       # installs the pinned Go
+./run test         # go test, every package
+./run check        # gofmt and go vet
+./run build        # a static binary for this machine, into dist/
+./run release      # every architecture's binary, the unit and checksums, into dist/release/
+./run image        # the image, for every architecture, locally
+nix build          # the Nix package, running the tests on the way
+nix flake check    # also the module check and the NixOS VM test (needs KVM)
+```
+
+`./run` is a POSIX shell script and the only place any of this is defined, so CI
+runs the same commands you do. The tests that need real infrastructure - the
+system bus, a Docker daemon, cgroupfs, or permission to dump conntrack - skip
+themselves where it is missing, as it all is in Nix's build sandbox; the VM test
+is where conntrack meets a real kernel.
+
+### Versions
 
 Every push to `master` publishes an image, tagged `:latest` and with an exact
 version, and a [GitHub release](https://github.com/danielbodart/tidewaiter/releases)
-of the same version, tagged `v<version>`, with standalone binaries and the systemd
-unit.
+of the same version, tagged `v<version>`, with the standalone binaries for `x64`,
+`arm64` and `armv7`, the systemd unit, and their `SHA256SUMS`.
+
+The number is derived from the repository rather than stored in it. Only the
+major is committed - in `MAJOR`, because that one is a decision, and it moves
+when compatibility breaks; the Go rewrite did not move it, since its flags,
+labels, status file and state directory are v1's. The minor is the commit count,
+so it only goes up and names exactly one commit; the patch is the CI run number,
+which separates two builds of the same commit. Locally the patch becomes a
+timestamp, so a developer build sorts after CI's and is obviously not one.
 
 ## Known limitations (v1)
 
@@ -89,7 +128,7 @@ mode, and a container swap interrupted by a restart - are in
 
 ## Relationship to portical
 
-Tidewaiter is the sibling of [**portical**](https://github.com/danielbodart/portical) and shares its spine — a label-driven reconcile loop over the Docker Engine API in Bun/TypeScript
+Tidewaiter is the sibling of [**portical**](https://github.com/danielbodart/portical) and shares its spine — a label-driven reconcile loop over the Docker Engine API, in Go, on the same [gokit](https://github.com/danielbodart/gokit).
 
 ## License
 

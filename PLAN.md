@@ -2,7 +2,7 @@
 
 > A *tidewaiter* was a customs officer who boarded a ship on arrival, **waiting for the tide** before going aboard. This one waits for the tide of traffic to go out, then quietly swaps your container for a newer one — and backs off the moment anyone's aboard.
 
-Status: **planning**. This document is the brief for the build session. Nothing here is built yet.
+Status: **built**, and kept as the design history it is. This was the brief for the build session; what it planned was built in Bun/TypeScript, then rewritten in Go with the same behaviour - a static binary, a scratch image, conntrack and sockets read over netlink with no `conntrack` or `ss` to run. Where this plan names Bun, TypeScript files, Alpine, `tini` or `conntrack-tools`, it describes the first build, not the current one; the README and `docs/` describe what Tidewaiter does now.
 
 ---
 
@@ -39,7 +39,7 @@ Researched thoroughly; the exact combination does not exist for plain Docker/com
 - **[WUD / What's Up Docker](https://getwud.github.io/wud/)** — mature registry-watch + triggers; reference its registry/watch design (and consider it as the "commodity 80%" if we ever want less to maintain).
 - **[Dockcheck](https://github.com/mag37/dockcheck)** — image-backup rollback approach in a shell tool; simplest existing rollback pattern.
 - **[itzg/mc-server-runner](https://github.com/itzg/mc-server-runner)** — reference for graceful stop (translate SIGTERM → in-band `stop`, wait). Relevant to how we *drain/stop* a container before recreate.
-- **Bun fetch 300s timeout** — [oh-my-pi#2422](https://github.com/can1357/oh-my-pi/issues/2422): Bun's fetch has a hard ~300s timeout, `AbortSignal` can't extend it, disable with `timeout: false`. Already handled in portical's `http.ts` (which we vendor) for the Docker `/events` stream; the registry client must do the same where it long-polls.
+- **Bun fetch 300s timeout** — [oh-my-pi#2422](https://github.com/can1357/oh-my-pi/issues/2422): Bun's fetch has a hard ~300s timeout, `AbortSignal` can't extend it, disable with `timeout: false`. Already handled in portical's `http.ts` (which we vendor) for the Docker `/events` stream; the registry client must do the same where it long-polls. *(Gone with Bun: Go's net/http has no such timeout, and the streams are bounded by their contexts.)*
 
 Whenever a new sub-problem appears in the build, **check for prior art first and cite it** — that's the house style.
 
@@ -48,9 +48,9 @@ Whenever a new sub-problem appears in the build, **check for prior art first and
 ## 3. Shape & constraints (decided)
 
 - **One container.** No sidecars. Runs with `network_mode: host`, the Docker socket mounted read-write, and **`CAP_NET_ADMIN`** (required to read conntrack via netlink). Capabilities are a *runtime* grant — set in the deploy compose (`cap_add: [NET_ADMIN]`), **not** the image, and **not** Flatcar/Ignition. See §6.
-- **Bun + TypeScript**, compiled to a single static binary, same as portical. Alpine final image + `tini` as PID 1 + `conntrack-tools`.
+- **Bun + TypeScript**, compiled to a single static binary, same as portical. Alpine final image + `tini` as PID 1 + `conntrack-tools`. *(Since rewritten in Go, as portical was: a static binary in an empty image, which dumps conntrack over netlink itself and starts no children, so needs neither `conntrack-tools` nor `tini`.)*
 - **Label-driven**, reconcile loop, pure decision core — same architecture as portical.
-- **Trunk-based** (`master`), CI tests-gated build+push to Docker Hub + GHCR, version derived from git (copy portical's `run.ts`).
+- **Trunk-based** (`master`), CI tests-gated build+push to Docker Hub + GHCR, version derived from git (copy portical's `run.ts`; now `./run`, a POSIX shell script, with the major in `MAJOR`).
 
 ---
 
@@ -137,7 +137,7 @@ Opt a container in with labels (schema in §8). Nothing changes on the Flatcar O
 
 ## 7. What to lift from portical (`vendor/portical`)
 
-The submodule is there to **read and steal from while building**, not to depend on at runtime. Copy/adapt into `src/`:
+The submodule is there to **read and steal from while building**, not to depend on at runtime. Copy/adapt into `src/`: *(the TypeScript build; the Go rewrite took the same pieces from portical's own Go rewrite, and shares httpx, clock and sockdiag with it through gokit)*
 
 - **`http.ts`** — the unix-socket `Handler`, `withTimeout`, and the **`timeout: false`** fix for long-poll streams (Docker `/events`, and any registry long-poll). Take as-is.
 - **`docker.ts`** — Docker Engine API client (containers, events, inspect, networks). **Extend** with: image pull (`POST /images/create`), image inspect/digest, container create/remove/rename, and reading a container's full config for faithful recreate.

@@ -1,67 +1,44 @@
 {
   lib,
-  stdenvNoCC,
-  bun,
+  buildGo127Module,
   makeWrapper,
-  conntrack-tools,
-  iproute2,
   nix,
   version,
   src,
 }:
 
-# The same `bun build --compile` as run.ts's build. Tidewaiter has no runtime
-# dependencies, so there is nothing to fetch and it builds in the sandbox from
-# the source alone; typescript and @types/bun are only for tsc, which this
-# does not run.
-stdenvNoCC.mkDerivation {
+# The same static build as ./run, by nixpkgs' Go, and the check phase runs the
+# tests on the way - the ones that need a system bus, Docker, cgroupfs or
+# netlink permission skip themselves in the sandbox. buildGo127Module rather
+# than buildGoModule, which is still Go 1.26 in the pinned nixpkgs and would
+# refuse go.mod's `go 1.27`.
+buildGo127Module {
   pname = "tidewaiter";
   inherit version src;
 
-  nativeBuildInputs = [
-    bun
-    makeWrapper
+  # godbus, gokit and the golang.org/x/sys godbus needs, as `go mod vendor`
+  # lays them out. A go.sum change needs it recomputed: build once with
+  # lib.fakeHash and take the hash Nix reports.
+  vendorHash = "sha256-oFrO+4NkrHEqy3FsgiH1BVIsGfv1YV/3+a/xrCJj70g=";
+
+  nativeBuildInputs = [ makeWrapper ];
+
+  env.CGO_ENABLED = 0;
+  ldflags = [
+    "-s"
+    "-w"
+    "-X github.com/danielbodart/tidewaiter/internal/version.Version=${version}"
   ];
 
-  buildPhase = ''
-    runHook preBuild
-    export HOME=$TMPDIR
-    bun build --compile --minify --sourcemap \
-      --define 'TIDEWAITER_VERSION="${version}"' \
-      src/main.ts --outfile tidewaiter
-    runHook postBuild
+  # What it runs: nix-env and nix-store, for the systemd source's profiles and
+  # closures. Nothing else - the conntrack table and the sockets are asked of
+  # the kernel over netlink, where conntrack and ss used to be on this PATH.
+  # Suffixed, not prefixed, so the host's own come first: on NixOS the module
+  # puts config.nix.package on PATH. systemd itself is only ever spoken to over
+  # the bus.
+  postInstall = ''
+    wrapProgram $out/bin/tidewaiter --suffix PATH : ${lib.makeBinPath [ nix ]}
   '';
-
-  # The tests that need a Nix daemon or a system bus skip themselves here.
-  doCheck = true;
-  checkPhase = ''
-    runHook preCheck
-    bun test
-    runHook postCheck
-  '';
-
-  # What it runs: conntrack (the activity detector), ss (sockets by cgroup),
-  # nix-env and nix-store (profiles and closures). Suffixed, not prefixed, so
-  # the host's own come first: on NixOS the module puts config.nix.package on
-  # PATH. systemd itself is only ever spoken to over the bus.
-  installPhase = ''
-    runHook preInstall
-    install -Dm755 tidewaiter $out/libexec/tidewaiter
-    makeWrapper $out/libexec/tidewaiter $out/bin/tidewaiter \
-      --suffix PATH : ${
-        lib.makeBinPath [
-          conntrack-tools
-          iproute2
-          nix
-        ]
-      }
-    runHook postInstall
-  '';
-
-  # A compiled Bun binary is Bun with the bundle appended to it. Stripping it,
-  # or patchelf rewriting it, loses the bundle and leaves plain Bun behind.
-  dontStrip = true;
-  dontPatchELF = true;
 
   meta = {
     description = "Update Docker containers and systemd units only when they are idle, health-gate the swap, roll back on failure";
@@ -70,6 +47,7 @@ stdenvNoCC.mkDerivation {
     platforms = [
       "x86_64-linux"
       "aarch64-linux"
+      "armv7l-linux"
     ];
     mainProgram = "tidewaiter";
   };

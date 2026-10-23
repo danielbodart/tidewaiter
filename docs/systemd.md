@@ -4,7 +4,7 @@ The same care for a native service: a systemd unit whose program lives in a **Ni
 
 1. **Waits for the tide to go out** — conntrack flows to the unit's declared ports, UDP included, exactly as for a container on host networking. Debounced by `idleSamples`, and looked at once more right before anything changes.
 2. **Swaps** — `nix-env --profile P --set DESIRED`, then `systemctl restart` the unit (over D-Bus). A graceful stop is the unit's own `ExecStop`, however long its `TimeoutStopSec` allows.
-3. **Health-gates** — `systemd`: the restart job finished `done` (for a `Type=notify` unit, the program said `READY=1`) and the unit stayed up on that invocation, with no `Restart=` crash loop hidden behind `active`; `port-bound`: a socket **in the unit's own cgroup** is on a declared port (`ss -e`, so another process on the same port doesn't count); `port-connect` and `uptime` as for containers.
+3. **Health-gates** — `systemd`: the restart job finished `done` (for a `Type=notify` unit, the program said `READY=1`) and the unit stayed up on that invocation, with no `Restart=` crash loop hidden behind `active`; `port-bound`: a socket **in the unit's own cgroup** is on a declared port (the kernel's socket diagnostics name each socket's cgroup, so another process on the same port doesn't count); `port-connect` and `uptime` as for containers.
 4. **Commits or rolls back** — healthy: prune old generations. Unhealthy: switch the profile back to the exact generation it left, delete the failed one, restart, and pin the version out until the declaration moves on. Pins survive a restart of Tidewaiter; a swap it died in the middle of is rolled back when it next sees the unit failed.
 
 A stopped unit just has its profile moved, for whoever starts it next.
@@ -123,25 +123,27 @@ with a standalone binary for each architecture and a unit file to run it:
 | Asset | |
 | --- | --- |
 | `tidewaiter-linux-x64` | The binary, for 64-bit Intel and AMD. |
-| `tidewaiter-linux-arm64` | The binary, for 64-bit ARM. |
+| `tidewaiter-linux-arm64` | The binary, for 64-bit ARM - a Pi 3/4/5 on 64-bit Raspberry Pi OS, or an ARM NAS. |
+| `tidewaiter-linux-armv7` | The binary, for 32-bit ARMv7 - a Pi 2 onwards on 32-bit Raspberry Pi OS, or an armhf NAS. |
 | `tidewaiter.service` | The unit file. |
 | `SHA256SUMS` | Checksums of the above. |
 
-The binaries are built against glibc, which is every mainstream systemd
-distribution. What they run comes from the host:
+The binaries are static, so they run on any distribution, glibc or musl. The
+conntrack table and the sockets are asked of the kernel over netlink, so the only
+thing they need from the host is:
 
 - **Nix**, installed as a multi-user daemon, for the systemd source. The unit looks
   for `nix-env` and `nix-store` in `/nix/var/nix/profiles/default/bin`, where that
   install puts them, and writes profiles through the daemon.
-- **`conntrack`**, from the distribution's `conntrack` (or `conntrack-tools`)
-  package, for the default activity detector.
-- **`ss`**, from iproute2, for `port-bound` health.
+
+`port-bound` health on a unit needs Linux 5.7 or later, whose socket diagnostics
+carry the socket's cgroup.
 
 ### Install
 
 ```shell
 cd "$(mktemp -d)"
-arch=$(uname -m | sed 's/x86_64/x64/; s/aarch64/arm64/')
+arch=$(uname -m | sed 's/x86_64/x64/; s/aarch64/arm64/; s/armv7l/armv7/')
 base=https://github.com/danielbodart/tidewaiter/releases/latest/download
 curl -fsSLO "$base/tidewaiter-linux-$arch" -O "$base/tidewaiter.service" -O "$base/SHA256SUMS"
 sha256sum -c --ignore-missing SHA256SUMS
@@ -246,7 +248,7 @@ unit's home is `/var/lib/tidewaiter` (root's is hidden from it), so they go in
 Replace the binary and restart. A swap in flight is finished first:
 
 ```shell
-arch=$(uname -m | sed 's/x86_64/x64/; s/aarch64/arm64/')
+arch=$(uname -m | sed 's/x86_64/x64/; s/aarch64/arm64/; s/armv7l/armv7/')
 curl -fsSL -o tidewaiter "https://github.com/danielbodart/tidewaiter/releases/latest/download/tidewaiter-linux-$arch"
 sudo install -m 755 tidewaiter /usr/local/bin/tidewaiter
 sudo systemctl restart tidewaiter

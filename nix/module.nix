@@ -41,10 +41,10 @@ let
   # Where `tidewaiter status` looks by default.
   statusFile = "/run/tidewaiter/status.json";
 
-  # One file per unit, the shape src/units.ts reads. Interpolating `desired`
-  # puts it in the system closure, so the version a unit is asked to move to
-  # was built (or substituted) by the switch that asked, and is kept from the
-  # garbage collector by the system generation.
+  # One file per unit, the shape internal/systemd/units.go reads. Interpolating
+  # `desired` puts it in the system closure, so the version a unit is asked to
+  # move to was built (or substituted) by the switch that asked, and is kept
+  # from the garbage collector by the system generation.
   declaration =
     name: service:
     let
@@ -483,7 +483,7 @@ in
           ProtectKernelTunables = true;
           ProtectKernelModules = true;
           ProtectKernelLogs = true;
-          # Read-only: ss reads cgroupfs to name a socket's cgroup.
+          # Read-only: a socket's cgroup is named from cgroupfs.
           ProtectControlGroups = true;
           ProtectClock = true;
           ProtectHostname = true;
@@ -510,7 +510,8 @@ in
           IPAddressAllow = mkIf (!hasDocker) [ "localhost" ];
           IPAddressDeny = mkIf (!hasDocker) [ "any" ];
           SupplementaryGroups = optional hasDocker "docker";
-          # Not MemoryDenyWriteExecute: Bun's JIT needs writable code.
+          # A Go binary has no JIT, so no memory is ever both written and run.
+          MemoryDenyWriteExecute = true;
           # Not PrivateNetwork: conntrack and port-connect are the host's.
           # Not PrivateUsers: it must be real root to systemd and the Nix daemon.
           # Not ProtectProc: the tcp detector reads /proc/<MainPID>/net.

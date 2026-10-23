@@ -15,7 +15,9 @@ The same image is published to two registries:
 
 Each carries `:latest` and an exact version. The examples here use Docker Hub;
 `ghcr.io/danielbodart/tidewaiter` can be used in its place anywhere. Both are built
-for `amd64` and `arm64`.
+for `amd64`, `arm64` and 32-bit `armv7`, and hold nothing but Tidewaiter itself - a
+static binary that speaks the Docker Engine API, the registry and netlink on its
+own, and CA certificates for the registry.
 
 ## Deploy
 
@@ -40,7 +42,7 @@ Two grants, two jobs: **`CAP_NET_ADMIN`** is the *activity gate* (conntrack — 
 
 Then opt any container in with `tidewaiter.autoupdate=registry`. See [`docker-compose.yaml`](../docker-compose.yaml) for a worked example.
 
-Private registries: Tidewaiter reads `~/.docker/config.json` for credentials and sends them both when resolving digests and when pulling.
+Private registries: Tidewaiter reads `~/.docker/config.json` for credentials and sends them both when resolving digests and when pulling. In the image that is `/root/.docker/config.json`; mount yours there read-only.
 
 ## Labels
 

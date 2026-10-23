@@ -1,10 +1,11 @@
 # Tidewaiter as a native systemd service, for a host without NixOS - the NixOS
 # module in nix/module.nix writes the same unit from its options.
 #
-# Expects the release binary at /usr/local/bin/tidewaiter, conntrack from the
-# distribution's conntrack package, and, for the systemd source, Nix installed
-# as a multi-user daemon. Configure it with a drop-in (`systemctl edit
-# tidewaiter`) rather than by editing this file, so an update can replace it:
+# Expects the release binary at /usr/local/bin/tidewaiter and, for the systemd
+# source, Nix installed as a multi-user daemon - nothing else from the
+# distribution: the conntrack table and the sockets are asked of the kernel
+# over netlink. Configure it with a drop-in (`systemctl edit tidewaiter`)
+# rather than by editing this file, so an update can replace it:
 #
 #   [Service]
 #   Environment=TIDEWAITER_INTERVAL=300
@@ -32,7 +33,7 @@ After=network.target nix-daemon.socket
 Environment=TIDEWAITER_SOURCES=systemd
 Environment=TIDEWAITER_STATUS_FILE=/run/tidewaiter/status.json
 # nix-env and nix-store from the default profile, where a multi-user install
-# puts them; conntrack and ss from the distribution.
+# puts them - the only programs Tidewaiter runs.
 Environment=PATH=/nix/var/nix/profiles/default/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 # Through the daemon, so writing a profile takes no privilege over the store
 # itself.
@@ -70,7 +71,7 @@ PrivateDevices=yes
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectKernelLogs=yes
-# Read-only: ss reads cgroupfs to name a socket's cgroup.
+# Read-only: a socket's cgroup is named from cgroupfs.
 ProtectControlGroups=yes
 ProtectClock=yes
 ProtectHostname=yes
@@ -79,6 +80,8 @@ RestrictRealtime=yes
 RestrictSUIDSGID=yes
 LockPersonality=yes
 SystemCallArchitectures=native
+# A Go binary has no JIT, so no memory is ever both written and run.
+MemoryDenyWriteExecute=yes
 SystemCallFilter=@system-service
 SystemCallFilter=~@privileged
 # The drop-ins are for systemd, but an operator should be able to read them too.
@@ -89,7 +92,6 @@ RestrictAddressFamilies=AF_UNIX AF_NETLINK AF_INET AF_INET6
 # docker source's drop-in clears both.
 IPAddressAllow=localhost
 IPAddressDeny=any
-# Not MemoryDenyWriteExecute: Bun's JIT needs writable code.
 # Not PrivateNetwork: conntrack and port-connect are the host's.
 # Not PrivateUsers: it must be real root to systemd and the Nix daemon.
 # Not ProtectProc: the tcp detector reads /proc/<MainPID>/net.

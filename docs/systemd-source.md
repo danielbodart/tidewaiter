@@ -7,8 +7,9 @@ source of things to update: **systemd units whose program lives in a Nix
 profile**, so a native service on NixOS gets the same care a labelled container
 does. Docker behaviour does not change.
 
-Status: built. Sections 1-9 are implemented, unit-tested, and proven end to
-end by the NixOS VM test of section 11 (see "Where this stands", section 12,
+Status: built - first in TypeScript, then rewritten in Go with the same
+behaviour, flags, files and state. Sections 1-9 are implemented, unit-tested,
+and proven end to end by the NixOS VM test of section 11 (see "Where this stands", section 12,
 for where building it changed this design). Section 13 lists what is still
 open.
 
@@ -52,99 +53,91 @@ tidewaiter, every pass:
 
 ## 1. Sources and the shared core
 
-Today `Tidewaiter` (`src/daemon.ts`) is the Docker updater and the loop in one.
-It splits into a **daemon** that owns everything shared and **sources** that own
-how one kind of workload is read, swapped and checked. This follows the same
-split Portical made on its `systemd-source` branch (`Source` in its
-`src/source.ts`), adapted: Portical's sources only *describe* desired state,
-whereas a Tidewaiter source also *acts* (a swap is source-specific), so here a
-source runs its own pass.
+`Tidewaiter` was once the Docker updater and the loop in one. It split into a
+**daemon** (`internal/daemon`) that owns everything shared and **sources** that
+own how one kind of workload is read, swapped and checked. This follows the same
+split Portical made (`Source` in its `internal/source`), adapted: Portical's
+sources only *describe* desired state, whereas a Tidewaiter source also *acts*
+(a swap is source-specific), so here a source runs its own pass.
 
-```ts
-// src/source.ts
-export interface PassContext {
-  /** The host conntrack table, dumped once per pass; undefined when the dump failed. */
-  readonly conntrack: readonly ConntrackEntry[] | undefined;
-  /**
-   * Mark `workload` as being swapped until the end of the pass. Called before
-   * any swap starts, so the status says so and an automatic reboot waits.
-   */
-  hold(workload: string): Promise<void>;
+```go
+// internal/source
+type Pass struct {
+	// The host conntrack table, dumped once per pass; nil when the dump failed.
+	Conntrack []detect.ConntrackEntry
+	// Hold marks workload as being swapped until the end of the pass. Called
+	// before any swap starts, so the status says so and an automatic reboot
+	// waits.
+	Hold func(workload string)
 }
 
-export interface Outcome {
-  /** "chandlery-bedrock.service", or a container name. Unique within a source. */
-  readonly workload: string;
-  readonly action: Action;
-  /**
-   * The activity verdict this pass, fail-safe (could-not-tell reads as busy).
-   * Undefined when the pass never sampled it (registry or systemd unreachable):
-   * the daemon keeps the workload's last verdict.
-   */
-  readonly busy?: boolean;
-  /** Idle for its whole idle-samples debounce this pass; undefined reads as not. */
-  readonly settled?: boolean;
+type Outcome struct {
+	// "chandlery-bedrock.service", or a container name. Unique within a source.
+	Workload string
+	Action   decide.Action
+	// The activity verdict this pass, fail-safe (could-not-tell reads as busy).
+	// Nil when the pass never sampled it (registry or systemd unreachable): the
+	// daemon keeps the workload's last verdict.
+	Busy *bool
+	// Idle for its whole idle-samples debounce this pass.
+	Settled bool
 }
 
-export interface Source {
-  readonly name: "docker" | "systemd";
-  /** Reconcile every workload once. One workload failing never fails the pass. */
-  once(context: PassContext): Promise<Outcome[]>;
-  /** Activity only - no digests, no swaps - for the faster tick between passes. */
-  activity(conntrack: readonly ConntrackEntry[] | undefined): Promise<{ workload: string; busy: boolean }[]>;
-  /** One line per workload for `tidewaiter list`. */
-  list(): Promise<string[]>;
+type Source interface {
+	Name() Name // "docker" or "systemd"
+	// Once reconciles every workload once. One workload failing never fails the pass.
+	Once(ctx context.Context, pass Pass) ([]Outcome, error)
+	// Activity is activity only - no digests, no swaps - for the faster tick between passes.
+	Activity(ctx context.Context, conntrack []detect.ConntrackEntry) ([]Activity, error)
+	// List is one line per workload for `tidewaiter list`.
+	List(ctx context.Context) ([]string, error)
 }
 ```
 
-```ts
-// src/daemon.ts
-export class Daemon {
-  constructor(
-    sources: readonly Source[],
-    conntrack: ConntrackSource,
-    options: DaemonOptions,        // interval, activityInterval
-    log: Log,
-    status: StatusSink,            // NoStatus without --status-file
-    autoReboot?: AutoReboot,       // with --auto-reboot-window
-  );
-  once(): Promise<Outcome[]>;      // dump conntrack, each source in order, summary, status
-  considerReboot(): Promise<void>; // section 6
-  run(signal: AbortSignal): Promise<void>;  // runEvery(interval, once + considerReboot) + the activity tick
-}
+```go
+// internal/daemon
+daemon.New(daemon.Deps{
+	Sources:    sources,     // run in this order, every pass
+	Conntrack:  dumper,      // activity.Conntrack(), over netlink
+	Options:    options,     // Interval, ActivityInterval
+	Log:        log,
+	Status:     sink,        // status.None without --status-file
+	AutoReboot: autoReboot,  // with --auto-reboot-window
+	Clock:      clock,
+})
+d.Once(ctx)           // dump conntrack, each source in order, summary, status
+d.ConsiderReboot(ctx) // section 6
+d.Run(ctx)            // a pass every interval, then ConsiderReboot, and the activity tick
 ```
 
 What is shared, and where it lives:
 
 | Concern | Where | Notes |
 |---|---|---|
-| Interval loop, single-flight | `src/loop.ts` `runEvery` | Already extracted. Both sources' passes run in one queue, so two swaps never overlap. |
-| Keep / update / defer / pinned | `src/decide.ts` `decide(Decidable, ContainerState)` | Already generalised. For systemd the "digests" are store paths, equally opaque. |
+| Interval loop, single-flight | `internal/daemon` `Run` | Both sources' passes run in one loop, so two swaps never overlap. |
+| Keep / update / defer / pinned | `internal/decide` `Decide(Inputs, State)` | For systemd the "digests" are store paths, equally opaque. |
 | Debounce (idle streak) | the source's per-workload state | Same rule: `idleStreak = busy ? 0 : previous + 1`. |
-| Detectors | `src/detectors.ts` | `conntrack`, `tcp`, `none` reused as is (section 3). |
-| Health checks and their combination | `src/health.ts` | `port-connect`, `port-bound`, `uptime` reused through the new `HealthSubject` and `BoundPorts` seams; a new `systemd` check. |
-| Health gate polling | `src/gate.ts` `pollVerdict` | Already extracted. |
-| Pinning and swap-failure back-off | per-source state, same rules | `MAX_SWAP_FAILURES` moves to a shared constant. |
-| Status and automatic reboot | `src/status.ts`, `src/reboot.ts` | Daemon-owned, fed by every source (section 6). |
+| Detectors | `internal/detect` | `conntrack`, `tcp`, `none` reused as is (section 3). |
+| Health checks and their combination | `internal/health` | `port-connect`, `port-bound`, `uptime` reused through the `Subject` and `BoundPorts` seams; a `systemd` check in `internal/systemd`. |
+| Health gate polling | `internal/health` `Gate` | Shared by both sources. |
+| Pinning and swap-failure back-off | per-source state, same rules | `source.MaxSwapFailures` is the shared constant. |
+| Status and automatic reboot | `internal/status`, `internal/reboot` | Daemon-owned, fed by every source (section 6). |
 
-`DockerSource` (`src/docker-source.ts`) is the old `Tidewaiter` class renamed,
-with `once()` taking the `PassContext` instead of dumping conntrack itself, and
-`run()` moving to the `Daemon`. Its logic, messages and tests are otherwise
-untouched: `daemon.test.ts` keeps driving it through the same fakes, behind a
-`Daemon` with one source. A failed conntrack dump reaches it as `undefined`,
-which it reads as an empty table - exactly what it did before (see open
-question 12).
+The Docker source (`internal/docker`'s `Source`) is the old `Tidewaiter` class,
+with `Once` taking the `Pass` instead of dumping conntrack itself, and the loop
+moved to the `Daemon`. A failed conntrack dump reaches it as nil, which its
+`conntrack` detector reads as busy (see open question 12).
 
-If a source throws, the others still run, its workloads keep their last busy
-verdicts (so a source that cannot be read never reads as idle), and the
-first error is rethrown at the end of the pass, so the loop logs it and `check`
-exits non-zero as before.
+If a source fails, the others still run, its workloads keep their last busy
+verdicts (so a source that cannot be read never reads as idle), and the first
+error is returned at the end of the pass, so the loop logs it and `check` exits
+non-zero.
 
-The summary line stays per pass across all sources, counting "containers"
-when Docker is the only source (unchanged), "units" when systemd is, and
-"workloads" for both. `decide()` takes its reasons' wording as an optional
-`Words` argument - the Docker wording by default, `UNIT_WORDS` for units - so a
-unit's log talks about versions and profiles, not images.
+The summary line stays per pass across all sources, counting "containers" when
+Docker is the only source, "units" when systemd is, and "workloads" for both.
+`decide.Decide` takes its reasons' wording as `Words` - `decide.ImageWords` for
+containers, `decide.UnitWords` for units - so a unit's log talks about versions
+and profiles, not images.
 
 ## 2. The systemd source
 
@@ -181,8 +174,8 @@ Why a file and not `X-Tidewaiter-*` keys in the unit (Portical's choice):
 
 Only `unit`, `desired` and `profile` are required. Every other field has the
 same default and the same "warn and use the default" handling as the labels
-(`labels.ts`), through a `parseUnitPolicy(json, fileName)` beside
-`parseLabels`, returning `{ policy?, warnings }`. A file that is not JSON, or is
+(`internal/docker`'s `ParseLabels`), through `systemd.ParsePolicy(text,
+fileName)`, returning the policy (nil to skip) and its warnings. A file that is not JSON, or is
 missing a required field, is warned about and skipped, never guessed at. The
 file name is informative only; `unit` is the identity. A `unit` without a
 suffix gets `.service`.
@@ -190,9 +183,9 @@ suffix gets `.service`.
 `ports` uses the `tidewaiter.ports` grammar (`25565`, `25565/tcp`, `19132/udp`),
 but is not validated against "what is published", because a host unit publishes
 nothing: the declared ports *are* the unit's ports. A bare port means both
-protocols. Each becomes a `PublishedPort` with `hostPort = containerPort`.
+protocols. Each becomes a `PublishedPort` with `HostPort = ContainerPort`.
 
-`UnitPolicy` is `ContainerPolicy` minus `autoupdate`, `graceSeconds` and
+`systemd.Policy` is the container `Policy` minus `autoupdate`, `graceSeconds` and
 `keepImages`, plus `unit`, `desired`, `profile`, `keepGenerations` and
 `bindClosure`; `health` is a list of `"systemd" | "port-connect" |
 "port-bound" | "uptime"`, `detector` one of `"conntrack" | "tcp" | "none"`
@@ -200,37 +193,40 @@ protocols. Each becomes a `PublishedPort` with `hostPort = containerPort`.
 
 ### Talking to systemd
 
-Over the system bus, with the hand-written D-Bus client from Portical's
-`systemd-source` branch (`src/dbus.ts`, ~600 lines, zero dependencies) copied
-in - the same "lift from the sibling" PLAN.md already used for `http.ts`. It
-keeps Tidewaiter at zero runtime dependencies, so the Nix package stays a plain
-`bun build` with nothing to fetch.
+Over the system bus, with [godbus](https://github.com/godbus/dbus) - one of
+Tidewaiter's two dependencies, the other being the author's own
+standard-library-only [gokit](https://github.com/danielbodart/gokit) - behind
+the narrow interface the source calls, so the source is tested against units in
+memory. The TypeScript carried a hand-written D-Bus client, lifted from
+Portical, to stay at zero dependencies; Go builds with its modules vendored, so
+the Nix package still fetches nothing at build time.
 
-```ts
-// src/systemd.ts
-export interface UnitState {
-  readonly name: string;
-  readonly loadState: string;      // "loaded", "not-found", ...
-  readonly activeState: string;    // "active", "activating", "deactivating", "inactive", "failed", "reloading"
-  readonly subState: string;       // "running", "start-pre", ...
-  readonly result: string;         // Service.Result: "success", "exit-code", "timeout", ...
-  readonly nRestarts: number;      // Service.NRestarts
-  readonly mainPid: number;        // Service.MainPID, 0 when none
-  readonly controlGroup: string;   // Service.ControlGroup, "" when not running
-  readonly invocationId: string;   // Unit.InvocationID, hex; changes every start
+```go
+// internal/systemd
+type UnitState struct {
+	Name         string
+	LoadState    string // "loaded", "not-found", ...
+	ActiveState  string // "active", "activating", "deactivating", "inactive", "failed", "reloading"
+	SubState     string // "running", "start-pre", ...
+	Result       string // Service.Result: "success", "exit-code", "timeout", ...
+	NRestarts    int    // Service.NRestarts
+	MainPID      int    // Service.MainPID, 0 when none
+	ControlGroup string // Service.ControlGroup, "" when not running
+	InvocationID string // Unit.InvocationID, hex; changes every start
 }
 
-export type JobResult = "done" | "canceled" | "timeout" | "failed" | "dependency" | "skipped";
+type JobResult string // "done", "canceled", "timeout", "failed", "dependency", "skipped"
 
-export interface SystemdClient {
-  unit(name: string): Promise<UnitState>;
-  /** RestartUnit(name, "replace"), then wait for its JobRemoved. No timeout of its own: the unit's TimeoutStopSec/TimeoutStartSec bound it. */
-  restart(name: string): Promise<JobResult>;
-  daemonReload(): Promise<void>;
+type Bus interface {
+	Unit(ctx context.Context, name string) (UnitState, error)
+	// Restart is RestartUnit(name, "replace"), then a wait for its JobRemoved. No
+	// timeout of its own: the unit's TimeoutStopSec/TimeoutStartSec bound it.
+	Restart(ctx context.Context, name string) (JobResult, error)
+	DaemonReload(ctx context.Context) error
 }
 ```
 
-`DbusSystemdClient`: `GetUnit`/`LoadUnit` for the path, `Properties.GetAll` on
+`DBus`: `LoadUnit` for the path, `Properties.GetAll` on
 `org.freedesktop.systemd1.Unit` and `...Service`, `Subscribe` plus an
 `AddMatch` on `JobRemoved` before calling `RestartUnit`, so the job's end is
 never missed. For a `Type=notify` unit (Chandlery's), the restart job finishes
@@ -243,34 +239,35 @@ console FIFO and waits, under `TimeoutStopSec=5min`).
 
 ### Profiles
 
-```ts
-// src/profile.ts
-export interface Profiles {
-  /** The store path the profile points at now, or undefined if there is no profile. */
-  current(profile: string): Promise<string | undefined>;
-  /** The current generation number, for an exact rollback. */
-  generation(profile: string): Promise<number | undefined>;
-  /** The store path a generation points at. */
-  target(profile: string, generation: number): Promise<string | undefined>;
-  set(profile: string, storePath: string): Promise<void>;
-  switchGeneration(profile: string, generation: number): Promise<void>;
-  deleteGeneration(profile: string, generation: number): Promise<void>;
-  /** Keep the current generation and `keep` before it; delete the rest. */
-  prune(profile: string, keep: number): Promise<void>;
+```go
+// internal/nix
+type Profiles interface {
+	// Current is the store path the profile points at now, or "" if there is no profile.
+	Current(ctx context.Context, profile string) (string, error)
+	// Generation is the current generation number, for an exact rollback; 0 if none.
+	Generation(ctx context.Context, profile string) (int, error)
+	// Target is the store path a generation points at.
+	Target(ctx context.Context, profile string, generation int) (string, error)
+	Set(ctx context.Context, profile, storePath string) error
+	SwitchGeneration(ctx context.Context, profile string, generation int) error
+	DeleteGeneration(ctx context.Context, profile string, generation int) error
+	// Prune keeps the current generation and `keep` before it; deletes the rest.
+	Prune(ctx context.Context, profile string, keep int) error
 }
 ```
 
-`NixProfiles` shells out, as `CliConntrackSource` does:
+`NixProfiles` runs `nix-env` through an injectable `Runner` (`os/exec` for
+real) - with section 7's `nix-store`, the only programs Tidewaiter still runs:
 
 | Method | Command |
 |---|---|
-| `current` | `realpath` of the profile (a `readlink` chain: `P -> P-N-link -> /nix/store/...`), in-process |
-| `generation` | parse `N` from `readlink P` (`P-N-link`), in-process |
-| `target` | `realpath` of `P-N-link`, in-process |
-| `set` | `mkdir -p $(dirname P)`, then `nix-env --profile P --set PATH` |
-| `switchGeneration` | `nix-env --profile P --switch-generation N` |
-| `deleteGeneration` | `nix-env --profile P --delete-generations N` |
-| `prune` | `nix-env --profile P --delete-generations +(keep+1)` |
+| `Current` | `realpath` of the profile (a `readlink` chain: `P -> P-N-link -> /nix/store/...`), in-process |
+| `Generation` | parse `N` from `readlink P` (`P-N-link`), in-process |
+| `Target` | `realpath` of `P-N-link`, in-process |
+| `Set` | `mkdir -p $(dirname P)`, then `nix-env --profile P --set PATH` |
+| `SwitchGeneration` | `nix-env --profile P --switch-generation N` |
+| `DeleteGeneration` | `nix-env --profile P --delete-generations N` |
+| `Prune` | `nix-env --profile P --delete-generations +(keep+1)` |
 
 Checked on the development host: `nix-env --set` needs the profile's parent
 directory to exist ("cannot read directory"), hence the `mkdir`; `--rollback`
@@ -285,7 +282,7 @@ generation is numbered one past the highest left. So a rollback deletes the
 generation it leaves (the failed version) straight away: otherwise the failed
 generation, being newest, would be what `prune` keeps as "the previous one" and
 the good version before it would be pruned. Checked against `nix-env` on the
-development host, and in `test/profile.test.ts` wherever a Nix daemon is
+development host, and in `internal/nix`'s tests wherever a Nix daemon is
 reachable.
 
 `nix build --profile P PATH` would also do, but `nix-env` is in every Nix
@@ -296,32 +293,30 @@ operator.
 
 For port-bound health (section 4):
 
-```ts
-// src/listeners.ts
-export interface Listener { readonly protocol: Protocol; readonly port: number; readonly cgroup: string }
-export interface ListenerSource { dump(): Promise<string> }    // `ss -Hlntu -e`
-export function parseListeners(text: string): Listener[];
-export function unitBoundPorts(listeners: () => Promise<Listener[]>, controlGroup: string): BoundPorts;
+```go
+// internal/health
+type BoundPorts func(ctx context.Context, protocol model.Protocol) (map[int]bool, error)
+func CgroupBoundPorts(list func(ctx context.Context) ([]sockdiag.Listener, error), cgroup string) BoundPorts
 ```
 
-`ss -Hlntu -e` prints each listening TCP and bound UDP socket with
-`cgroup:/system.slice/<unit>` (checked on the development host, systemd 260,
-iproute2 with sock_diag cgroup support: Linux 5.7+, iproute2 5.9+). A socket
-belongs to the unit when its cgroup is the unit's `ControlGroup` or beneath it.
-Any local address counts - for health, a socket bound only to loopback is still
-the unit serving. Portical's branch parses the same output for its `published`;
-the parser is shared in spirit, not by import (the repos do not depend on each
-other).
+The listing is gokit's `sockdiag.Kernel()`: every listening TCP and bound UDP
+socket, asked of the kernel over `NETLINK_SOCK_DIAG`, each with the cgroup the
+kernel records for it (Linux 5.7+) named from cgroupfs. It replaced running
+`ss -Hlntu -e` and parsing its text. A socket belongs to the unit when its
+cgroup is the unit's `ControlGroup` or beneath it (`Listener.Within`). Any
+local address counts - for health, a socket bound only to loopback is still the
+unit serving. Portical's `published` uses the same lister, from the same gokit.
 
-`unitBoundPorts` throws - which port-bound and uptime read as "cannot tell yet",
-never "nothing bound" - when the unit has no `ControlGroup` (not running) or
-when `ss` printed no `cgroup:` field on any line (a kernel or iproute2 too old),
-so a host that cannot attribute sockets never fails a healthy update for it.
+`CgroupBoundPorts` fails - which port-bound and uptime read as "cannot tell
+yet", never "nothing bound" - when the unit has no `ControlGroup` (not running,
+or an exited oneshot) or when the cgroups could not be named
+(`sockdiag.ErrUnknownCgroups`: no cgroupfs, or a kernel too old), so a host
+that cannot attribute sockets never fails a healthy update for it.
 
 ## 3. Activity: conntrack for a host unit
 
 The conntrack detector needs no change. It already matches flows by their
-original-direction destination port against `PublishedPort.hostPort`; for a
+original-direction destination port against `PublishedPort.HostPort`; for a
 unit the declared ports are host ports, and every flow to them - a LAN client
 (`src=10.x`), a client DNAT'd in from the WAN, or one over loopback - is in the
 host's table. UDP players show up exactly as they do for a container on host
@@ -343,30 +338,30 @@ interval" window. (Back-porting it to Docker is an open question.)
 
 ## 4. Health for a unit
 
-The gate is the Docker gate - `pollVerdict` over a set of checks, roll back on
+The gate is the Docker gate - `health.Gate` over a set of checks, roll back on
 any active failure, at the deadline commit unless something failed - with the
 unit presented through the seams added in this branch:
 
-```ts
+```go
 // what the systemd source builds per poll
-const subject: HealthSubject = {
-  running: state.activeState === "active" || state.activeState === "reloading",
-  health: "none",                                   // no Docker HEALTHCHECK
-  spec: { networks: [], networkMode: "host" },      // host network
-};
-const input: HealthInput = {
-  container: subject,
-  ports: policy.ports,
-  bound: unitBoundPorts(listeners, state.controlGroup),
-  tcp, networkDriver: async () => undefined,
-};
+subject := health.Subject{
+	Running:     systemd.IsUp(state), // active, or reloading while active
+	Health:      model.NoHealth,      // no Docker HEALTHCHECK
+	NetworkMode: "host",              // host network
+}
+input := health.Input{
+	Subject: subject,
+	Ports:   policy.Ports,
+	Bound:   health.CgroupBoundPorts(listeners, state.ControlGroup),
+	TCP:     dialer,
+}
 ```
 
 | Check | For a unit |
 |---|---|
 | `systemd` (new) | **fail** if the restart job did not end `done`, if `ActiveState` is `failed`, `inactive` or `deactivating` after the job, if `NRestarts` rose, or if `InvocationID` changed since the job (it crashed and `Restart=` brought it back). **pass** when `active`/`running` with the job `done`. **inconclusive** while `activating`/`reloading`. |
 | `port-bound` | A socket in the unit's cgroup on any declared port. Unchanged check; reads through `BoundPorts`. |
-| `port-connect` | `connect()` to `127.0.0.1:<port>` for each declared TCP port, truthful (no proxy on the host network), so a refusal after the grace fails. Unchanged check: `clientEndpoints` already does this for `networkMode: "host"`. Skips when no TCP port is declared - a Bedrock server is UDP only. |
+| `port-connect` | `connect()` to `127.0.0.1:<port>` for each declared TCP port, truthful (no proxy on the host network), so a refusal after the grace fails. Unchanged check: `ClientEndpoints` already does this for `networkMode: "host"`. Skips when no TCP port is declared - a Bedrock server is UDP only. |
 | `uptime` | `running` stays true (the `systemd` check's crash signals feed `running` too: `false` once `NRestarts` or `InvocationID` moved) for the grace, and by then a declared port is bound in the cgroup. Unchanged check. |
 | `docker` | Not accepted in a unit's `health`; warned and dropped. |
 
@@ -380,10 +375,10 @@ cgroup, is not fooled by another process on the same port.
 
 ## 5. The swap state machine
 
-Per managed unit, each pass (`SystemdSource.once`):
+Per managed unit, each pass (the systemd `Source`'s `Once`):
 
 1. **Read** the unit's file and policy, `UnitState`, and `current =
-   profiles.current(profile)`. A unit systemd does not know (`not-found`) is
+   profiles.Current(profile)`. A unit systemd does not know (`not-found`) is
    left alone with a warning.
 2. **Not running** (`inactive`, `failed`): nobody is playing, but it is not
    Tidewaiter's to start either. If `current != desired` and `desired` is not
@@ -394,22 +389,22 @@ Per managed unit, each pass (`SystemdSource.once`):
    the idle streak does not count.
 3. **Sample activity** with the policy's detector over the shared conntrack dump;
    `idleStreak` as for Docker.
-4. **Decide**: `decide({ policy, currentDigest: current, desired: { digest:
-   desired }, inUse, idleStreak }, state)`.
+4. **Decide**: `decide.Decide(Inputs{Current: current, Desired: desired, InUse,
+   IdleStreak, IdleSamples}, state, decide.UnitWords)`.
 5. **Update** (not dry-run):
-   1. `context.hold(unit)` - the status says swapping; no automatic reboot.
+   1. `pass.Hold(unit)` - the status says swapping; no automatic reboot.
    2. Re-sample conntrack (section 3); busy now means defer, streak reset.
-   3. `previous = profiles.generation(profile)`.
+   3. `previous = profiles.Generation(profile)`.
    4. If `bindClosure`: write the closure drop-in for `desired` (section 7) and
-      `daemonReload()`.
-   5. `profiles.set(profile, desired)`.
-   6. `jobResult = systemd.restart(unit)`.
-   7. Gate: `pollVerdict` with `healthTimeout`.
-   8. **Healthy**: `profiles.prune(profile, keepGenerations)`; clear failure
+      `DaemonReload`.
+   5. `profiles.Set(profile, desired)`.
+   6. `jobResult = bus.Restart(unit)`.
+   7. Gate: `health.Gate` with `healthTimeout`.
+   8. **Healthy**: `profiles.Prune(profile, keepGenerations)`; clear failure
       counters; log `updated to <desired> and it is healthy`.
-   9. **Unhealthy**: `profiles.switchGeneration(profile, previous)` and delete
+   9. **Unhealthy**: `profiles.SwitchGeneration(profile, previous)` and delete
       the generation it leaves (section 2); closure drop-in for the previous
-      path; `daemonReload()`; `restart(unit)`; wait for it with the same gate (a
+      path; `DaemonReload`; `Restart(unit)`; wait for it with the same gate (a
       failed rollback is logged as "manual attention needed", never retried in
       a loop); **pin** `desired`.
    10. **A step failed** before the gate (`nix-env` error, the restart could not
@@ -510,11 +505,11 @@ writes it: a `check` beside a running daemon must not overwrite what the daemon
 says. A file that cannot be written is warned about once and never fatal.
 
 A file rather than a D-Bus service or a socket: the daemon already knows the
-answer every few seconds, a file needs nothing listening, and the hand-written
-D-Bus client does not serve methods.
+answer every few seconds, a file needs nothing listening, and serving D-Bus
+methods would be a bus name and a policy file to install for one answer.
 
 **The activity tick** (`--activity-interval`, default 15 s) dumps conntrack and
-runs each source's `activity()` - no digests, no swaps, no effect on idle
+runs each source's `Activity` - no digests, no swaps, no effect on idle
 streaks - so a player who joins between passes shows up within one tick. It
 runs whenever there is a status file or an automatic reboot to keep current;
 the image, which has neither by default, does not tick, as before.
@@ -522,7 +517,7 @@ the image, which has neither by default, does not tick, as before.
 ### Rebooting automatically
 
 With `--auto-reboot-window HH:MM-HH:MM` (module: `autoReboot = { enable;
-window; }`), every pass of `run` ends with `considerReboot()`:
+window; }`), every pass of `run` ends with `ConsiderReboot`:
 
 1. **Is a reboot needed?** The test `system.autoUpgrade` makes with
    `allowReboot`: `realpath` of `initrd`, `kernel` and `kernel-modules` under
@@ -547,9 +542,9 @@ window; }`), every pass of `run` ends with `considerReboot()`:
    Refused (another program's block lock, no logind) is logged, and the next
    pass in the window tries again.
 
-`decideReboot` is the pure part (steps 1-5's inputs to a verdict); the daemon
-gathers them. A pass in which a source threw never reboots: the error is
-rethrown before `considerReboot` runs. The verdict is logged when it changes -
+`reboot.Decide` is the pure part (steps 1-5's inputs to a verdict); the daemon
+gathers them. A pass in which a source failed never reboots: the error is
+returned before `ConsiderReboot` runs. The verdict is logged when it changes -
 `Automatic reboot (03:00-05:00): needed, kernel changed since boot; waiting:
 chandlery-bedrock.service in use` - and is in the status.
 
@@ -593,7 +588,7 @@ BindReadOnlyPaths=/nix/store/...-glibc-2.40
 - The list is `nix-store --query --requisites <target>`, plus the profile's
   directory (so the profile symlink and its generation link resolve inside the
   root).
-- Rewritten, followed by `daemonReload()`, before the restart into `desired` and
+- Rewritten, followed by `DaemonReload`, before the restart into `desired` and
   again before the restart back into the previous generation (steps 5.4 and 5.9).
 - At boot, and on every switch that changes a declaration, the module's
   `tidewaiter-prepare.service` runs `tidewaiter prepare`, which writes the
@@ -656,13 +651,13 @@ they are idle".
 
 ### Flake
 
-`flake.nix`, one input (`nixpkgs`, `nixos-unstable` for its Bun - see open
-question 6), for `x86_64-linux` and `aarch64-linux`, laid out as Portical's
-branch does:
+`flake.nix`, one input (`nixpkgs`, `nixos-unstable` for its
+`buildGo127Module` - see open question 6), for `x86_64-linux` and
+`aarch64-linux`, laid out as Portical's does:
 
 ```
 flake.nix
-nix/package.nix        # bun build --compile, bun test in checkPhase
+nix/package.nix        # buildGo127Module, go test in checkPhase
 nix/module.nix         # services.tidewaiter + systemd.services.<n>.tidewaiter
 nix/module-check.nix   # evaluation-only assertions on a configuration
 nix/vm-test.nix        # the NixOS VM test (section 11)
@@ -670,20 +665,21 @@ nix/vm-test.nix        # the NixOS VM test (section 11)
 
 Outputs:
 
-- `packages.<system>.default` - `bun build --compile --minify --sourcemap
-  --define 'TIDEWAITER_VERSION="<version>"' src/main.ts`, version from
-  `package.json`'s major, `self.revCount` and `self.lastModifiedDate` (the
-  `run.ts` scheme with the date for the run number). Tidewaiter has no runtime
-  dependencies, so it builds in the sandbox from `src`, `test`, `package.json`
-  and `tsconfig.json` alone; `typescript` and `@types/bun` are only for `tsc`,
-  which the package does not run. `dontStrip` and `dontPatchELF`: a compiled
-  Bun binary is Bun with the bundle appended, and stripping loses the bundle.
-  `makeWrapper` *suffixes* `PATH` with `conntrack-tools` (conntrack),
-  `iproute2` (ss) and `nix` (nix-env, nix-store), so the host's own come
-  first: the module puts `config.nix.package` on the services' `path` rather
-  than overriding the package. systemd and logind are only spoken to over the
-  bus.
-- `checks.<system>` - `package` (which runs `bun test`), `module`, `vm`.
+- `packages.<system>.default` - the same static `go build` as `./run build`,
+  by `buildGo127Module`, with the version from `MAJOR`, `self.revCount` and
+  `self.lastModifiedDate` (the `./run` scheme with the date for the run
+  number) linked in with `-X`. godbus and gokit are vendored by
+  `vendorHash`, so the build itself fetches nothing; its source is `go.mod`,
+  `go.sum`, the `.go` files and the tests' `testdata`. `makeWrapper`
+  *suffixes* `PATH` with `nix` (nix-env, nix-store) - all it runs, as the
+  conntrack table and the sockets are read over netlink - so the host's own
+  come first: the module puts `config.nix.package` on the services' `path`
+  rather than overriding the package. systemd and logind are only spoken to
+  over the bus.
+- `checks.<system>` - `package` (whose check phase is `go test`, the tests
+  needing a bus, Docker, cgroupfs or netlink permission skipping in the
+  sandbox), `module`, `vm`.
+
 - `nixosModules.default`.
 - `formatter.<system>` - `nixfmt`.
 
@@ -785,7 +781,7 @@ host conntrack table - and confined as far as that allows:
 - `ProtectSystem = "strict"` with `ReadWritePaths = [ "/nix/var/nix/profiles"
   "/run/systemd/system" ]`; `ProtectHome`, `PrivateTmp`, `PrivateDevices`,
   `ProtectKernelTunables`, `ProtectKernelModules`, `ProtectKernelLogs`,
-  `ProtectControlGroups` (`ss` only reads), `ProtectClock`, `ProtectHostname`,
+  `ProtectControlGroups` (cgroupfs is only read, to name a socket's cgroup), `ProtectClock`, `ProtectHostname`,
   `RestrictNamespaces`, `RestrictRealtime`, `RestrictSUIDSGID`,
   `LockPersonality`, `NoNewPrivileges`, `SystemCallArchitectures = "native"`,
   `SystemCallFilter = [ "@system-service" "~@privileged" ]`, `UMask = "0022"` (the drop-ins
@@ -797,9 +793,10 @@ host conntrack table - and confined as far as that allows:
   `["systemd"]` - the only IP it ever opens is port-connect to loopback. With
   Docker, the registry needs the internet, so no IP filter.
 - With `"docker"`: `SupplementaryGroups = [ "docker" ]`.
-- Not `MemoryDenyWriteExecute` (Bun's JIT), not `PrivateNetwork` (conntrack and
-  port-connect are the host's), not `PrivateUsers` (it must be real root to the
-  bus and to `nix-env`).
+- `MemoryDenyWriteExecute`: a Go binary has no JIT. (The Bun build could not
+  have it.)
+- Not `PrivateNetwork` (conntrack and port-connect are the host's), not
+  `PrivateUsers` (it must be real root to the bus and to `nix-env`).
 - `ProcSubset`/`ProtectProc` left default: the `tcp` detector reads
   `/proc/<MainPID>/net/*`.
 
@@ -838,26 +835,34 @@ services.tidewaiter.enable = true;
 
 ## 11. Test plan
 
-All new TypeScript in the existing style: pure functions tested against
-captured real output, everything with I/O behind an interface with an in-memory
-fake. Docker tests unchanged and green throughout.
+Pure functions tested against captured real output, everything with I/O behind
+an interface with an in-memory fake: the bus at `systemd.Bus`, Nix at
+`nix.Runner`, Docker and the registry as `http.Handler`s reached through
+gokit's `httpx` transports, so no test opens a port. Tests that need the real
+thing - the system bus, a Docker daemon, a Nix daemon, cgroupfs, permission to
+dump conntrack - run where it is and skip where it is not.
 
-- **`parseUnitPolicy`** - a full file; only required fields (defaults); each
+- **`ParsePolicy`** - a full file; only required fields (defaults); each
   bad field warned and defaulted; missing `desired`/`profile`/`unit` skipped;
   not JSON skipped; `docker` in `health` dropped with a warning; `netio`
   rejected; bare `unit` gets `.service`; ports grammar shared with labels.
-- **`parseListeners`** - captured `ss -Hlntu -e` from a real host (fixture):
-  TCP LISTEN and UDP UNCONN, v4/v6/wildcard/`%lo`, a socket-unit cgroup, no
-  `cgroup:` field at all. **`unitBoundPorts`** - cgroup equal, beneath,
-  sibling with a shared prefix (`foo.service` vs `foo.service2`) not matched.
+- **`CgroupBoundPorts`** - cgroup equal, beneath, sibling with a shared prefix
+  (`foo.service` vs `foo.service2`) not matched; no cgroup, and
+  `ErrUnknownCgroups`, both "cannot tell". The netlink lister itself is tested
+  where it lives, in gokit's `sockdiag`.
+- **Conntrack over ctnetlink** - the request's bytes, and captured-shape dumps
+  decoded: TCP and UDP kept, the rest dropped, the original direction's
+  destination port, `IPS_ASSURED`, the TCP state named as `conntrack -L` names
+  it, an error or a truncated message an error and never an empty table; the
+  real kernel's table where permitted (skipped on EPERM), and in the VM test.
+
 - **`NixProfiles`** - against a temporary directory and real `nix-env` where
   available (skipped otherwise): set creates the parent, generation numbers,
-  switchGeneration, prune keeps `+N`; and pure `generationOf("P-12-link")`.
+  SwitchGeneration, Prune keeps `+N`; and pure `GenerationOf("P-12-link")`.
 - **`systemd` health check** - each `UnitState`/`JobResult` combination to
   pass/fail/inconclusive; `NRestarts` and `InvocationID` movement.
-- **`SystemdSource`** with `FakeSystemd`, `FakeProfiles`, `FakeListeners`,
-  `FakeConntrackSource`, `FakeTcpProbe` and an in-memory units directory and
-  state store:
+- **The systemd `Source`** with a fake bus, profiles, listener, conntrack
+  dumper and netns, and an in-memory units directory and state store:
   - keep when `current == desired`;
   - defer while conntrack shows a UDP flow to a declared port; the debounce;
   - a flow arriving between the decision and the swap defers (re-sample);
@@ -866,35 +871,36 @@ fake. Docker tests unchanged and green throughout.
   - port never bound -> uptime fails -> rollback;
   - pin survives a new `SystemdSource` over the same state store;
   - a new `desired` clears the pin;
-  - `nix-env` failing -> undo, counted, pinned after `MAX_SWAP_FAILURES`;
+  - `nix-env` failing -> undo, counted, pinned after `MaxSwapFailures`;
   - stopped unit -> profile set, no restart;
   - `not-found` unit -> warned, left alone;
-  - `hold()` called before the swap;
+  - `Hold` called before the swap;
   - `bindClosure`: drop-in written for desired before restart and for the
-    previous path before the rollback restart, each followed by daemonReload.
+    previous path before the rollback restart, each followed by a reload.
 - **`Daemon`** - two sources in one pass share one conntrack dump; outcomes
   concatenated; the status names exactly the busy workloads, and the swapping
   one before its swap starts; the activity tick updates it without touching
-  idle streaks; a source that throws does not stop the other; `run` clears it
+  idle streaks; a source that fails does not stop the other; `Run` clears it
   on the way out.
-- **Automatic reboot** (`FakeBootCheck`, `FakeRebooter`, a settable clock) -
+- **Automatic reboot** (a fake boot check and rebooter, gokit's stopped clock) -
   reboots when needed, in the window and settled, once only; not when not
   needed or when it cannot tell; waits outside the window and goes in the next
   day's; waits for a busy workload of either source, an unsettled or unsampled
   one, a swap, someone found by the last look, a last look that failed; asks
-  again after a refusal; never from a failed pass. `parseWindow` and
-  `inWindow`, midnight crossing included; `NixosBootCheck` over temporary
-  system directories; `LogindRebooter` against the fake bus; `decideReboot`.
-- **Status** - `describeStatus`, `FileStatus` round trip, and `main(["status"])`
+  again after a refusal; never from a failed pass. `ParseWindow` and
+  `Window.Contains`, midnight crossing included; the `NixOS` boot check over
+  temporary system directories; logind's `Reboot` over godbus; `reboot.Decide`.
+- **Status** - `Describe`, the `File` round trip, and `tidewaiter status`
   exiting 0, 1 and 2.
-- **D-Bus** - Portical's wire-format tests come with `dbus.ts`; new golden bytes
-  for `RestartUnit`, `GetAll` on a Service, and a `JobRemoved` signal decoded.
+- **D-Bus** - the adapter's decoding of `GetAll` and of a `JobRemoved` signal,
+  a job removed before `RestartUnit`'s reply, a bus that drops mid-wait; and
+  the real system bus where there is one (skipped otherwise).
 - **`prepare`** - seeds only missing profiles; writes the drop-in only where it is missing or names another profile, never over the daemon's.
 - **Arguments** - `--source` repeated and comma separated, unknown rejected,
   `--units-dir`, `--state-dir`/`STATE_DIRECTORY`, `--status-file`,
   `--auto-reboot-window` (checked), `--booted-system`, `--current-system`.
 - **Nix**
-  - `checks.package`: the build, with `bun test` in `checkPhase`.
+  - `checks.package`: the build, with `go test` in `checkPhase`.
   - `checks.module`: evaluate a configuration with an opted-in unit and assert
     the rendered `/etc/tidewaiter/units/x.service.json`, `restartIfChanged =
     false`, the ordering after `tidewaiter-prepare.service` (wants, not
@@ -941,49 +947,39 @@ fake. Docker tests unchanged and green throughout.
       and find "rebooting, as nothing is in use" in the previous boot's
       journal, and "not needed" in this one's.
     - Runs in about 90 s of test script on a KVM host.
-- Also: `bun run.ts check` (tsc) and the Docker image build unchanged.
+- Also: `./run check` (gofmt and go vet) and the Docker image build.
 
 ## 12. Where this stands
 
-Refactors made first, behaviour unchanged:
+Built first in TypeScript, with a refactor of the Docker updater into a source
+before anything was added; then rewritten in Go, package for package. Each
+package depends only on the ones below it, with in-memory fakes in
+`internal/fakes` and beside each package's tests:
 
-- **`src/loop.ts` `runEvery`** - the single-flight interval loop.
-- **`src/gate.ts` `pollVerdict`, `sleep`, `uptimeSeconds`** - the health gate's
-  poll-until-settled loop and the uptime grace, shared by both sources.
-- **`src/decide.ts` `Decidable`, `Words`** - the part of a `Snapshot` `decide()`
-  reads, and the wording of its reasons.
-- **`src/health.ts` `HealthSubject`, `BoundPorts`, `netnsBoundPorts`** - the
-  checks read a subject and a bound-ports function, not a container and its
-  netns.
-- **`src/labels.ts`** - `parsePortTerm` and the field validators exported, so a
-  units file is read with the labels' rules.
-
-Built on them, each with in-memory fakes (`test/fakes/systemd.ts`,
-`test/fakes/source.ts`):
-
-| File | What |
+| Package | What |
 |---|---|
-| `src/source.ts` | `Source`, `PassContext`, `Outcome`, `MAX_SWAP_FAILURES` |
-| `src/daemon.ts` | `Daemon`: shared dump, sources in turn, summary, status, activity tick, automatic reboot |
-| `src/docker-source.ts` | `DockerSource`, plus `activity()` and `list()` |
-| `src/status.ts` | `Status`, `StatusSink`, `FileStatus`, `describeStatus` |
-| `src/reboot.ts` | `parseWindow`, `inWindow`, `NixosBootCheck`, `LogindRebooter`, `decideReboot` |
-| `src/units.ts` | `parseUnitPolicy`, `DirUnitsDirectory` |
-| `src/listeners.ts` | `parseListeners`, `unitBoundPorts`, `SsListenerSource` |
-| `src/profile.ts` | `Profiles`, `NixProfiles`, `generationOf` |
-| `src/systemd.ts` | `UnitState`, `SystemdClient`, `systemdVerdict`, `DbusSystemdClient` |
-| `src/dbus.ts` | the D-Bus wire format and connection, copied from Portical's branch |
-| `src/prepare.ts` | `prepare`: seed missing profiles, write closure drop-ins, reload |
-| `src/closure.ts` | `ClosureBinder`, `NixClosureBinder`, `closureDropIn` |
-| `src/state-store.ts` | `UnitMemory`, `FileStateStore` |
-| `src/systemd-source.ts` | `SystemdSource`: sections 2-5 and 7's swap side |
+| `internal/source` | `Source`, `Pass`, `Outcome`, `MaxSwapFailures` |
+| `internal/daemon` | `Daemon`: shared dump, sources in turn, summary, status, activity tick, automatic reboot |
+| `internal/decide` | `Decide`, `Inputs`, `State`, `Words` |
+| `internal/detect` | the detectors, `ConntrackEntry` and `ConntrackDumper` |
+| `internal/activity` | the conntrack dump over ctnetlink, and `/proc` netns reading |
+| `internal/health` | the shared checks, `Combine`, `Gate`, `BoundPorts` by netns and by cgroup |
+| `internal/docker` | the Docker Engine client over net/http, labels, the recreate, the Docker `Source` |
+| `internal/registry` | digests from the registry, its token auth and `~/.docker/config.json` |
+| `internal/status` | `Status`, `Sink`, `File`, `Describe`, the `status` command |
+| `internal/reboot` | `ParseWindow`, `Window`, the `NixOS` boot check, `Rebooter`, `Decide` |
+| `internal/systemd` | `ParsePolicy`, `Dir`, `UnitState`, `Bus`, `Verdict`, `DBus` over godbus, `Prepare`, the systemd `Source`: sections 2-5 and 7's swap side |
+| `internal/nix` | `Profiles`, `NixProfiles`, `GenerationOf`, `ClosureBinder`, `NixClosureBinder` |
+| `internal/statestore` | `UnitMemory`, the state file (the TypeScript's, read as it was) |
+| `internal/cli` | the flags, the commands, and the `Container` that wires it all |
 
-`main.ts` builds the sources section 8's flags name - Docker alone by
-default, so the image behaves as before - the `FileStatus` with
-`--status-file`, and the automatic reboot with `--auto-reboot-window`. `flake.nix` and `nix/` are section 9, and `nix/vm-test.nix` the VM
-test of section 11.
+`internal/cli` builds the sources section 8's flags name - Docker alone by
+default, so the image behaves as before - the status `File` with
+`--status-file`, and the automatic reboot with `--auto-reboot-window`.
+`flake.nix` and `nix/` are section 9, and `nix/vm-test.nix` the VM test of
+section 11.
 
-`DbusSystemdClient` subscribes to `JobRemoved` once per connection, before its
+`DBus` subscribes to `JobRemoved` once per connection, before its
 first call, and a `JobRemoved` that arrives before the reply to `RestartUnit`
 is kept for the restart that asked; a bus that drops while a restart waits
 rejects it, which the source treats as a swap-step failure (undo, and restart
@@ -999,9 +995,10 @@ reboot at schedule time - and then, because a block lock refused a person's
 reboot too, the lock was replaced by `tidewaiter status` and Tidewaiter's own
 automatic reboot (section 6).
 
-Checked: `bun test` (all pass; the tests needing a Nix daemon or the system bus
-run on a development host and skip in the sandbox), `tsc --noEmit`, `nix flake
-check` (package with `bun test` under nixpkgs' Bun 1.4.2, module, VM).
+Checked: `./run test` (all pass; the tests needing a Nix daemon, the system bus,
+Docker, cgroupfs or conntrack permission run on a development host and skip in
+the sandbox), `./run check`, `nix flake check` (package with `go test` in its
+check phase, module, VM).
 
 ## 13. Open questions
 
@@ -1027,10 +1024,10 @@ check` (package with `bun test` under nixpkgs' Bun 1.4.2, module, VM).
    swap. Binding `/nix/store` read-only in Chandlery's units is simpler, and the
    store is world-readable anyway. Which does Chandlery prefer? (Needs agreeing
    with the Chandlery branch.)
-6. **Which Bun builds the flake.** `mise.toml` pins `1.3` (1.3.14 locally),
-   the flake builds with nixpkgs-unstable's 1.4.2, and Portical's branch moved
-   its `mise.toml` to 1.4.2. The whole suite passes on both, so the flake just
-   uses 1.4.2; bump `mise.toml` (and the image) to match?
+6. **Which toolchain builds the flake.** Settled by the Go rewrite: `mise.toml`
+   and the image pin Go 1.27.3, and the flake builds with nixpkgs-unstable's
+   `buildGo127Module`, which refuses anything older than go.mod's `go 1.27`.
+
 7. **Unit config changes.** With `restartIfChanged = false`, a change to the
    unit's *own* definition (a new flag in `ExecStart`) waits for the next
    version change to take effect. Should the module include a hash of the
@@ -1050,12 +1047,13 @@ check` (package with `bun test` under nixpkgs' Bun 1.4.2, module, VM).
     only, so the host itself talking *out* to another server on 19132 would
     read as a player. Also match the flow's original destination address
     against the host's own addresses?
-12. **Docker reads a failed conntrack dump as an empty table** in a pass - so
-    as idle, though it logs "assuming busy where it matters". That predates
-    this branch and is kept, as promised; the systemd source reads it as busy.
-    The activity tick does read it as busy for a `conntrack`-detector
-    container, and an automatic reboot's last look is a tick's, so a reboot is
-    never taken on a read that failed. Make Docker's swaps fail safe too?
+12. **Docker read a failed conntrack dump as an empty table** in a pass - so as
+    idle, though it logged "assuming busy where it matters". That predated this
+    branch, and the TypeScript kept it. Settled by the Go rewrite: a failed
+    dump reaches every source as "could not tell", and the `conntrack`
+    detector reads that as busy for a container as for a unit, in a pass as in
+    the activity tick.
+
 13. **Symlinked store paths in a closure** are bound as written, where nixpkgs'
     confinement binds their target, since systemd cannot bind a symlink
     (section 7). Not seen in a real closure; handle it anyway?
