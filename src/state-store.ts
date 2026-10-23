@@ -22,6 +22,24 @@ export interface UnitMemory {
    * recovery rolls back to.
    */
   readonly good?: number;
+  /**
+   * A swap under way, written before anything is changed and cleared once it
+   * commits or is undone, so a Tidewaiter that dies in between finds out on
+   * its next start that the profile may point at a version that never ran,
+   * or ran but was never gated, rather than taking it for a baseline.
+   */
+  readonly swapping?: SwapRecord;
+}
+
+/** Where a swap started from, where it was going, and the invocation it was replacing. */
+export interface SwapRecord {
+  /** The profile generation the swap left; undefined for a profile it created. */
+  readonly from?: number;
+  /** That generation's store path, for the closure drop-in. */
+  readonly fromTarget?: string;
+  readonly to: string;
+  /** The unit's invocation before the restart: unchanged means it never restarted. */
+  readonly invocationId: string;
 }
 
 export type Memories = Readonly<Record<string, UnitMemory>>;

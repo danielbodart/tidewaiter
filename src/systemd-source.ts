@@ -18,7 +18,7 @@ import { parseListeners, unitBoundPorts, type Listener, type ListenerSource } fr
 import type { NetnsReader } from "./netns.ts";
 import type { Profiles } from "./profile.ts";
 import { MAX_SWAP_FAILURES, type Activity, type Outcome, type PassContext, type Source } from "./source.ts";
-import type { Memories, StateStore, UnitMemory } from "./state-store.ts";
+import type { Memories, StateStore, SwapRecord, UnitMemory } from "./state-store.ts";
 import { isStopped, isUp, restartedSince, systemdVerdict, type JobResult, type SystemdClient, type UnitState } from "./systemd.ts";
 import { parseUnitPolicy, type UnitPolicy, type UnitsDirectory } from "./units.ts";
 
@@ -63,8 +63,9 @@ interface Progress {
  * ExecStop saves and quits), health-gate, and on failure switch the profile
  * back to the generation it left, restart again and pin the version out.
  *
- * Pins and the last good generation survive a restart of Tidewaiter (see
- * UnitMemory); idle streaks do not.
+ * Pins, the last good generation and a swap under way survive a restart of
+ * Tidewaiter (see UnitMemory), each saved the moment it changes; idle streaks
+ * do not.
  */
 export class SystemdSource implements Source {
   readonly name = "systemd";
@@ -179,15 +180,16 @@ export class SystemdSource implements Source {
       return outcome({ kind: "keep", reason: "no such unit" }, false);
     }
 
-    let current: string | undefined;
-    let generation: number | undefined;
-    try {
-      current = await this.deps.profiles.current(profile);
-      generation = await this.deps.profiles.generation(profile);
-    } catch (error) {
-      this.log(`${unit}: could not read the profile ${profile} (${(error as Error).message}); leaving it alone`);
-      return outcome({ kind: "keep", reason: "profile unreadable" });
-    }
+    const readProfile = async (): Promise<{ current?: string; generation?: number } | undefined> => {
+      try {
+        return { current: await this.deps.profiles.current(profile), generation: await this.deps.profiles.generation(profile) };
+      } catch (error) {
+        this.log(`${unit}: could not read the profile ${profile} (${(error as Error).message}); leaving it alone`);
+        return undefined;
+      }
+    };
+    let read = await readProfile();
+    if (read === undefined) return outcome({ kind: "keep", reason: "profile unreadable" });
 
     // A pin, and a run of swap failures, only hold until desired moves on.
     let memory = this.memory(unit);
@@ -199,9 +201,14 @@ export class SystemdSource implements Source {
 
     if (!this.seen.has(unit)) {
       this.seen.add(unit);
-      const recovered = await this.firstSight(policy, state, current, generation, context);
+      const recovered = await this.firstSight(policy, state, read.current, read.generation, context);
       if (recovered) return outcome(recovered, false);
+      // Recovery may have moved the profile back, or gated what it points at.
+      state = await this.deps.systemd.unit(unit);
+      read = await readProfile();
+      if (read === undefined) return outcome({ kind: "keep", reason: "profile unreadable" });
     }
+    const { current, generation } = read;
 
     if (isStopped(state)) return outcome(await this.updateStopped(policy, current), false);
 
@@ -291,6 +298,18 @@ export class SystemdSource implements Source {
       return action;
     }
 
+    // Recorded, durably, before anything changes: a Tidewaiter that dies from
+    // here until the gate's verdict must not mistake the profile's new
+    // generation for one that is known good (see resumeSwap).
+    this.remember(unit, {
+      ...this.memory(unit),
+      swapping: { from: previous, fromTarget: current, to: desired, invocationId: before.invocationId },
+    });
+    if (!(await this.save())) {
+      this.remember(unit, { ...this.memory(unit), swapping: undefined });
+      return { kind: "defer", reason: "could not record the swap before starting it" };
+    }
+
     const progress: Progress = { bound: false, set: false };
     let job: JobResult;
     try {
@@ -305,7 +324,9 @@ export class SystemdSource implements Source {
     } catch (error) {
       this.log(`${unit}: FAILED during swap (${(error as Error).message}); undoing what was done`);
       await this.undo(policy, before, current, previous, progress);
+      this.remember(unit, { ...this.memory(unit), swapping: undefined });
       this.countFailure(unit, desired);
+      await this.save();
       return undefined;
     }
 
@@ -316,13 +337,17 @@ export class SystemdSource implements Source {
         this.log(`${unit}: updated, but pruning old generations failed (${(error as Error).message})`),
       );
       this.remember(unit, { good });
+      await this.save();
       this.log(`${unit}: updated to ${desired} and it is healthy`);
       return undefined;
     }
 
     this.log(`${unit}: the new version is unhealthy (${health.reason}); rolling back`);
     await this.rollBack(policy, previous, current);
-    this.remember(unit, { ...this.memory(unit), pinned: desired, failing: undefined, swapFailures: undefined });
+    this.remember(unit, {
+      ...this.memory(unit), pinned: desired, failing: undefined, swapFailures: undefined, swapping: undefined,
+    });
+    await this.save();
     return undefined;
   }
 
@@ -419,12 +444,12 @@ export class SystemdSource implements Source {
   /**
    * The first look at a unit since this daemon started.
    *
-   * If Tidewaiter died mid-swap, the profile may point at a version whose gate
-   * never ran. A unit that is up is adopted as it is, its generation recorded
-   * as good. A unit that has failed on a generation newer than the last one
-   * recorded good is the one fact that says "a swap went wrong and nobody
-   * cleaned up", so that - and only that - is rolled back, and the version it
-   * failed on pinned out.
+   * A swap recorded as under way is finished or undone by resumeSwap. Without
+   * one, a unit that is up is adopted as it is, its generation recorded as
+   * good - someone moved the profile by hand, or this is the first sight of
+   * it. A unit that has failed on a generation newer than the last one
+   * recorded good says "something went wrong and nobody cleaned up", so that
+   * - and only that - is rolled back, and the version it failed on pinned out.
    */
   private async firstSight(
     policy: UnitPolicy,
@@ -434,14 +459,18 @@ export class SystemdSource implements Source {
     context: PassContext,
   ): Promise<Action | undefined> {
     const { unit, profile } = policy;
-    const { good } = this.memory(unit);
+    const { good, swapping } = this.memory(unit);
+    if (swapping !== undefined) return this.resumeSwap(policy, swapping, state, generation, context);
     if (generation === undefined) return undefined;
 
     if (isUp(state)) {
       if (good !== undefined && good !== generation) {
         this.log(`${unit}: adopting generation ${generation} of ${profile} as the baseline (no record of it going in)`);
       }
-      if (good !== generation) this.remember(unit, { ...this.memory(unit), good: generation });
+      if (good !== generation) {
+        this.remember(unit, { ...this.memory(unit), good: generation });
+        await this.save();
+      }
       return undefined;
     }
 
@@ -454,7 +483,85 @@ export class SystemdSource implements Source {
     await context.hold(unit);
     const goodTarget = await this.deps.profiles.target(profile, good).catch(() => undefined);
     await this.rollBack(policy, good, goodTarget);
-    if (current !== undefined) this.remember(unit, { ...this.memory(unit), pinned: current });
+    if (current !== undefined) {
+      this.remember(unit, { ...this.memory(unit), pinned: current });
+      await this.save();
+    }
+    return { kind: "pinned", reason: "rolled back an interrupted swap" };
+  }
+
+  /**
+   * Pick up a swap Tidewaiter died in the middle of, by whether the unit
+   * restarted since the swap began (its invocation id moved on):
+   *
+   * - **It did not.** The unit still runs the version the swap left, whatever
+   *   the profile and the closure drop-in now say. Both are put back - without
+   *   a restart, players may be on - and the ordinary idle-gated path swaps
+   *   again.
+   * - **It did, and is failed.** Rolled back to where the swap started, and
+   *   the version pinned out, as a failed gate would have.
+   * - **It did, and is up.** The restart happened but its gate never ran: it
+   *   is gated now, committed if healthy, rolled back and pinned if not.
+   * - **It did, and is stopped.** Someone stopped it since; nothing runs, so
+   *   the record is dropped and the stopped-unit path moves the profile.
+   *
+   * Only once the record is cleared is a generation ever adopted as good.
+   */
+  private async resumeSwap(
+    policy: UnitPolicy,
+    record: SwapRecord,
+    state: UnitState,
+    generation: number | undefined,
+    context: PassContext,
+  ): Promise<Action | undefined> {
+    const { unit, profile } = policy;
+    const { from, fromTarget, to } = record;
+    const finish = async (memory: Partial<UnitMemory> = {}): Promise<void> => {
+      this.remember(unit, { ...this.memory(unit), ...memory, swapping: undefined });
+      await this.save();
+    };
+    if (this.options.dryRun) {
+      this.log(`${unit}: a swap to ${to} was interrupted; leaving it as it is (dry run)`);
+      return { kind: "keep", reason: "interrupted swap left alone in a dry run" };
+    }
+
+    if (state.invocationId === record.invocationId || isStopped(state) && state.activeState !== "failed") {
+      if (state.invocationId === record.invocationId) {
+        this.log(`${unit}: a swap to ${to} was interrupted before the restart; putting ${profile} back`);
+      }
+      try {
+        if (from !== undefined && generation !== undefined && generation !== from) await this.switchBack(profile, from);
+        if (policy.bindClosure && fromTarget !== undefined) {
+          await this.deps.closure.bind(unit, profile, fromTarget);
+          await this.deps.systemd.daemonReload();
+        }
+      } catch (error) {
+        this.log(`${unit}: could not put ${profile} back (${(error as Error).message}); trying again next pass`);
+        this.seen.delete(unit);
+        return { kind: "keep", reason: "interrupted swap not yet undone" };
+      }
+      await finish();
+      return undefined;
+    }
+
+    await context.hold(unit);
+    if (state.activeState !== "failed" && (from === undefined || generation !== from)) {
+      this.log(`${unit}: a swap to ${to} was interrupted after the restart; gating it now`);
+      const health = await this.gate(policy, "done");
+      if (health.healthy) {
+        await this.deps.profiles.prune(profile, policy.keepGenerations).catch((error) =>
+          this.log(`${unit}: updated, but pruning old generations failed (${(error as Error).message})`),
+        );
+        this.log(`${unit}: updated to ${to} and it is healthy`);
+        await finish({ good: generation, pinned: undefined, failing: undefined, swapFailures: undefined });
+        return undefined;
+      }
+      this.log(`${unit}: the new version is unhealthy (${health.reason}); rolling back`);
+    } else {
+      this.log(`${unit}: a swap to ${to} was interrupted and the unit is ${state.activeState}; rolling back`);
+    }
+    await this.rollBack(policy, from, fromTarget);
+    await finish({ pinned: to, failing: undefined, swapFailures: undefined });
     return { kind: "pinned", reason: "rolled back an interrupted swap" };
   }
 
@@ -588,16 +695,22 @@ export class SystemdSource implements Source {
     this.saved = JSON.stringify(memories);
   }
 
-  /** Persist the memories, only when this pass changed them. */
-  private async save(): Promise<void> {
+  /**
+   * Persist the memories, only when they changed since the last save. Called
+   * straight after every change that matters for safety, and once at the end
+   * of a pass. False when the write failed.
+   */
+  private async save(): Promise<boolean> {
     const memories = Object.fromEntries([...(this.memories ?? new Map()).entries()].sort(([a], [b]) => a.localeCompare(b)));
     const json = JSON.stringify(memories);
-    if (json === this.saved) return;
+    if (json === this.saved) return true;
     try {
       await this.deps.store.save(memories);
       this.saved = json;
+      return true;
     } catch (error) {
       this.log(`Warning: could not save the systemd source's state (${(error as Error).message})`);
+      return false;
     }
   }
 }

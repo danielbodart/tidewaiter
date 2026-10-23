@@ -378,6 +378,130 @@ describe("crash recovery", () => {
   });
 });
 
+describe("a swap Tidewaiter died in the middle of", () => {
+  /** good=1 on V1, and a record of a swap to V2 started from it while invocation 0001 ran. */
+  function interrupted(fields: Record<string, unknown> = {}) {
+    const store = new MemoryStateStore();
+    store.memories = { [UNIT]: { good: 1, swapping: { from: 1, fromTarget: V1, to: V2, invocationId: "0001" } } };
+    return harness(fields, store);
+  }
+
+  test("is recorded, durably, before anything changes, and cleared once it commits", async () => {
+    const h = harness();
+    const seen: unknown[] = [];
+    const set = h.profiles.set.bind(h.profiles);
+    h.profiles.set = async (profile, path) => {
+      seen.push(h.store.memories[UNIT]?.swapping);
+      return set(profile, path);
+    };
+
+    expect(await h.kinds()).toEqual(["update"]);
+
+    expect(seen).toEqual([{ from: 1, fromTarget: V1, to: V2, invocationId: "0001" }]);
+    expect(h.store.memories[UNIT]).toEqual({ good: 2 });
+  });
+
+  test("is not started when it cannot be recorded", async () => {
+    const h = harness();
+    h.store.save = async () => { throw new Error("read-only file system"); };
+
+    expect(await h.kinds()).toEqual(["defer"]);
+    expect(h.journal).toEqual(["hold game.service"]);
+    expect(await h.profiles.current(PROFILE)).toBe(V1);
+  });
+
+  test("after `set` but before the restart: the profile is put back, not adopted, and the swap redone when idle", async () => {
+    const h = interrupted();
+    h.profiles.seed(PROFILE, V1, V2);
+
+    expect(await h.kinds()).toEqual(["update"]);
+
+    expect(h.journal).toEqual([
+      "switch 1", "delete 2", "hold game.service", `set ${V2}`, "restart game.service", "prune +2",
+    ]);
+    expect(h.store.memories[UNIT]).toEqual({ good: 2 });
+    expect(h.log.join("\n")).not.toContain("adopting");
+  });
+
+  test("after `set` but before the restart, with a player on: put back without a restart, and waits", async () => {
+    const h = interrupted();
+    h.profiles.seed(PROFILE, V1, V2);
+    h.conntrack.text = PLAYER;
+
+    expect(await h.kinds()).toEqual(["defer"]);
+
+    expect(h.journal).toEqual(["switch 1", "delete 2"]);
+    expect(await h.profiles.current(PROFILE)).toBe(V1);
+    expect(h.store.memories[UNIT]).toEqual({ good: 1 });
+  });
+
+  test("after the closure was bound but before `set`: the drop-in goes back to what the profile names", async () => {
+    const h = interrupted({ bindClosure: true });
+    h.conntrack.text = PLAYER;
+
+    expect(await h.kinds()).toEqual(["defer"]);
+
+    expect(h.journal).toEqual([`bind ${V1}`, "daemon-reload"]);
+    expect(h.store.memories[UNIT]).toEqual({ good: 1 });
+  });
+
+  test("after the restart, before the gate: gated now, and committed when healthy", async () => {
+    const h = interrupted();
+    h.profiles.seed(PROFILE, V1, V2);
+    h.systemd.patch(UNIT, { invocationId: "0002" });
+
+    expect(await h.kinds()).toEqual(["keep"]);
+
+    expect(h.journal).toEqual(["hold game.service", "prune +2"]);
+    expect(h.store.memories[UNIT]).toEqual({ good: 2 });
+  });
+
+  test("after the restart, before the gate: gated now, and rolled back and pinned when unhealthy", async () => {
+    const h = interrupted();
+    h.profiles.seed(PROFILE, V1, V2);
+    h.systemd.patch(UNIT, { invocationId: "0002" });
+    h.listeners.clear(); // V2 came up but never bound its port
+    neverBinds(h, V2);
+
+    const [outcome] = await h.pass();
+
+    expect(outcome!.action.kind).toBe("pinned");
+    expect(h.journal).toEqual(["hold game.service", "switch 1", "delete 2", "restart game.service"]);
+    expect(await h.profiles.current(PROFILE)).toBe(V1);
+    expect(h.store.memories[UNIT]).toEqual({ good: 1, pinned: V2 });
+  });
+
+  test("after the restart, failed: rolled back and pinned", async () => {
+    const h = interrupted();
+    h.profiles.seed(PROFILE, V1, V2);
+    h.systemd.patch(UNIT, { invocationId: "0002", activeState: "failed", result: "exit-code" });
+
+    expect(await h.kinds()).toEqual(["pinned"]);
+
+    expect(await h.profiles.current(PROFILE)).toBe(V1);
+    expect(h.store.memories[UNIT]).toEqual({ good: 1, pinned: V2 });
+  });
+
+  test("a rollback's pin is saved straight away, not at the end of the pass", async () => {
+    const h = harness();
+    neverBinds(h, V2);
+    h.units.declare("other.service", { desired: V1, profile: `${PROFILE}-other`, ports: ["7778/udp"] });
+    h.systemd.add(unitState("other.service"));
+    h.profiles.seed(`${PROFILE}-other`, V1);
+    // What is on disk when the pass moves on to the next unit: the moment a crash would lose it.
+    let onDisk: unknown;
+    const read = h.systemd.unit.bind(h.systemd);
+    h.systemd.unit = async (name) => {
+      if (name === "other.service" && onDisk === undefined) onDisk = structuredClone(h.store.memories[UNIT]);
+      return read(name);
+    };
+
+    await h.pass();
+
+    expect(onDisk).toEqual({ good: 1, pinned: V2 });
+  });
+});
+
 describe("activity and list", () => {
   test("activity reads players, without moving the idle streak", async () => {
     const h = harness({ idleSamples: 2 });
