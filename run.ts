@@ -52,6 +52,26 @@ export async function build(outfile = "dist/tidewaiter") {
   console.log(`built ${outfile} ${v}`);
 }
 
+/**
+ * What a GitHub release carries: a binary per architecture, the systemd unit
+ * that runs it, and their checksums, all in one directory for `gh release
+ * create` to upload as they are. The binaries are glibc builds, for the
+ * distributions a native install is for; the image's musl build is for Alpine.
+ *
+ * x64 is Bun's baseline build, which runs without AVX2. The low-power Celerons
+ * and Atoms in a lot of home servers do not have it.
+ */
+export async function release(dir = "dist/release") {
+  const v = await version();
+  await $`rm -rf ${dir} && mkdir -p ${dir}`;
+  for (const [arch, target] of [["x64", "bun-linux-x64-baseline"], ["arm64", "bun-linux-arm64"]]) {
+    await $`bun build --compile --minify --define ${`TIDEWAITER_VERSION="${v}"`} --target=${target} src/main.ts --outfile ${`${dir}/tidewaiter-linux-${arch}`}`;
+  }
+  await $`cp systemd/tidewaiter.service ${dir}/`;
+  await $`sha256sum tidewaiter-linux-x64 tidewaiter-linux-arm64 tidewaiter.service > SHA256SUMS`.cwd(dir);
+  console.log(`built ${dir} ${v}`);
+}
+
 /** The same image CI publishes, for both architectures, built locally. */
 export async function image(tag = "danielbodart/tidewaiter:dev") {
   const v = await version();
@@ -63,6 +83,7 @@ const commands: Record<string, (...args: string[]) => Promise<unknown>> = {
   check,
   test,
   build,
+  release,
   image,
 };
 

@@ -3,7 +3,7 @@
 
 # Tidewaiter
 
-**Auto-updater that waits for the tide to go out.** It watches for a newer version — a newer image in the registry for a Docker container, or a new store path in the NixOS configuration for a [systemd unit](#systemd-units) — updates **only when nobody is using it** (no live network flows), health-checks the swap, and **rolls back** on failure. On NixOS it can also reboot into a new kernel the same way: inside a nightly window, once nobody is on.
+**Auto-updater that waits for the tide to go out.** It watches for a newer version — a newer image in the registry for a Docker container, or a new store path in the NixOS configuration for a [systemd unit](https://github.com/danielbodart/tidewaiter/blob/master/docs/systemd.md) — updates **only when nobody is using it** (no live network flows), health-checks the swap, and **rolls back** on failure. On NixOS it can also reboot into a new kernel the same way: inside a nightly window, once nobody is on.
 
 > A *tidewaiter* was a customs officer who boarded an incoming ship only once the tide allowed. This one waits for the tide of traffic to ebb before it goes aboard — and steps back the instant anyone's on.
 
@@ -45,169 +45,18 @@ The gate leans deliberately toward *trusting the update*: a check that merely ne
 
 Override per container, e.g. `tidewaiter.health=docker,uptime`.
 
-## Labels
+## Running it
 
-| Label | Meaning | Default |
-| --- | --- | --- |
-| `tidewaiter.autoupdate` | **the opt-in.** `registry` (compare against the registry) or `local` (compare against the locally-stored image, no network). A container is managed only if it carries this label with a known value; absence — or an unrecognised value — means it is left completely alone. | *(none — required to opt in)* |
-| `tidewaiter.detector` | `conntrack` \| `tcp` \| `netio` \| `none` | `conntrack` |
-| `tidewaiter.ports` | scope the idle check and health probe to specific published ports — use it when a container also exposes a metrics/admin port that gets constant automated traffic (which would otherwise keep it looking "busy" forever) | all published ports |
-| `tidewaiter.idle-samples` | consecutive idle passes required before updating | `3` |
-| `tidewaiter.health` | comma-separated checks: `docker`, `port-connect`, `port-bound`, `uptime` (run together, any active failure rolls back) | all four |
-| `tidewaiter.health-timeout` | seconds to wait for healthy before rolling back | `120` |
-| `tidewaiter.grace` | stop-grace (drain) seconds | container's own stop timeout |
-| `tidewaiter.keep-images` | previous images to retain for rollback before pruning | `1` |
+How to opt something in, and run Tidewaiter, depends on where your services run:
 
-A malformed label is reported and the default used — one bad label never stops a container being managed.
-
-`tidewaiter.ports` takes a comma-separated list where each term is a port with an optional protocol: `25565/tcp` (TCP only), `19132/udp` (UDP only), or a bare `25565` (both, or whichever the container actually publishes) — e.g. `tidewaiter.ports=25565,19132/udp`.
-
-## Deploy
-
-```yaml
-services:
-  tidewaiter:
-    image: danielbodart/tidewaiter:latest
-    container_name: tidewaiter
-    network_mode: host          # share the net ns: conntrack + connect to host ports
-    cap_add:
-      - NET_ADMIN               # ACTIVITY GATE: dump the host conntrack table (netlink)
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock   # rw: it pulls, recreates, stops, removes
-      - /proc:/host/proc:ro     # DETECT LISTENING: read /proc/<pid>/net/* to see what a
-                                # container has bound inside its own netns (host networking
-                                # shares the net ns but NOT the pid ns; a read-only /proc
-                                # mount is a smaller grant than `pid: host`)
-    restart: unless-stopped
-```
-
-Two grants, two jobs: **`CAP_NET_ADMIN`** is the *activity gate* (conntrack — "is anyone using this container?"); the read-only **`/proc` mount** is the *health/detector* read ("is it actually listening inside?"). Tidewaiter never needs `CAP_SYS_ADMIN` — it reads `/proc`, it doesn't enter namespaces. Without the `/proc` mount, `port-bound` health and the `tcp` detector degrade to inconclusive; conntrack, `port-connect`, `docker` and `uptime` still work.
-
-Then opt any container in with `tidewaiter.autoupdate=registry`. See [`docker-compose.yaml`](./docker-compose.yaml) for a worked example.
-
-Private registries: Tidewaiter reads `~/.docker/config.json` for credentials and sends them both when resolving digests and when pulling.
-
-## systemd units
-
-The same care for a native service: a systemd unit whose program lives in a **Nix profile**. The unit's `ExecStart` runs from the profile (`/nix/var/nix/profiles/…/bin/server`), so the unit itself never changes when the version does. A declaration names the store path the profile *should* point at; when it differs, Tidewaiter:
-
-1. **Waits for the tide to go out** — conntrack flows to the unit's declared ports, UDP included, exactly as for a container on host networking. Debounced by `idleSamples`, and looked at once more right before anything changes.
-2. **Swaps** — `nix-env --profile P --set DESIRED`, then `systemctl restart` the unit (over D-Bus). A graceful stop is the unit's own `ExecStop`, however long its `TimeoutStopSec` allows.
-3. **Health-gates** — `systemd`: the restart job finished `done` (for a `Type=notify` unit, the program said `READY=1`) and the unit stayed up on that invocation, with no `Restart=` crash loop hidden behind `active`; `port-bound`: a socket **in the unit's own cgroup** is on a declared port (`ss -e`, so another process on the same port doesn't count); `port-connect` and `uptime` as for containers.
-4. **Commits or rolls back** — healthy: prune old generations. Unhealthy: switch the profile back to the exact generation it left, delete the failed one, restart, and pin the version out until the declaration moves on. Pins survive a restart of Tidewaiter; a swap it died in the middle of is rolled back when it next sees the unit failed.
-
-A stopped unit just has its profile moved, for whoever starts it next.
-
-### NixOS
-
-```nix
-{
-  inputs.tidewaiter.url = "github:danielbodart/tidewaiter";
-  # ...
-  imports = [ inputs.tidewaiter.nixosModules.default ];
-
-  services.tidewaiter.enable = true;
-
-  systemd.services.minecraft = {
-    wantedBy = [ "multi-user.target" ];
-    serviceConfig.ExecStart = "/nix/var/nix/profiles/tidewaiter/minecraft/bin/minecraft-server";
-    tidewaiter = {
-      desired = pkgs.minecraft-server;   # the version to move to; setting it opts in
-      ports = [ "25565/tcp" ];
-    };
-  };
-}
-```
-
-Setting `tidewaiter.desired` on a service:
-
-- sets `restartIfChanged = false` — `nixos-rebuild switch` (or `system.autoUpgrade`) no longer restarts it; Tidewaiter does, when it's idle;
-- writes `/etc/tidewaiter/units/<name>.service.json`, the declaration the daemon reads, which also puts `desired` in the system closure — built by the switch that asked for it;
-- orders the service after `tidewaiter-prepare.service`, which creates its profile on `desired` the first time it's declared, so it starts on day one.
-
-| `systemd.services.<name>.tidewaiter.` | Meaning | Default |
-| --- | --- | --- |
-| `desired` | the package the profile should point at; non-null opts the service in | `null` |
-| `profile` | the profile `ExecStart` runs from | `/nix/var/nix/profiles/tidewaiter/<name>` |
-| `ports` | ports whose flows mean "in use", and that health probes: `19132/udp`, `25565/tcp`, or bare `25565` for both | `[]` (an assertion requires some unless `detector = "none"`) |
-| `detector` | `conntrack` \| `tcp` \| `none` | `conntrack` |
-| `health` | any of `systemd`, `port-connect`, `port-bound`, `uptime`, run together | all four |
-| `idleSamples` | consecutive idle passes before updating | `3` |
-| `healthTimeout` | seconds to wait for healthy | `120` |
-| `keepGenerations` | earlier profile generations kept after a healthy update | `1` |
-| `bindClosure` | bind the profile's current target and its closure into a confined service (see below) | the service's `confinement.enable` |
-
-| `services.tidewaiter.` | Meaning | Default |
-| --- | --- | --- |
-| `enable` | run the daemon | `false` |
-| `sources` | `systemd`, `docker`, or both — one daemon per host, so two swaps never overlap | `[ "systemd" ]` |
-| `interval` | seconds between passes | `60` |
-| `activityInterval` | seconds between activity checks between passes, keeping `tidewaiter status` current | `15` |
-| `autoReboot.enable` | reboot when the installed system needs it, inside the window, once nothing is in use (see below) | `false` |
-| `autoReboot.window` | daily window in local time, `HH:MM-HH:MM`; may cross midnight, `00:00-24:00` is all day | `"03:00-05:00"` |
-| `dryRun`, `dockerSocket`, `label`, `extraArgs`, `package` | as they say | |
-
-The daemon runs as root — it restarts other units and writes system profiles — and is otherwise confined: `CAP_NET_ADMIN` only (conntrack), `ProtectSystem=strict` with only `/nix/var/nix/profiles` and `/run/systemd/system` writable, profiles written through the Nix daemon, no `@privileged` system calls, and IP limited to localhost when systemd is the only source. `systemd-analyze security tidewaiter` rates it **2.0 OK**.
-
-**Confined services.** NixOS `confinement.enable` gives a service a root holding only the closure of its own definition — which names the profile but no version. With `bindClosure` (on by default for a confined service), Tidewaiter writes a runtime drop-in binding the profile's directory and its current target's closure before every restart, rollbacks included, and `tidewaiter-prepare` writes it at boot (only where none is there, so it never races the daemon's).
-
-**Combining with Portical.** A unit forwarded by [Portical](https://github.com/danielbodart/portical) typically lists the same ports twice. While no forward remaps a port, share one list: `let ports = [ "19132/udp" ]; in { portical.forward = ports; tidewaiter.ports = ports; }`. A remapped forward (`external:internal/proto`) is not a valid `tidewaiter.ports` entry: list the internal port — the one the unit binds, and the one conntrack sees the players' flows reach — e.g. `portical.forward = [ "19133:19132/udp" ]; tidewaiter.ports = [ "19132/udp" ];`, or derive it with `map (p: lib.last (lib.splitString ":" p)) forwards`.
-
-### Is anyone on? `tidewaiter status`
-
-Humans stay in charge: Tidewaiter never stands in the way of a reboot someone asks for. To see whether one would cut anybody off first:
-
-```
-$ tidewaiter status
-Busy: minecraft.service in use
-  minecraft.service (systemd)  in use
-  web (docker)  idle
-Automatic reboot (03:00-05:00): needed, kernel changed since boot; waiting: minecraft.service in use
-As of 4s ago
-```
-
-It exits **0** when nothing is in use or being swapped, **1** when something is, and **2** when there is no daemon to ask — so `tidewaiter status && reboot` does what it says. It needs no root: the daemon writes `/run/tidewaiter/status.json` (plain JSON, for scripts too) after every pass, every activity check (`activityInterval`) and the start of every swap, and the CLI only reads it. A workload is listed as "idle, not yet for long enough" until it has been idle for its `idleSamples`.
-
-### Rebooting for a new kernel
-
-`system.autoUpgrade` with `allowReboot = true` reboots whoever is on. Let Tidewaiter do it instead:
-
-```nix
-system.autoUpgrade = {
-  enable = true;
-  allowReboot = false;   # a plain nightly switch; opted-in services are not restarted by it
-};
-services.tidewaiter.autoReboot = {
-  enable = true;
-  window = "03:00-05:00";
-};
-```
-
-Each pass, Tidewaiter reboots (through logind, as `systemctl reboot` does) when all of these hold:
-
-- **a reboot is needed** — the test `autoUpgrade` itself makes: `/run/booted-system/{initrd,kernel,kernel-modules}` differ from `/nix/var/nix/profiles/system`'s;
-- **it is inside the window**, in local time — never outside it;
-- **every managed unit and container** has been idle for its whole `idleSamples`, Docker's included, and activity read once more right before the reboot still says so;
-- **nothing is being swapped**.
-
-A window busy from start to end simply passes, and the next night's is tried the same way. What it is waiting for is in the journal (once per change) and in `tidewaiter status`. The module refuses `autoReboot` together with `autoUpgrade.allowReboot`, since the two would fight. Both the wait and the reboot are proven by the VM test (`nix build .#checks.x86_64-linux.vm`).
-
-### Without NixOS
-
-Nothing here needs NixOS, only Nix profiles and systemd. Drop a JSON file per unit in `/etc/tidewaiter/units/`:
-
-```json
-{
-  "unit": "minecraft.service",
-  "desired": "/nix/store/…-minecraft-server-1.21.4",
-  "profile": "/nix/var/nix/profiles/tidewaiter/minecraft",
-  "ports": ["25565/tcp"]
-}
-```
-
-Every other field (`detector`, `health`, `idleSamples`, `healthTimeout`, `keepGenerations`) is optional, with the defaults above; `bindClosure` defaults to `false` in a file. Point the unit's `ExecStart` at the profile, have your deployment change only the file (never restart the unit itself), run `tidewaiter prepare` to create missing profiles, and run `tidewaiter --source systemd --status-file /run/tidewaiter/status.json run` as root (add `--auto-reboot-window 03:00-05:00` on NixOS to reboot as above).
-
-The design, and what is still open, is in [`docs/systemd-source.md`](./docs/systemd-source.md).
+- **[Run it in Docker](https://github.com/danielbodart/tidewaiter/blob/master/docs/docker.md)**
+  to update Docker containers, opted in with a label. The image is on Docker Hub as
+  `danielbodart/tidewaiter` and on GitHub as `ghcr.io/danielbodart/tidewaiter`.
+- **[Run it as a systemd service](https://github.com/danielbodart/tidewaiter/blob/master/docs/systemd.md)**
+  to update systemd units whose program lives in a Nix profile - from the flake's
+  NixOS module, or from a release binary on any systemd distribution with Nix. A
+  native Tidewaiter can update Docker containers too, and is the one to use on a
+  host that has both: one Tidewaiter per host, so two swaps never overlap.
 
 ## Commands
 
@@ -223,18 +72,25 @@ Options: `-s/--source docker|systemd` (repeat or comma-separate; default `docker
 
 ## Building
 
-`bun run.ts check` and `bun run.ts test` for development; `nix build` builds the binary reproducibly (running the tests on the way) and `nix flake check` adds the module check and the VM test.
+`bun run.ts check` and `bun run.ts test` for development, `bun run.ts release` for the release's binaries, unit and checksums; `nix build` builds the binary reproducibly (running the tests on the way) and `nix flake check` adds the module check and the VM test.
+
+Every push to `master` publishes an image, tagged `:latest` and with an exact
+version, and a [GitHub release](https://github.com/danielbodart/tidewaiter/releases)
+of the same version, tagged `v<version>`, with standalone binaries and the systemd
+unit.
 
 ## Known limitations (v1)
 
-- **Anonymous volumes block updates.** A container with an anonymous volume can't be recreated without losing the volume's data, so Tidewaiter defers and says so — give it a named volume to enable updates.
-- **`container:` network mode is copied verbatim.** A container sharing another's netns (`network_mode: "container:x"`) is recreated as-is; if `x` itself was recreated, the reference can break. Logged when detected.
-- **No crash-recovery of an in-flight container swap.** If Tidewaiter restarts mid-swap it has no memory of it; it adopts the running image as the current baseline (with a warning) rather than guessing. (A systemd unit's swap is recovered: see above.)
+The limits that are a container's own - anonymous volumes, `container:` network
+mode, and a container swap interrupted by a restart - are in
+[Running Tidewaiter in Docker](https://github.com/danielbodart/tidewaiter/blob/master/docs/docker.md#known-limitations).
+
 - **`port`/bound-socket health is "listening", not "fully functional."** It matches what most real TCP/HTTP healthchecks test, protocol-aware probes should be baked into images
 
 ## Relationship to portical
 
 Tidewaiter is the sibling of [**portical**](https://github.com/danielbodart/portical) and shares its spine — a label-driven reconcile loop over the Docker Engine API in Bun/TypeScript
+
 ## License
 
 Apache-2.0.

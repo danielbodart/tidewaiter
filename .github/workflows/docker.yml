@@ -1,4 +1,4 @@
-name: Build and push image
+name: Build and publish
 
 on:
   push:
@@ -6,9 +6,9 @@ on:
   pull_request:
   workflow_dispatch:
 
-# Least privilege for the built-in token. Nothing here writes to the
-# repository: the only credential that matters is the Docker Hub one, which
-# comes from secrets.
+# Least privilege for the built-in token. Read-only by default, and widened
+# only on the jobs that publish: build pushes to GitHub's registry, and release
+# creates a tag and a release.
 permissions:
   contents: read
 
@@ -38,6 +38,11 @@ jobs:
     runs-on: ubuntu-latest
     # Nothing is published unless the tests pass.
     needs: test
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      version: ${{ steps.version.outputs.value }}
     steps:
       # The whole history, because the version's minor is the commit count and
       # the default shallow checkout would make every build claim to be the
@@ -66,6 +71,18 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_PASSWORD }}
 
+      # The same image on GitHub's registry, for anyone who would rather not
+      # depend on Docker Hub's pull limits. The built-in token is enough, and
+      # the image's org.opencontainers.image.source label links the package to
+      # this repository.
+      - name: Log in to GitHub Container Registry
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/master'
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Build and push
         uses: docker/build-push-action@v7
         with:
@@ -81,10 +98,71 @@ jobs:
           tags: |
             danielbodart/tidewaiter:latest
             danielbodart/tidewaiter:${{ steps.version.outputs.value }}
+            ghcr.io/danielbodart/tidewaiter:latest
+            ghcr.io/danielbodart/tidewaiter:${{ steps.version.outputs.value }}
           build-args: |
             VERSION=${{ steps.version.outputs.value }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+  # The binaries for running Tidewaiter natively under systemd, on a host
+  # without NixOS, which builds its own from the flake. One release per
+  # published image, tagged with the image's version, so the two never disagree
+  # about what a version is, and nothing needs bumping to release either.
+  release:
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/master'
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ needs.build.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - uses: jdx/mise-action@v4
+
+      - run: bun install --frozen-lockfile
+
+      - name: Build
+        run: bun run.ts release
+
+      # Same commit, same run, so run.ts derives the same version the image was
+      # published as. Checked rather than assumed, since a release whose binary
+      # disagrees with its tag is worse than no release.
+      - name: Check the version
+        run: |
+          built=$(dist/release/tidewaiter-linux-x64 --version 2>/dev/null)
+          [ "$built" = "$VERSION" ] || { echo "the binary says $built but the image is $VERSION"; exit 1; }
+
+      # The plain unit has no VM test of its own - nix/vm-test.nix runs the
+      # module's - so it is at least checked against a real systemd, with the
+      # binary where it expects to find it.
+      - name: Verify the systemd unit
+        run: |
+          sudo install -m 755 dist/release/tidewaiter-linux-x64 /usr/local/bin/tidewaiter
+          systemd-analyze verify systemd/tidewaiter.service
+
+      # A re-run has the same run number and so the same version, so the
+      # release may already exist: its assets are replaced rather than the job
+      # failing.
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tag="v$VERSION"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" dist/release/* --clobber
+          else
+            {
+              git log -1 --format=%B "$GITHUB_SHA"
+              echo
+              echo "Image: \`danielbodart/tidewaiter:$VERSION\` or \`ghcr.io/danielbodart/tidewaiter:$VERSION\`"
+            } > notes.md
+            gh release create "$tag" dist/release/* --target "$GITHUB_SHA" --title "$tag" --latest --notes-file notes.md
+          fi
 
   # Docker Hub no longer syncs a README from GitHub, so the page has to be
   # pushed over the API. Kept in its own job and allowed to fail, because it is
