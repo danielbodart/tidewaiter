@@ -7,11 +7,10 @@ source of things to update: **systemd units whose program lives in a Nix
 profile**, so a native service on NixOS gets the same care a labelled container
 does. Docker behaviour does not change.
 
-Status: sections 1-7 are built and unit-tested (see "Where this stands",
-section 12): the `Daemon` over sources, `DockerSource`, `SystemdSource`, the
-inhibitor, profiles, listeners, the closure drop-in and the persisted state.
-Not yet: the D-Bus `SystemdClient`, the command line of section 8, `tidewaiter
-prepare`, and all of section 9 (flake, module, VM test).
+Status: built. Sections 1-9 are implemented, unit-tested, and proven end to
+end by the NixOS VM test of section 11 (see "Where this stands", section 12,
+for where building it changed this design). Section 13 lists what is still
+open.
 
 The shape, end to end, for one unit:
 
@@ -515,12 +514,13 @@ next boot. The next night's run finds the booted and built kernels still differ
 and tries again - so a busy server reboots at the first window in which nobody
 is playing, with nothing to configure in `system.autoUpgrade`.
 
-Whether logind refuses at *schedule* time or holds the scheduled shutdown until
-the lock goes is verified by the VM test (section 11) rather than assumed; both
-keep players safe. If it refuses, `nixos-upgrade.service` ends `failed` that
-night, which is noisy but accurate. Not done: wrapping the reboot in an
-`ExecCondition` - it would also skip the switch-only upgrades, which never
-disrupt anyone.
+logind refuses at *schedule* time - verified by the VM test (section 11), on
+systemd 262: with the lock held, both `shutdown -r +5` and a non-TTY
+`systemctl reboot` as root fail with "Operation denied due to active block
+inhibitor". So `nixos-upgrade.service` ends `failed` on a night the reboot is
+refused, which is noisy but accurate (open question 3). Not done: wrapping the
+reboot in an `ExecCondition` - it would also skip the switch-only upgrades,
+which never disrupt anyone.
 
 A person at a terminal running `systemctl reboot` is told who holds the lock and
 why (systemctl checks inhibitors client-side on a TTY), and `-i` overrides it
@@ -557,19 +557,27 @@ BindReadOnlyPaths=/nix/store/...-glibc-2.40
   root).
 - Rewritten, followed by `daemonReload()`, before the restart into `desired` and
   again before the restart back into the previous generation (steps 5.4 and 5.9).
-- At boot and on every switch the module's activation snippet runs `tidewaiter
-  prepare`, which writes the drop-in for each unit's *current* profile target
-  (and seeds a missing profile, below) before systemd starts anything - `/run`
-  is empty after a reboot.
+- At boot, and on every switch that changes a declaration, the module's
+  `tidewaiter-prepare.service` runs `tidewaiter prepare`, which writes the
+  drop-in for each unit's *current* profile target (and seeds a missing
+  profile, below) and reloads systemd, before any managed unit starts - `/run`
+  is empty after a reboot. (Designed as an activation snippet; see section 9
+  for why it is a unit.)
 
 This keeps the confinement as tight as Chandlery wants it - only the running
 version's closure - while letting the version change underneath. The simpler
 alternative, binding all of `/nix/store` read-only, is noted as open question 5.
 
 **Seeding.** A new unit's profile does not exist yet, and its `ExecStart` would
-fail. `tidewaiter prepare` (from the activation snippet) does, for every units
-file: if the profile does not exist, `nix-env --profile P --set DESIRED`. A
-first install is not activity-gated: nothing is running to disturb.
+fail. `tidewaiter prepare` (from `tidewaiter-prepare.service`) does, for every
+units file: if the profile does not exist, `nix-env --profile P --set DESIRED`.
+A first install is not activity-gated: nothing is running to disturb. An
+existing profile is never moved by `prepare`.
+
+A closure path that is itself a symlink in the store is bound as written;
+nixpkgs' confinement binds such a path's target instead, because systemd
+cannot bind a symlink. No store path a program's closure is made of is a
+symlink in practice, so this is not handled (open question 13).
 
 ## 8. Command line
 
@@ -585,8 +593,9 @@ first install is not activity-gated: nothing is running to disturb.
 without it Tidewaiter never opens the Docker socket.
 
 Commands: `run`, `check`, `list` work across every source. New: `prepare`, which
-seeds missing profiles and writes the closure drop-ins (section 7), then exits;
-it reads only the units directory and needs no daemon.
+seeds missing profiles and writes the closure drop-ins (section 7), reloads
+systemd if it wrote any, then exits; it reads only the units directory and
+needs no Tidewaiter daemon.
 
 The usage line becomes "update Docker containers and systemd units only when
 they are idle".
@@ -617,9 +626,11 @@ Outputs:
   and `tsconfig.json` alone; `typescript` and `@types/bun` are only for `tsc`,
   which the package does not run. `dontStrip` and `dontPatchELF`: a compiled
   Bun binary is Bun with the bundle appended, and stripping loses the bundle.
-  `makeWrapper` puts on `PATH`: `conntrack-tools` (conntrack), `iproute2` (ss),
-  `systemd` (systemd-inhibit), `nix` (nix-env, nix-store), `coreutils`.
-  The module overrides `nix` with `config.nix.package`.
+  `makeWrapper` *suffixes* `PATH` with `conntrack-tools` (conntrack),
+  `iproute2` (ss), `systemd` (systemd-inhibit) and `nix` (nix-env, nix-store),
+  so the host's own come first: the module puts `config.nix.package` on the
+  services' `path`, and NixOS puts the running systemd there already, rather
+  than overriding the package.
 - `checks.<system>` - `package` (which runs `bun test`), `module`, `vm`.
 - `nixosModules.default`.
 - `formatter.<system>` - `nixfmt`.
@@ -668,11 +679,27 @@ and the top level of the module sets:
 - `environment.etc."tidewaiter/units/<name>.service.json".text` - the JSON of
   section 2, `desired` as `"${desired}"`, which also puts it in the system
   closure (built at switch, and kept from GC by the system generation).
-- `system.activationScripts.tidewaiter` - `${package}/bin/tidewaiter prepare
-  --units-dir /etc/static/tidewaiter/units` (the files' store copy, readable
-  before `/etc` is linked), with `nix` on `PATH`.
+- `tidewaiter-prepare.service` - a oneshot (`RemainAfterExit`) running
+  `tidewaiter --units-dir /etc/tidewaiter/units prepare` through the Nix
+  daemon, `wantedBy` multi-user and before every managed service, which each
+  get `wants` and `after` it - `wants`, not `requires`, so its restart on a
+  switch never restarts them. Its `restartTriggers` are the declarations, so a
+  switch that changes one re-runs it.
+
+  *Not* an activation snippet, as first designed: activation at boot runs in
+  stage 2 before systemd, so before the Nix daemon - and in a NixOS VM test
+  before the store's paths are even registered (`boot.postBootCommands` loads
+  the database after activation), so `nix-env --set` fails "path is not
+  valid". A unit also has to reload systemd after writing the drop-ins at boot,
+  which `prepare` does.
+
+  The unit is always defined and only `enable`d when a service opts in: whether
+  a `systemd.services` attribute exists cannot depend on the other services'
+  options without infinite recursion.
 - a warning if any unit opts in while `services.tidewaiter.enable` is false: the
-  unit will never be updated, only seeded.
+  unit will never be updated, only seeded; and one if `sources` lacks
+  `"systemd"`.
+- a warning if `inhibit` is on with systemd older than 257 (open question 1).
 - an assertion that each unit's `ports` is non-empty when its `detector` is not
   `"none"` - the runtime fail-safe would otherwise defer it forever.
 
@@ -684,10 +711,16 @@ and the top level of the module sets:
 Root, because it must restart other units, write system profiles and read the
 host conntrack table - and confined as far as that allows:
 
-- `wantedBy = [ "multi-user.target" ]`, `after = [ "network.target" ]`,
-  `Restart = "on-failure"`, `StateDirectory = "tidewaiter"`.
+- `wantedBy = [ "multi-user.target" ]`, `after = [ "network.target"
+  "nix-daemon.socket" ]`, `Restart = "on-failure"`, `StateDirectory =
+  "tidewaiter"`.
 - `Environment = "NIX_REMOTE=daemon"`, so `nix-env` goes through the Nix daemon
-  instead of writing the store itself - no `CAP_CHOWN`/`CAP_FOWNER` needed.
+  instead of writing the store itself - no `CAP_CHOWN`/`CAP_FOWNER` needed -
+  and `HOME=/var/lib/tidewaiter`, since root's home is out of sight.
+- `TimeoutStopSec = "15min"`: a stop waits for the pass in flight, and a swap
+  can take a game's whole `TimeoutStopSec`, its start and two gates; killing it
+  halfway leaves a profile moved with no gate run. `KillMode = "mixed"`, so the
+  inhibitor's child is not signalled before Tidewaiter itself has gone.
 - `CapabilityBoundingSet = [ "CAP_NET_ADMIN" ]` (conntrack over netlink),
   `AmbientCapabilities` not needed (uid 0). Everything Tidewaiter writes is
   root-owned, so uid 0 without `CAP_DAC_OVERRIDE` suffices.
@@ -697,7 +730,7 @@ host conntrack table - and confined as far as that allows:
   `ProtectControlGroups` (`ss` only reads), `ProtectClock`, `ProtectHostname`,
   `RestrictNamespaces`, `RestrictRealtime`, `RestrictSUIDSGID`,
   `LockPersonality`, `NoNewPrivileges`, `SystemCallArchitectures = "native"`,
-  `SystemCallFilter = [ "@system-service" ]`, `UMask = "0022"` (the drop-ins
+  `SystemCallFilter = [ "@system-service" "~@privileged" ]`, `UMask = "0022"` (the drop-ins
   must be world-readable for systemd's manager - it reads as root anyway, but
   operators should be able to).
 - `RestrictAddressFamilies = [ "AF_UNIX" "AF_NETLINK" "AF_INET" "AF_INET6" ]`:
@@ -712,8 +745,10 @@ host conntrack table - and confined as far as that allows:
 - `ProcSubset`/`ProtectProc` left default: the `tcp` detector reads
   `/proc/<MainPID>/net/*`.
 
-`systemd-analyze security tidewaiter` is run in the VM test and its exposure
-level recorded in the README.
+`systemd-analyze security tidewaiter` is run in the VM test: **2.0 OK**
+(recorded in the README). Uid 0 with only `CAP_NET_ADMIN` is enough for
+systemd's `RestartUnit` and `Reload`, and for logind's block inhibitor - both
+recognise root by uid - as the VM test shows.
 
 ## 10. How each shared contract is met
 
@@ -724,7 +759,7 @@ level recorded in the README.
 | Module writes the desired store path to `/etc/tidewaiter/<unit>.json` "or similar" | `/etc/tidewaiter/units/<unit>.json`, with the whole policy, not just `desired` - the directory is the list of managed units. |
 | Daemon: profile != desired -> wait idle -> `nix-env --set` -> restart -> health -> on failure roll back and restart | Section 5. Rollback is `--switch-generation <recorded>`, which is `--rollback` made exact. |
 | Inhibitor while players are on, mode decided and documented | `shutdown:sleep`, `block`, held by a `systemd-inhibit` child; section 6, including how autoUpgrade's `shutdown -r +1` is refused. |
-| Chandlery `packagePath` defaulting to `"${package}"` | A Chandlery server sets `packagePath = profile` and `tidewaiter.desired = package`; Tidewaiter seeds the profile on first activation, so the unit starts on day one. |
+| Chandlery `packagePath` defaulting to `"${package}"` | A Chandlery server sets `packagePath = profile` and `tidewaiter.desired = package`; `tidewaiter-prepare.service` seeds the profile before the unit first starts, so it starts on day one. |
 | Chandlery confinement | `bindClosure` (section 7) binds the profile dir and the *current* target's closure, and rewrites it before every restart, so update and rollback both start. **Needs Chandlery to not also hard-code its package's closure as the only store path in the root** - it may, harmlessly, but then an old version's closure lingers until the next switch. |
 | Chandlery `ExecStop` save-and-quit, `TimeoutStopSec=5min`, `Type=notify` | Tidewaiter only `RestartUnit`s; the job waits for ExecStop and then READY=1. The `systemd` check reads a failed job as unhealthy. |
 | Chandlery console FIFO socket unit | Untouched. Restarting the service leaves `chandlery-<n>.socket` and its FIFO up. |
@@ -795,33 +830,39 @@ fake. Docker tests unchanged and green throughout.
   - `checks.package`: the build, with `bun test` in `checkPhase`.
   - `checks.module`: evaluate a configuration with an opted-in unit and assert
     the rendered `/etc/tidewaiter/units/x.service.json`, `restartIfChanged =
-    false`, the activation snippet, and the daemon's `ExecStart`.
+    false`, the ordering after `tidewaiter-prepare.service` (wants, not
+    requires) and that unit itself, and the daemon's `ExecStart` and
+    sandbox; and that importing the module with nothing opted in and the
+    daemon off adds nothing.
   - `checks.vm`, one node:
-    - `echo-game`: a tiny UDP+TCP echo built three ways - `v1`, `v2` (answers
-      "v2") and `bad` (exits after 2 s without binding) - with `ExecStart =
-      "${profile}/bin/echo-game"`, `Type=notify` via `systemd-notify --ready`
-      after binding (`NotifyAccess=all`), `confinement.enable = true` so
+    - `echo-game`: a tiny Python UDP+TCP echo built three ways - `v1`, `v2`
+      (answers "v2") and `bad` (exits after 2 s without binding) - with
+      `ExecStart = "${profile}/bin/echo-game"`, `Type=notify` by writing
+      `READY=1` to `NOTIFY_SOCKET` itself after binding (systemd binds the
+      socket into the confined root), `confinement.enable = true` so
       `bindClosure` is exercised, `tidewaiter = { desired = v1; ports = [
       "7777/udp" "7777/tcp" ]; idleSamples = 2; healthTimeout = 20; }`.
     - specialisations `v2` and `bad` that only change `tidewaiter.desired`.
     - `services.tidewaiter = { enable = true; interval = 2; activityInterval =
       1; }`; `net.netfilter.nf_conntrack_udp_timeout{,_stream} = 5` so an idle
       UDP flow ages out within the test.
-    - Script: boots on v1 (profile seeded, answers "v1"); start a UDP client
-      sending every second and a TCP client holding a connection; switch to
-      `v2` with `switch-to-configuration test` and assert the unit's
-      `InvocationID` did not change (restartIfChanged); assert
-      `systemd-inhibit --list` shows tidewaiter, and that `shutdown -r +1` and
-      `systemctl reboot` (non-TTY) are refused - or, if logind accepts the
-      schedule, that `ScheduledShutdown` never fires while the lock is held -
-      recording which in the README; wait several passes and assert still v1;
-      stop the clients; wait for the profile to point at v2, a new
-      `InvocationID`, "v2" on the port, and the lock released.
-    - Switch to `bad`: wait for "rolled back" in the journal; profile back on
-      v2's generation, unit active, answers "v2"; then several more passes with
-      no further restart (pinned). Restart `tidewaiter.service` and assert it
-      still does not retry (persisted pin).
+    - Script: boots on v1 (profile seeded by prepare, closure drop-in written,
+      confined, answers "v1" on UDP and TCP); start a UDP player sending every
+      second (a transient unit); assert `systemd-inhibit --list` shows
+      tidewaiter's block lock naming `echo-game.service`; switch to `v2` with
+      `switch-to-configuration test` and assert the unit's `InvocationID` did
+      not change (restartIfChanged); assert `shutdown -r +5` and `systemctl
+      reboot` (non-TTY, root) are both refused; wait five passes and assert
+      still v1 and not restarted; stop the player; wait for the profile to
+      point at v2, a new `InvocationID`, "v2" on the port, the lock released
+      and "updated to v2 and it is healthy" in the journal.
+    - Switch to `bad`: wait for "rolled back to v2" in the journal; profile
+      back on v2, unit active, answers "v2"; five more passes with no further
+      restart, and the pin in `/var/lib/tidewaiter/systemd.json`; the bad
+      generation deleted (`--list-generations` shows two). Restart
+      `tidewaiter.service` and assert it still does not retry (persisted pin).
     - `systemd-analyze security tidewaiter.service` printed into the log.
+    - Runs in about 90 s of test script on a KVM host.
 - Also: `bun run.ts check` (tsc) and the Docker image build unchanged.
 
 ## 12. Where this stands
@@ -851,30 +892,50 @@ Built on them, each with in-memory fakes (`test/fakes/systemd.ts`,
 | `src/units.ts` | `parseUnitPolicy`, `DirUnitsDirectory` |
 | `src/listeners.ts` | `parseListeners`, `unitBoundPorts`, `SsListenerSource` |
 | `src/profile.ts` | `Profiles`, `NixProfiles`, `generationOf` |
-| `src/systemd.ts` | `UnitState`, `SystemdClient` (interface only), `systemdVerdict` |
+| `src/systemd.ts` | `UnitState`, `SystemdClient`, `systemdVerdict`, `DbusSystemdClient` |
+| `src/dbus.ts` | the D-Bus wire format and connection, copied from Portical's branch |
+| `src/prepare.ts` | `prepare`: seed missing profiles, write closure drop-ins, reload |
 | `src/closure.ts` | `ClosureBinder`, `NixClosureBinder`, `closureDropIn` |
 | `src/state-store.ts` | `UnitMemory`, `FileStateStore` |
 | `src/systemd-source.ts` | `SystemdSource`: sections 2-5 and 7's swap side |
 
-`main.ts` runs a `Daemon` over `DockerSource` with `NoInhibitor`, so the binary
-and the image behave as before.
+`main.ts` builds the sources section 8's flags name - Docker alone by
+default, so the image behaves as before - and the `SystemdInhibitor` with
+`--inhibit`. `flake.nix` and `nix/` are section 9, and `nix/vm-test.nix` the VM
+test of section 11.
 
-Still to do: `DbusSystemdClient` (with Portical's `dbus.ts`), section 8's
-flags and `prepare`, and section 9.
+`DbusSystemdClient` subscribes to `JobRemoved` once per connection, before its
+first call, and a `JobRemoved` that arrives before the reply to `RestartUnit`
+is kept for the restart that asked; a bus that drops while a restart waits
+rejects it, which the source treats as a swap-step failure (undo, and restart
+back only if the `InvocationID` moved). It uses `LoadUnit` rather than
+`GetUnit`, so a unit nothing has started yet is found, and a name with no unit
+file reads `not-found`.
+
+Where building part 2 changed the design: `prepare` runs from a unit, not an
+activation snippet (section 9); the wrapper suffixes `PATH` instead of the
+module overriding `nix`; the daemon's unit gained `TimeoutStopSec`,
+`KillMode=mixed`, `HOME` and `~@privileged`; logind was found to refuse a
+reboot at schedule time (section 6).
+
+Checked: `bun test` (all pass; the tests needing a Nix daemon or the system bus
+run on a development host and skip in the sandbox), `tsc --noEmit`, `nix flake
+check` (package with `bun test` under nixpkgs' Bun 1.4.2, module, VM).
 
 ## 13. Open questions
 
 1. **The inhibitor on older systemd.** Before 257, `block` is ignored by root,
-   so `system.autoUpgrade`'s reboot would go ahead regardless. Require 257+
-   (an assertion on `config.systemd.package.version`), or add an
-   `ExecCondition` fallback to `nixos-upgrade.service` on older hosts?
+   so `system.autoUpgrade`'s reboot would go ahead regardless. The module now
+   *warns* below 257. Make it an assertion, or add an `ExecCondition` fallback
+   to `nixos-upgrade.service` on older hosts?
 2. **A broken detector blocks reboots forever.** Fail-safe says busy; busy says
    hold the lock. Cap it - e.g. stop holding for a workload whose activity has
    been unreadable for longer than N hours, with a loud log - or stay strict?
    The design is strict.
-3. **`nixos-upgrade.service` failing** on a night it was refused. Accept, or
-   have the module add `SuccessExitStatus`/a wrapper so a refused reboot is not
-   a failure? Wrapping nixpkgs' script is brittle; the design accepts.
+3. **`nixos-upgrade.service` failing** on a night it was refused - confirmed:
+   logind refuses at schedule time. Accept, or have the module add
+   `SuccessExitStatus`/a wrapper so a refused reboot is not a failure?
+   Wrapping nixpkgs' script is brittle; the design accepts.
 4. **Stopped units.** The design moves a stopped unit's profile to `desired`
    with no gate. Leave its profile alone instead, so a manually-stopped unit
    comes back on what it last ran?
@@ -884,9 +945,9 @@ flags and `prepare`, and section 9.
    store is world-readable anyway. Which does Chandlery prefer? (Needs agreeing
    with the Chandlery branch.)
 6. **Which Bun builds the flake.** `mise.toml` pins `1.3` (1.3.14 locally),
-   nixpkgs-unstable has 1.4.2 and Portical's branch moved its `mise.toml` to
-   1.4.2. Bump Tidewaiter's pin to match, or fetch 1.3 as a fixed-output
-   derivation?
+   the flake builds with nixpkgs-unstable's 1.4.2, and Portical's branch moved
+   its `mise.toml` to 1.4.2. The whole suite passes on both, so the flake just
+   uses 1.4.2; bump `mise.toml` (and the image) to match?
 7. **Unit config changes.** With `restartIfChanged = false`, a change to the
    unit's *own* definition (a new flag in `ExecStart`) waits for the next
    version change to take effect. Should the module include a hash of the
@@ -910,3 +971,13 @@ flags and `prepare`, and section 9.
     though it logs "assuming busy where it matters". That predates this branch
     and is kept, as promised; the systemd source reads it as busy. Make Docker
     fail safe too?
+13. **Symlinked store paths in a closure** are bound as written, where nixpkgs'
+    confinement binds their target, since systemd cannot bind a symlink
+    (section 7). Not seen in a real closure; handle it anyway?
+14. **A service newly declared in a switch** relies on
+    `switch-to-configuration` restarting `tidewaiter-prepare.service` (its
+    triggers changed) before it starts the new service, which is ordered after
+    it. The VM test covers boot and a changed `desired`, not a unit added by a
+    switch. Worth a VM subtest?
+15. **`tidewaiter-prepare` is not hardened.** It runs as plain root for a few
+    seconds per switch. Give it the daemon's sandbox too?
