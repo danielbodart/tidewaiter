@@ -49,6 +49,34 @@ describe("prepare", () => {
     expect(journal).toEqual([`bind ${V1}`, `set ${V2}`, `bind ${V2}`, "daemon-reload"]);
   });
 
+  test("leaves a drop-in that is already there to the daemon, and does not reload for nothing", async () => {
+    const { deps, journal } = world();
+    deps.profiles.seed(PROFILE, V1);
+    deps.closure.dropIns.set("game.service", { profile: PROFILE, target: V1 });
+    deps.units.declare("game.service", { desired: V2, profile: PROFILE, bindClosure: true });
+    expect((await prepare(deps)).bound).toEqual([]);
+    expect(journal).toEqual([]);
+  });
+
+  test("run between the daemon's bind and its `set`, leaves the drop-in naming desired", async () => {
+    const { deps } = world();
+    deps.profiles.seed(PROFILE, V1);
+    deps.units.declare("game.service", { desired: V2, profile: PROFILE, bindClosure: true });
+    await deps.closure.bind("game.service", PROFILE, V2); // the daemon, mid-swap
+    await prepare(deps); // reads the profile while it still says V1
+    await deps.profiles.set(PROFILE, V2); // the daemon carries on
+    expect(deps.closure.dropIns.get("game.service")?.target).toBe(V2);
+  });
+
+  test("rewrites a drop-in bound for a profile the declaration no longer names", async () => {
+    const { deps } = world();
+    deps.profiles.seed(PROFILE, V1);
+    deps.closure.dropIns.set("game.service", { profile: `${PROFILE}-old`, target: V2 });
+    deps.units.declare("game.service", { desired: V2, profile: PROFILE, bindClosure: true });
+    expect((await prepare(deps)).bound).toEqual(["game.service"]);
+    expect(deps.closure.dropIns.get("game.service")).toEqual({ profile: PROFILE, target: V1 });
+  });
+
   test("one unit failing does not stop the next, and is reported", async () => {
     const { deps, logs } = world();
     deps.profiles.setThrows = new Error("cannot connect to the Nix daemon");

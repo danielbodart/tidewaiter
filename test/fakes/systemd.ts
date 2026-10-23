@@ -158,15 +158,23 @@ export class FakeProfiles implements Profiles {
   }
 }
 
-/** Records each drop-in it would write. */
+/** Records each drop-in it would write; `dropIns` is what is on disk, per unit. */
 export class FakeClosure implements ClosureBinder {
   readonly bound: { unit: string; profile: string; target: string }[] = [];
+  readonly dropIns = new Map<string, { profile: string; target: string }>();
 
   constructor(readonly journal: Journal = []) {}
 
   async bind(unit: string, profile: string, target: string): Promise<void> {
     this.journal.push(`bind ${target}`);
     this.bound.push({ unit, profile, target });
+    this.dropIns.set(unit, { profile, target });
+  }
+
+  async ensure(unit: string, profile: string, target: string): Promise<boolean> {
+    if (this.dropIns.get(unit)?.profile === profile) return false;
+    await this.bind(unit, profile, target);
+    return true;
   }
 }
 

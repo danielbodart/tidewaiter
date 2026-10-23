@@ -1,8 +1,8 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { closureDropIn } from "../src/closure.ts";
+import { CLOSURE_DROP_IN, closureDropIn, dropInProfile, NixClosureBinder } from "../src/closure.ts";
 import { FileStateStore } from "../src/state-store.ts";
 import { systemdVerdict, type JobResult } from "../src/systemd.ts";
 import { unitState } from "./fakes/systemd.ts";
@@ -45,12 +45,53 @@ describe("closureDropIn", () => {
       "/nix/store/bbb-bedrock-server", "/nix/store/aaa-glibc", "/nix/store/bbb-bedrock-server",
     ])).toBe([
       "# Written by tidewaiter before each restart: what the profile points at, and its closure.",
+      "# Profile: /nix/var/nix/profiles/chandlery/bedrock",
       "[Service]",
       "BindReadOnlyPaths=/nix/var/nix/profiles/chandlery",
       "BindReadOnlyPaths=/nix/store/aaa-glibc",
       "BindReadOnlyPaths=/nix/store/bbb-bedrock-server",
       "",
     ].join("\n"));
+  });
+});
+
+describe("NixClosureBinder.ensure", () => {
+  const PROFILE = "/nix/var/nix/profiles/tidewaiter/game";
+  const dirs: string[] = [];
+  afterEach(async () => {
+    for (const dir of dirs.splice(0)) await rm(dir, { recursive: true, force: true });
+  });
+
+  /** A binder over a scratch runtime directory, with a nix-store that answers each path as its own closure. */
+  async function binder() {
+    const dir = await mkdtemp(join(tmpdir(), "tidewaiter-ensure-"));
+    dirs.push(dir);
+    const nixStore = join(dir, "nix-store");
+    await writeFile(nixStore, `#!${Bun.which("sh") ?? "/bin/sh"}\necho "$3"\n`);
+    await chmod(nixStore, 0o755);
+    const file = join(dir, "game.service.d", CLOSURE_DROP_IN);
+    return { binder: new NixClosureBinder(dir, nixStore), read: () => readFile(file, "utf8") };
+  }
+
+  test("writes a drop-in that is missing", async () => {
+    const { binder: closure, read } = await binder();
+    expect(await closure.ensure("game.service", PROFILE, "/nix/store/aaaa-game-1")).toBe(true);
+    expect(await read()).toContain("BindReadOnlyPaths=/nix/store/aaaa-game-1\n");
+    expect(dropInProfile(await read())).toBe(PROFILE);
+  });
+
+  test("leaves the daemon's drop-in for the same profile alone, whatever it binds", async () => {
+    const { binder: closure, read } = await binder();
+    await closure.bind("game.service", PROFILE, "/nix/store/bbbb-game-2");
+    expect(await closure.ensure("game.service", PROFILE, "/nix/store/aaaa-game-1")).toBe(false);
+    expect(await read()).toContain("BindReadOnlyPaths=/nix/store/bbbb-game-2\n");
+  });
+
+  test("replaces one written for another profile", async () => {
+    const { binder: closure, read } = await binder();
+    await closure.bind("game.service", `${PROFILE}-old`, "/nix/store/bbbb-game-2");
+    expect(await closure.ensure("game.service", PROFILE, "/nix/store/aaaa-game-1")).toBe(true);
+    expect(dropInProfile(await read())).toBe(PROFILE);
   });
 });
 

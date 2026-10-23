@@ -32,7 +32,7 @@ Commands:
   run       Reconcile continuously on an interval (default)
   check     Reconcile once and exit
   list      Show managed containers and units, and whether an update is waiting
-  prepare   Create missing unit profiles and write closure drop-ins, then exit
+  prepare   Create missing unit profiles and missing closure drop-ins, then exit
 
 Options:
   -s, --source NAME       docker or systemd; repeat or comma-separate for both
