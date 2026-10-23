@@ -51,3 +51,56 @@ describe("parseArguments", () => {
     expect(parseArguments([]).options.interval).toBe(DEFAULTS.interval);
   });
 });
+
+describe("parseArguments: sources and the systemd side", () => {
+  test("docker is the only source by default, so the image behaves as it always has", () => {
+    const parsed = parseArguments([]);
+    expect(parsed.sources).toEqual(["docker"]);
+    expect(parsed.inhibit).toBe(false);
+  });
+
+  test("--source repeats or takes a comma-separated list, each named once", () => {
+    expect(parseArguments(["--source", "systemd"]).sources).toEqual(["systemd"]);
+    expect(parseArguments(["-s", "systemd", "-s", "docker"]).sources).toEqual(["systemd", "docker"]);
+    expect(parseArguments(["--source", "systemd,docker,systemd"]).sources).toEqual(["systemd", "docker"]);
+  });
+
+  test("TIDEWAITER_SOURCES, overridden by the flag", () => {
+    expect(parseArguments([], { TIDEWAITER_SOURCES: "systemd" }).sources).toEqual(["systemd"]);
+    expect(parseArguments(["-s", "docker"], { TIDEWAITER_SOURCES: "systemd" }).sources).toEqual(["docker"]);
+  });
+
+  test("an unknown source is refused", () => {
+    expect(() => parseArguments(["--source", "podman"])).toThrow(/'podman' is not a source/);
+    expect(() => parseArguments(["--source", ","])).toThrow(/needs a source name/);
+  });
+
+  test("the units and state directories, from flags and the environment", () => {
+    const defaults = parseArguments([]);
+    expect(defaults.unitsDir).toBe("/etc/tidewaiter/units");
+    expect(defaults.stateDir).toBe("/var/lib/tidewaiter");
+    expect(parseArguments(["--units-dir", "/u"], { TIDEWAITER_UNITS_DIR: "/e" }).unitsDir).toBe("/u");
+    expect(parseArguments([], { TIDEWAITER_UNITS_DIR: "/e" }).unitsDir).toBe("/e");
+    expect(parseArguments(["--state-dir", "/s"]).stateDir).toBe("/s");
+    // StateDirectory=a b is passed as a colon-separated list; the first is ours.
+    expect(parseArguments([], { STATE_DIRECTORY: "/var/lib/tidewaiter:/var/lib/other" }).stateDir).toBe("/var/lib/tidewaiter");
+  });
+
+  test("--inhibit and --no-inhibit, last one wins, and the environment", () => {
+    expect(parseArguments(["--inhibit"]).inhibit).toBe(true);
+    expect(parseArguments(["--inhibit", "--no-inhibit"]).inhibit).toBe(false);
+    expect(parseArguments([], { TIDEWAITER_INHIBIT: "true" }).inhibit).toBe(true);
+    expect(parseArguments(["--no-inhibit"], { TIDEWAITER_INHIBIT: "1" }).inhibit).toBe(false);
+    expect(() => parseArguments([], { TIDEWAITER_INHIBIT: "maybe" })).toThrow(/true or false/);
+  });
+
+  test("--activity-interval, which must be more than nothing", () => {
+    expect(parseArguments([]).options.activityInterval).toBe(DEFAULTS.activityInterval);
+    expect(parseArguments(["--activity-interval", "5"]).options.activityInterval).toBe(5);
+    expect(() => parseArguments(["--activity-interval", "0"])).toThrow(/more than 0/);
+  });
+
+  test("prepare is a command", () => {
+    expect(parseArguments(["prepare"]).command).toBe("prepare");
+  });
+});
