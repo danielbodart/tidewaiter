@@ -4,12 +4,14 @@ import {
   combine,
   dockerCheck,
   dockerVerdict,
+  netnsBoundPorts,
   portBoundCheck,
   portConnectCheck,
   uptimeCheck,
   type CheckResult,
   type HealthInput,
 } from "../src/health.ts";
+import type { RunningContainer } from "../src/model.ts";
 import { runningContainer, port } from "./fakes/docker.ts";
 import { FakeNetnsReader } from "./fakes/netns.ts";
 import { FakeTcpProbe } from "./fakes/tcp.ts";
@@ -17,14 +19,18 @@ import { FakeTcpProbe } from "./fakes/tcp.ts";
 const noSignal = new AbortController().signal;
 
 /** A HealthInput with all seams defaulted; override per test. */
-function input(over: Partial<HealthInput> = {}): HealthInput {
+function input(
+  over: Partial<Omit<HealthInput, "container">> & { container?: RunningContainer; netns?: FakeNetnsReader } = {},
+): HealthInput {
+  const { netns = new FakeNetnsReader(), container = runningContainer("app"), ...rest } = over;
   return {
-    container: runningContainer("app"),
+    container,
     ports: [],
-    netns: new FakeNetnsReader(),
+    // The container's own netns, as the daemon reads it.
+    bound: netnsBoundPorts(netns, container.pid),
     tcp: new FakeTcpProbe(),
     networkDriver: async () => "bridge", // default: reachable, override for macvlan/overlay
-    ...over,
+    ...rest,
   };
 }
 

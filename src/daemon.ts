@@ -7,6 +7,7 @@ import {
   checkByName,
   combine as combineHealth,
   dockerVerdict,
+  netnsBoundPorts,
   portConnectCheck,
   uptimeCheck,
   type CheckResult,
@@ -14,7 +15,9 @@ import {
   type HealthResult,
   type TcpProbe,
 } from "./health.ts";
+import { pollVerdict } from "./gate.ts";
 import { parseLabels, type ContainerPolicy } from "./labels.ts";
+import { runEvery } from "./loop.ts";
 import type { Digest, PublishedPort, RunningContainer } from "./model.ts";
 import type { NetnsReader } from "./netns.ts";
 import { planSwap, recreatable, rollbackName, type SwapStep } from "./recreate.ts";
@@ -681,7 +684,7 @@ export class Tidewaiter {
     const input = {
       container: fresh,
       ports: policy.ports ?? fresh.spec.published,
-      netns: this.netns,
+      bound: netnsBoundPorts(this.netns, fresh.pid),
       tcp: this.tcp,
       networkDriver,
     };
@@ -704,25 +707,12 @@ export class Tidewaiter {
     networkDriver: (network: string) => Promise<string | undefined>,
     signal: AbortSignal,
   ): Promise<HealthResult> {
-    const deadline = this.now() + policy.healthTimeoutSeconds * 1000;
-
-    try {
-      while (this.now() < deadline && !signal.aborted) {
-        const results = await this.evaluateChecks(name, policy, checks, networkDriver, signal);
-        const verdict = combineHealth(results, false);
-        if (verdict !== undefined) return verdict;
-        await this.sleep(this.options.healthPollMillis, signal);
-      }
-    } catch (error) {
-      if (signal.aborted) return neverResolves<HealthResult>(signal);
-      return { healthy: false, reason: `health check errored: ${(error as Error).message}` };
-    }
-
-    if (signal.aborted) return neverResolves<HealthResult>(signal);
-    // Deadline reached: commit unless something actively failed (combine with
-    // timedOut=true), so a check that merely never confirmed cannot veto.
-    const results = await this.evaluateChecks(name, policy, checks, networkDriver, signal).catch(() => [] as CheckResult[]);
-    return combineHealth(results, true) ?? { healthy: true };
+    const verdict = await pollVerdict(
+      (signal) => this.evaluateChecks(name, policy, checks, networkDriver, signal),
+      { timeoutSeconds: policy.healthTimeoutSeconds, pollMillis: this.options.healthPollMillis, now: this.now },
+      signal,
+    );
+    return verdict === "aborted" ? neverResolves<HealthResult>(signal) : verdict;
   }
 
   /**
@@ -795,13 +785,6 @@ export class Tidewaiter {
     return retain;
   }
 
-  private sleep(millis: number, signal: AbortSignal): Promise<void> {
-    return new Promise((resolve) => {
-      const timer = setTimeout(resolve, millis);
-      signal.addEventListener("abort", () => { clearTimeout(timer); resolve(); }, { once: true });
-    });
-  }
-
   /**
    * Reconcile on an interval until the signal aborts.
    *
@@ -810,38 +793,7 @@ export class Tidewaiter {
    * trigger. A burst of ticks still collapses into one queued pass.
    */
   async run(signal: AbortSignal): Promise<void> {
-    let pending: Promise<void> = Promise.resolve();
-    let queued = false;
-
-    const pass = () => {
-      if (queued) return pending;
-      queued = true;
-      pending = pending.then(async () => {
-        queued = false;
-        try {
-          await this.once();
-        } catch (error) {
-          this.log(`Error: ${(error as Error).message}`);
-        }
-      });
-      return pending;
-    };
-
-    await pass();
-
-    const ticker = setInterval(pass, this.options.interval * 1000);
-    signal.addEventListener("abort", () => clearInterval(ticker), { once: true });
-    this.log(`Reconciling every ${this.options.interval}s...`);
-
-    try {
-      await new Promise<void>((resolve) => {
-        if (signal.aborted) return resolve();
-        signal.addEventListener("abort", () => resolve(), { once: true });
-      });
-    } finally {
-      clearInterval(ticker);
-      await pending;
-    }
+    await runEvery(this.options.interval, () => this.once(), signal, this.log);
   }
 }
 

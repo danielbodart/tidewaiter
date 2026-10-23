@@ -1,5 +1,5 @@
 import { portsInState, type NetnsReader } from "./netns.ts";
-import type { HealthStatus, PublishedPort, RunningContainer } from "./model.ts";
+import type { ContainerSpec, HealthStatus, PublishedPort } from "./model.ts";
 
 /**
  * What a single connect() attempt to a client-facing endpoint concluded.
@@ -88,10 +88,43 @@ export interface ClientEndpoint {
   readonly truthful: boolean;
 }
 
+/**
+ * What the checks read about the thing being health-gated.
+ *
+ * A RunningContainer satisfies it as it is. Narrowed to these fields so a
+ * systemd unit can be gated by the same checks: it is `running` while its
+ * ActiveState is active, has no Docker `health` ("none", so `docker` skips),
+ * and is on the host's network (`networkMode: "host"`, no networks), which
+ * makes port-connect probe 127.0.0.1 at the unit's own ports as a truthful
+ * endpoint.
+ */
+export interface HealthSubject {
+  readonly running: boolean;
+  readonly health: HealthStatus;
+  readonly spec: Pick<ContainerSpec, "networks" | "networkMode">;
+}
+
+/**
+ * The local ports with a socket in the listening state, for one family.
+ *
+ * TCP sockets in LISTEN, UDP sockets bound (unconnected). The seam port-bound
+ * and uptime read through, so each source decides what "this workload's
+ * sockets" means: a container's own netns via /proc/<pid>/net/* (see
+ * netnsBoundPorts), or for a systemd unit on the host's network the sockets
+ * whose cgroup is the unit's - the host netns is shared, so a port number
+ * alone would also see every other service's sockets.
+ */
+export type BoundPorts = (family: "tcp" | "udp") => Promise<ReadonlySet<number>>;
+
+/** BoundPorts for a container, read from its netns through /proc/<pid>/net/*. */
+export function netnsBoundPorts(netns: NetnsReader, pid: number): BoundPorts {
+  return (family) => portsInState(netns, pid, family, family === "tcp" ? TCP_LISTEN : UDP_LISTEN);
+}
+
 export interface HealthInput {
-  readonly container: RunningContainer;
+  readonly container: HealthSubject;
   readonly ports: readonly PublishedPort[];
-  readonly netns: NetnsReader;
+  readonly bound: BoundPorts;
   readonly tcp: TcpProbe;
   /**
    * Resolve a network's driver (bridge, macvlan, overlay, host, ...) by name.
@@ -202,7 +235,7 @@ export function dockerVerdict(health: HealthStatus): CheckResult {
  * is emitted as a truthful loopback endpoint.
  */
 export async function clientEndpoints(
-  container: RunningContainer,
+  container: HealthSubject,
   ports: readonly PublishedPort[],
   networkDriver: (network: string) => Promise<string | undefined>,
 ): Promise<ClientEndpoint[]> {
@@ -329,11 +362,11 @@ async function anyPortBound(input: HealthInput): Promise<boolean | undefined> {
 
   try {
     if (tcpPorts.size > 0) {
-      const listening = await portsInState(input.netns, input.container.pid, "tcp", TCP_LISTEN);
+      const listening = await input.bound("tcp");
       if ([...tcpPorts].some((port) => listening.has(port))) return true;
     }
     if (udpPorts.size > 0) {
-      const bound = await portsInState(input.netns, input.container.pid, "udp", UDP_LISTEN);
+      const bound = await input.bound("udp");
       if ([...udpPorts].some((port) => bound.has(port))) return true;
     }
   } catch {

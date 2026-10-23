@@ -2,6 +2,23 @@ import type { Digest, DesiredImage, RunningContainer } from "./model.ts";
 import type { ContainerPolicy } from "./labels.ts";
 
 /**
+ * The part of a snapshot decide() actually reads, whatever is being updated.
+ *
+ * Kept apart from Snapshot so the systemd source can judge a unit with the
+ * same rules: there `currentDigest` and `desired.digest` are Nix store paths
+ * (the profile's target and the module's desired path) rather than manifest
+ * digests, but they are just as opaque - compared, never parsed - so nothing
+ * about the decision changes.
+ */
+export interface Decidable {
+  readonly policy: { readonly idleSamples: number };
+  readonly currentDigest: Digest | undefined;
+  readonly desired: { readonly digest: Digest };
+  readonly inUse: boolean;
+  readonly idleStreak: number;
+}
+
+/**
  * Everything decide() needs to know about one container, gathered up front.
  *
  * The daemon does all the I/O - list containers, resolve the registry digest,
@@ -11,7 +28,7 @@ import type { ContainerPolicy } from "./labels.ts";
  * number the daemon already counted, exactly as portical's reconcile() takes a
  * lease as a number rather than reading the time itself.
  */
-export interface Snapshot {
+export interface Snapshot extends Decidable {
   readonly container: RunningContainer;
   readonly policy: ContainerPolicy;
   /**
@@ -92,7 +109,7 @@ export type Action =
  *      session to chase a version; the version will still be there next pass.
  *   4. Otherwise -> update.
  */
-export function decide(snapshot: Snapshot, state: ContainerState): Action {
+export function decide(snapshot: Decidable, state: ContainerState): Action {
   const { currentDigest, desired, policy, inUse, idleStreak } = snapshot;
   const current = currentDigest;
 
