@@ -94,6 +94,32 @@ export type Action =
   | { readonly kind: "pinned"; readonly reason: string };
 
 /**
+ * How decide() words its reasons, so a unit's log does not talk about images.
+ * The rules are the same whatever is being updated; only the nouns change.
+ */
+export interface Words {
+  readonly pinned: string;
+  readonly keep: string;
+  readonly busy: string;
+  /** Completes "idle for N samples and ...". */
+  readonly update: string;
+}
+
+export const IMAGE_WORDS: Words = {
+  pinned: "a previous update to this image failed its health check; pinned out until the tag moves on",
+  keep: "already on the latest image",
+  busy: "the tide is in - the container has live flows",
+  update: "a newer image is available",
+};
+
+export const UNIT_WORDS: Words = {
+  pinned: "a previous update to this version failed its health check; pinned out until the desired version moves on",
+  keep: "the profile is already on the desired version",
+  busy: "the tide is in - the unit has live flows",
+  update: "the desired version differs from the profile's",
+};
+
+/**
  * Decide what to do with one container, purely.
  *
  * The order of the checks is the policy:
@@ -109,23 +135,23 @@ export type Action =
  *      session to chase a version; the version will still be there next pass.
  *   4. Otherwise -> update.
  */
-export function decide(snapshot: Decidable, state: ContainerState): Action {
+export function decide(snapshot: Decidable, state: ContainerState, words: Words = IMAGE_WORDS): Action {
   const { currentDigest, desired, policy, inUse, idleStreak } = snapshot;
   const current = currentDigest;
 
   if (state.pinnedDigest !== undefined && state.pinnedDigest === desired.digest) {
     return {
       kind: "pinned",
-      reason: "a previous update to this image failed its health check; pinned out until the tag moves on",
+      reason: words.pinned,
     };
   }
 
   if (desired.digest === current) {
-    return { kind: "keep", reason: "already on the latest image" };
+    return { kind: "keep", reason: words.keep };
   }
 
   if (inUse) {
-    return { kind: "defer", reason: "the tide is in - the container has live flows" };
+    return { kind: "defer", reason: words.busy };
   }
 
   if (idleStreak < policy.idleSamples) {
@@ -139,6 +165,6 @@ export function decide(snapshot: Decidable, state: ContainerState): Action {
     kind: "update",
     from: current,
     to: desired.digest,
-    reason: `idle for ${idleStreak} samples and a newer image is available`,
+    reason: `idle for ${idleStreak} samples and ${words.update}`,
   };
 }
