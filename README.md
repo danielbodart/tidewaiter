@@ -3,7 +3,7 @@
 
 # Tidewaiter
 
-**Auto-updater that waits for the tide to go out.** It watches for a newer version — a newer image in the registry for a Docker container, or a new store path in the NixOS configuration for a [systemd unit](#systemd-units) — updates **only when nobody is using it** (no live network flows), health-checks the swap, and **rolls back** on failure. While anyone is on, it also holds off reboots.
+**Auto-updater that waits for the tide to go out.** It watches for a newer version — a newer image in the registry for a Docker container, or a new store path in the NixOS configuration for a [systemd unit](#systemd-units) — updates **only when nobody is using it** (no live network flows), health-checks the swap, and **rolls back** on failure. On NixOS it can also reboot into a new kernel the same way: inside a nightly window, once nobody is on.
 
 > A *tidewaiter* was a customs officer who boarded an incoming ship only once the tide allowed. This one waits for the tide of traffic to ebb before it goes aboard — and steps back the instant anyone's on.
 
@@ -142,8 +142,9 @@ Setting `tidewaiter.desired` on a service:
 | `enable` | run the daemon | `false` |
 | `sources` | `systemd`, `docker`, or both — one daemon per host, so two swaps never overlap | `[ "systemd" ]` |
 | `interval` | seconds between passes | `60` |
-| `activityInterval` | seconds between the shutdown lock's activity checks | `15` |
-| `inhibit` | hold off shutdown and sleep while anything is in use | `true` |
+| `activityInterval` | seconds between activity checks between passes, keeping `tidewaiter status` current | `15` |
+| `autoReboot.enable` | reboot when the installed system needs it, inside the window, once nothing is in use (see below) | `false` |
+| `autoReboot.window` | daily window in local time, `HH:MM-HH:MM`; may cross midnight, `00:00-24:00` is all day | `"03:00-05:00"` |
 | `dryRun`, `dockerSocket`, `label`, `extraArgs`, `package` | as they say | |
 
 The daemon runs as root — it restarts other units and writes system profiles — and is otherwise confined: `CAP_NET_ADMIN` only (conntrack), `ProtectSystem=strict` with only `/nix/var/nix/profiles` and `/run/systemd/system` writable, profiles written through the Nix daemon, no `@privileged` system calls, and IP limited to localhost when systemd is the only source. `systemd-analyze security tidewaiter` rates it **2.0 OK**.
@@ -152,14 +153,44 @@ The daemon runs as root — it restarts other units and writes system profiles �
 
 **Combining with Portical.** A unit forwarded by [Portical](https://github.com/danielbodart/portical) typically lists the same ports twice. While no forward remaps a port, share one list: `let ports = [ "19132/udp" ]; in { portical.forward = ports; tidewaiter.ports = ports; }`. A remapped forward (`external:internal/proto`) is not a valid `tidewaiter.ports` entry: list the internal port — the one the unit binds, and the one conntrack sees the players' flows reach — e.g. `portical.forward = [ "19133:19132/udp" ]; tidewaiter.ports = [ "19132/udp" ];`, or derive it with `map (p: lib.last (lib.splitString ":" p)) forwards`.
 
-### Holding off reboots
+### Is anyone on? `tidewaiter status`
 
-While any managed unit or container is in use — or being swapped — Tidewaiter holds a logind **block** inhibitor on `shutdown:sleep` (`systemd-inhibit --list` shows it, with the busy units as the reason). Since **systemd 257** a block lock refuses root too, so:
+Humans stay in charge: Tidewaiter never stands in the way of a reboot someone asks for. To see whether one would cut anybody off first:
 
-- `system.autoUpgrade` with `allowReboot = true` installs the new generation, and its `shutdown -r +1` is **refused** while anyone is playing; the generation stays installed for the next boot and the next run tries the reboot again. The upgrade unit ends failed on such a night — noisy, but accurate.
-- `systemctl reboot` is refused too, telling you who holds the lock; `systemctl reboot --check-inhibitors=no` overrides it deliberately.
+```
+$ tidewaiter status
+Busy: minecraft.service in use
+  minecraft.service (systemd)  in use
+  web (docker)  idle
+Automatic reboot (03:00-05:00): needed, kernel changed since boot; waiting: minecraft.service in use
+As of 4s ago
+```
 
-Both refusals are asserted by the VM test (`nix build .#checks.x86_64-linux.vm`). On older systemd, root ignores the lock and the module warns. Containers are covered as well when Tidewaiter runs natively; the image has no logind, so the CLI default is `--no-inhibit`.
+It exits **0** when nothing is in use or being swapped, **1** when something is, and **2** when there is no daemon to ask — so `tidewaiter status && reboot` does what it says. It needs no root: the daemon writes `/run/tidewaiter/status.json` (plain JSON, for scripts too) after every pass, every activity check (`activityInterval`) and the start of every swap, and the CLI only reads it. A workload is listed as "idle, not yet for long enough" until it has been idle for its `idleSamples`.
+
+### Rebooting for a new kernel
+
+`system.autoUpgrade` with `allowReboot = true` reboots whoever is on. Let Tidewaiter do it instead:
+
+```nix
+system.autoUpgrade = {
+  enable = true;
+  allowReboot = false;   # a plain nightly switch; opted-in services are not restarted by it
+};
+services.tidewaiter.autoReboot = {
+  enable = true;
+  window = "03:00-05:00";
+};
+```
+
+Each pass, Tidewaiter reboots (through logind, as `systemctl reboot` does) when all of these hold:
+
+- **a reboot is needed** — the test `autoUpgrade` itself makes: `/run/booted-system/{initrd,kernel,kernel-modules}` differ from `/nix/var/nix/profiles/system`'s;
+- **it is inside the window**, in local time — never outside it;
+- **every managed unit and container** has been idle for its whole `idleSamples`, Docker's included, and activity read once more right before the reboot still says so;
+- **nothing is being swapped**.
+
+A window busy from start to end simply passes, and the next night's is tried the same way. What it is waiting for is in the journal (once per change) and in `tidewaiter status`. The module refuses `autoReboot` together with `autoUpgrade.allowReboot`, since the two would fight. Both the wait and the reboot are proven by the VM test (`nix build .#checks.x86_64-linux.vm`).
 
 ### Without NixOS
 
@@ -174,7 +205,7 @@ Nothing here needs NixOS, only Nix profiles and systemd. Drop a JSON file per un
 }
 ```
 
-Every other field (`detector`, `health`, `idleSamples`, `healthTimeout`, `keepGenerations`) is optional, with the defaults above; `bindClosure` defaults to `false` in a file. Point the unit's `ExecStart` at the profile, have your deployment change only the file (never restart the unit itself), run `tidewaiter prepare` to create missing profiles, and run `tidewaiter --source systemd --inhibit run` as root.
+Every other field (`detector`, `health`, `idleSamples`, `healthTimeout`, `keepGenerations`) is optional, with the defaults above; `bindClosure` defaults to `false` in a file. Point the unit's `ExecStart` at the profile, have your deployment change only the file (never restart the unit itself), run `tidewaiter prepare` to create missing profiles, and run `tidewaiter --source systemd --status-file /run/tidewaiter/status.json run` as root (add `--auto-reboot-window 03:00-05:00` on NixOS to reboot as above).
 
 The design, and what is still open, is in [`docs/systemd-source.md`](./docs/systemd-source.md).
 
@@ -184,10 +215,11 @@ The design, and what is still open, is in [`docs/systemd-source.md`](./docs/syst
 tidewaiter run      # reconcile continuously on an interval (default)
 tidewaiter check    # reconcile once and exit
 tidewaiter list     # show managed containers and units, and whether an update is waiting
+tidewaiter status   # what the running daemon sees in use or swapping; exit 0 idle, 1 busy, 2 no daemon
 tidewaiter prepare  # create missing unit profiles and missing closure drop-ins, then exit
 ```
 
-Options: `-s/--source docker|systemd` (repeat or comma-separate; default `docker`), `-d/--interval SECONDS` (default 300), `-n/--dry-run`, `--inhibit`/`--no-inhibit` (default off), `--activity-interval SECONDS` (default 15), `--version`. Docker: `-l/--label LABEL`, `--docker-socket PATH`. systemd: `--units-dir DIR` (default `/etc/tidewaiter/units`), `--state-dir DIR` (default `/var/lib/tidewaiter`). Env: `TIDEWAITER_SOURCES`, `TIDEWAITER_INTERVAL`, `TIDEWAITER_INHIBIT`, `DOCKER_SOCKET`, `TIDEWAITER_UNITS_DIR`, `STATE_DIRECTORY`.
+Options: `-s/--source docker|systemd` (repeat or comma-separate; default `docker`), `-d/--interval SECONDS` (default 300), `-n/--dry-run`, `--status-file PATH` (`run` writes none unless given one; `status` reads `/run/tidewaiter/status.json` by default), `--activity-interval SECONDS` (default 15), `--auto-reboot-window HH:MM-HH:MM` with `--booted-system PATH` and `--current-system PATH` (defaults `/run/booted-system`, `/nix/var/nix/profiles/system`), `--version`. Docker: `-l/--label LABEL`, `--docker-socket PATH`. systemd: `--units-dir DIR` (default `/etc/tidewaiter/units`), `--state-dir DIR` (default `/var/lib/tidewaiter`). Env: `TIDEWAITER_SOURCES`, `TIDEWAITER_INTERVAL`, `TIDEWAITER_STATUS_FILE`, `TIDEWAITER_AUTO_REBOOT_WINDOW`, `DOCKER_SOCKET`, `TIDEWAITER_UNITS_DIR`, `STATE_DIRECTORY`.
 
 ## Building
 
