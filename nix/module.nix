@@ -38,6 +38,9 @@ let
   # Where the module declares them, and where both the daemon and prepare read.
   unitsDir = "/etc/tidewaiter/units";
 
+  # Where `tidewaiter status` looks by default.
+  statusFile = "/run/tidewaiter/status.json";
+
   # One file per unit, the shape src/units.ts reads. Interpolating `desired`
   # puts it in the system closure, so the version a unit is asked to move to
   # was built (or substituted) by the switch that asked, and is kept from the
@@ -98,7 +101,7 @@ in
         `systemd.services.<name>.tidewaiter.desired`, Docker containers
         labelled `tidewaiter.autoupdate`, or both. Run one Tidewaiter per host
         with every source it needs: one daemon is what keeps two swaps from
-        ever overlapping, and holds one shutdown lock for both.
+        ever overlapping, and what an automatic reboot waits on for both.
       '';
     };
 
@@ -115,23 +118,35 @@ in
       type = types.ints.positive;
       default = 15;
       description = ''
-        Seconds between the activity checks that keep the shutdown lock
-        current between passes, so a player who joins just after a pass holds
-        off a reboot within seconds.
+        Seconds between the activity checks that keep `tidewaiter status`
+        current between passes, so a player who joins just after a pass shows
+        up within seconds.
       '';
     };
 
-    inhibit = mkOption {
-      type = types.bool;
-      default = true;
-      description = ''
-        Hold a logind block lock on shutdown and sleep while anything managed
-        is in use, or being swapped. Since systemd 257 a block lock also
-        refuses root, so `system.autoUpgrade` with `allowReboot` cannot reboot
-        under players: its `shutdown -r` is refused, the new generation stays
-        installed for the next boot, and the next run tries again. A person can
-        still override it with `systemctl reboot --check-inhibitors=no`.
+    autoReboot = {
+      enable = mkEnableOption ''
+        rebooting automatically when the installed system needs it - its
+        kernel, initrd or kernel modules differ from the booted ones, the test
+        `system.autoUpgrade` makes - but only inside `window`, and only once
+        every managed unit and container has been idle for its `idleSamples`
+        and nothing is being swapped. A window busy throughout passes without a
+        reboot; the next day's is tried the same way. A person can always
+        reboot by hand. Pair it with `system.autoUpgrade` and
+        `allowReboot = false`, which makes the upgrade a plain nightly
+        `switch` (services that set `tidewaiter.desired` are not restarted by
+        it) and leaves the reboot to Tidewaiter
       '';
+
+      window = mkOption {
+        type = types.strMatching "([01][0-9]|2[0-3]):[0-5][0-9]-(([01][0-9]|2[0-3]):[0-5][0-9]|24:00)";
+        default = "03:00-05:00";
+        example = "23:00-01:00";
+        description = ''
+          The daily window, in local time, `HH:MM-HH:MM`. It may cross
+          midnight; `00:00-24:00` is the whole day.
+        '';
+      };
     };
 
     dryRun = mkOption {
@@ -336,7 +351,32 @@ in
         };
       };
 
-      assertions = mapAttrsToList (name: service: {
+      assertions = [
+        {
+          assertion =
+            !(
+              cfg.enable
+              && cfg.autoReboot.enable
+              && config.system.autoUpgrade.enable
+              && config.system.autoUpgrade.allowReboot
+            );
+          message = ''
+            services.tidewaiter.autoReboot and system.autoUpgrade.allowReboot both reboot the
+            machine, and autoUpgrade's does not wait for anyone. Set
+            system.autoUpgrade.allowReboot = false: the upgrade becomes a nightly switch, and
+            Tidewaiter reboots into it once nothing is in use.
+          '';
+        }
+        {
+          assertion =
+            let
+              ends = lib.splitString "-" cfg.autoReboot.window;
+            in
+            lib.head ends != lib.last ends;
+          message = "services.tidewaiter.autoReboot.window ${cfg.autoReboot.window} is empty; 00:00-24:00 is the whole day.";
+        }
+      ]
+      ++ mapAttrsToList (name: service: {
         assertion = service.tidewaiter.detector == "none" || service.tidewaiter.ports != [ ];
         message = ''
           systemd.services.${name}.tidewaiter.ports is empty, so the ${service.tidewaiter.detector}
@@ -356,10 +396,8 @@ in
     }
 
     (mkIf cfg.enable {
-      warnings = optional (cfg.inhibit && lib.versionOlder config.systemd.package.version "257") ''
-        services.tidewaiter.inhibit: systemd ${config.systemd.package.version} lets root ignore block
-        inhibitors, so an automatic reboot will not wait for players. It needs systemd 257 or later.
-      '';
+      # `tidewaiter status`, for anyone, reading what the daemon writes.
+      environment.systemPackages = [ cfg.package ];
 
       systemd.services.tidewaiter = {
         description = "Tidewaiter, updating services only when they are idle";
@@ -392,9 +430,14 @@ in
               (toString cfg.interval)
               "--activity-interval"
               (toString cfg.activityInterval)
-              (if cfg.inhibit then "--inhibit" else "--no-inhibit")
+              "--status-file"
+              statusFile
               "--units-dir"
               unitsDir
+            ]
+            ++ optionals cfg.autoReboot.enable [
+              "--auto-reboot-window"
+              cfg.autoReboot.window
             ]
             ++ optionals hasDocker [
               "--docker-socket"
@@ -409,12 +452,14 @@ in
           Restart = "on-failure";
           RestartSec = 5;
           StateDirectory = "tidewaiter";
+          # The status file: world-readable, so `tidewaiter status` needs no root.
+          RuntimeDirectory = "tidewaiter";
 
           # A pass in flight is finished before Tidewaiter exits, and a swap
           # can take a game server's whole stop (Chandlery allows 5 minutes),
           # its start and two health gates. Killing it halfway would leave a
-          # profile moved with no gate run. Mixed, so the shutdown lock's
-          # child is not signalled until Tidewaiter itself has gone.
+          # profile moved with no gate run. Mixed, so a nix-env it is running
+          # is not signalled before Tidewaiter has finished with it.
           TimeoutStopSec = "15min";
           KillMode = "mixed";
 
@@ -422,7 +467,8 @@ in
           # and reads the host's connection table - and otherwise confined as
           # far as that allows. Everything it writes is root's, so uid 0
           # without CAP_DAC_OVERRIDE is enough; CAP_NET_ADMIN is for
-          # conntrack. systemd and logind recognise root by uid on the bus.
+          # conntrack. systemd and logind (for an automatic reboot) recognise
+          # root by uid on the bus.
           CapabilityBoundingSet = [ "CAP_NET_ADMIN" ];
           NoNewPrivileges = true;
           ProtectSystem = "strict";

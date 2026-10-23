@@ -5,9 +5,11 @@
 # comes up.
 #
 # What it shows: a switch does not restart the service; Tidewaiter waits while
-# a player is connected, holding a shutdown lock that refuses a reboot; it swaps
-# once the player has gone; and it rolls a bad version back, and keeps it out
-# across a restart of itself.
+# a player is connected, and says so in `tidewaiter status`, while a person can
+# still reboot whenever they like; it swaps once the player has gone; it rolls
+# a bad version back, and keeps it out across a restart of itself; and an
+# automatic reboot, needed and inside its window, waits for the player too, and
+# goes once they have left.
 { pkgs, self }:
 
 let
@@ -94,7 +96,21 @@ pkgs.testers.runNixOSTest {
       enable = true;
       interval = 2;
       activityInterval = 1;
+      # Whenever the test happens to run; and the "installed" system is a
+      # stand-in the test changes, rather than a second system to install.
+      autoReboot = {
+        enable = true;
+        window = "00:00-24:00";
+      };
+      extraArgs = [
+        "--current-system"
+        "/run/installed-system"
+      ];
     };
+    # Until the test says otherwise, what is installed is what booted.
+    systemd.tmpfiles.rules = [ "L+ /run/installed-system - - - - /run/booted-system" ];
+    # So the boot before the automatic reboot can be read after it.
+    services.journald.settings.Journal.Storage = "persistent";
 
     systemd.services.echo-game = {
       wantedBy = [ "multi-user.target" ];
@@ -144,8 +160,13 @@ pkgs.testers.runNixOSTest {
       def switch(specialisation):
           machine.succeed(f"${toplevel}/specialisation/{specialisation}/bin/switch-to-configuration test")
 
-      def locked():
-          return "tidewaiter" in machine.succeed("systemd-inhibit --list --no-legend --no-pager")
+      def status():
+          # As nobody: the status needs no root.
+          return machine.execute("runuser -u nobody -- tidewaiter status")
+
+      def says(line):
+          # Exits 1 while busy, which pipefail would take for grep's answer.
+          return f"{{ runuser -u nobody -- tidewaiter status || true; }} | grep -qF '{line}'"
 
       def wait_passes(n=5):
           # Passes are every 2s; give it n of them.
@@ -162,10 +183,16 @@ pkgs.testers.runNixOSTest {
           machine.succeed("systemctl show -p RootDirectory --value echo-game.service | grep -q /run/confinement")
           print(machine.succeed("cat /etc/tidewaiter/units/echo-game.service.json"))
 
-      with subtest("a player holds the shutdown lock"):
+      with subtest("idle, tidewaiter status says so and exits 0"):
+          machine.wait_until_succeeds("runuser -u nobody -- tidewaiter status", timeout=dt.timedelta(seconds=30))
+          print(status()[1])
+
+      with subtest("a player shows up in tidewaiter status, which exits 1"):
           machine.succeed("systemd-run --unit=player ${player}")
-          machine.wait_until_succeeds("systemd-inhibit --list --no-legend --no-pager | grep -q 'tidewaiter.*echo-game.service'", timeout=dt.timedelta(seconds=30))
-          print(machine.succeed("systemd-inhibit --list --no-pager"))
+          machine.wait_until_succeeds(says("echo-game.service (systemd)  in use"), timeout=dt.timedelta(seconds=30))
+          code, output = status()
+          print(output)
+          assert code == 1, f"tidewaiter status exited {code} with a player on"
 
       with subtest("a switch to v2 does not restart the game"):
           before = invocation()
@@ -174,15 +201,12 @@ pkgs.testers.runNixOSTest {
           assert desired == "${v2}", desired
           assert invocation() == before, "the switch restarted echo-game"
 
-      with subtest("while the player is on, a reboot is refused"):
-          status, output = machine.execute("shutdown -r +5 2>&1")
-          print(output)
-          if status == 0:
-              machine.succeed("shutdown -c")
-          assert status != 0, "shutdown -r was accepted while the lock was held"
-          status, output = machine.execute("systemctl reboot 2>&1")
-          print(output)
-          assert status != 0, "systemctl reboot was accepted while the lock was held"
+      with subtest("while the player is on, a person can still reboot"):
+          inhibitors = machine.succeed("systemd-inhibit --list --no-legend --no-pager")
+          assert "tidewaiter" not in inhibitors, inhibitors
+          # Scheduled, so it can be taken back: logind checks block locks here.
+          machine.succeed("shutdown -r +5")
+          machine.succeed("shutdown -c")
 
       with subtest("and the game is left alone"):
           wait_passes()
@@ -190,13 +214,13 @@ pkgs.testers.runNixOSTest {
           assert invocation() == before, "echo-game was restarted with a player on it"
           answers("v1")
 
-      with subtest("once the player has gone, it moves to v2 and lets go of the lock"):
+      with subtest("once the player has gone, it moves to v2, and status is idle again"):
           machine.succeed("systemctl stop player")
           machine.wait_until_succeeds("readlink -f ${profile} | grep -qx ${v2}", timeout=dt.timedelta(seconds=120))
           answers("v2")
           assert invocation() != before, "echo-game was not restarted"
-          machine.wait_until_succeeds("! systemd-inhibit --list --no-legend --no-pager | grep -q tidewaiter", timeout=dt.timedelta(seconds=30))
           machine.wait_until_succeeds("journalctl -u tidewaiter.service -o cat | grep -q 'updated to ${v2} and it is healthy'")
+          machine.wait_until_succeeds("runuser -u nobody -- tidewaiter status", timeout=dt.timedelta(seconds=30))
 
       with subtest("a bad version is rolled back, and pinned out"):
           switch("bad")
@@ -222,5 +246,36 @@ pkgs.testers.runNixOSTest {
       with subtest("how confined the daemon is"):
           print(machine.succeed("systemd-analyze security tidewaiter.service --no-pager"))
           print(machine.succeed("journalctl -u tidewaiter.service -u tidewaiter-prepare.service -o cat --no-pager"))
+
+      with subtest("a needed reboot waits for the player, inside its window"):
+          machine.succeed("systemd-run --unit=player2 ${player}")
+          machine.wait_until_succeeds(says("echo-game.service (systemd)  in use"), timeout=dt.timedelta(seconds=30))
+          # An installed system whose kernel is not the one that booted.
+          machine.succeed(
+              "rm /run/installed-system && mkdir /run/installed-system"
+              " && ln -s /run/booted-system/initrd /run/booted-system/kernel-modules /run/installed-system/"
+              " && ln -s /run/booted-system/initrd /run/installed-system/kernel"
+          )
+          machine.wait_until_succeeds("journalctl -u tidewaiter.service -o cat | grep -q 'needed, kernel changed since boot; waiting: echo-game.service in use'", timeout=dt.timedelta(seconds=30))
+          wait_passes()
+          machine.succeed("true")
+          code, output = status()
+          print(output)
+          assert code == 1, f"tidewaiter status exited {code} with a player on"
+          assert "needed, kernel changed since boot; waiting" in output, output
+
+      with subtest("and goes once the player has gone"):
+          boot = machine.succeed("cat /proc/sys/kernel/random/boot_id").strip()
+          machine.succeed("systemctl stop player2")
+          # The test driver runs the VM with -no-reboot: a reboot powers it off.
+          machine.wait_for_shutdown(timeout=dt.timedelta(seconds=120))
+          machine.start()
+          machine.wait_for_unit("tidewaiter.service")
+          assert machine.succeed("cat /proc/sys/kernel/random/boot_id").strip() != boot
+          print(machine.succeed("journalctl -b -1 -u tidewaiter.service -o cat --no-pager | tail -n 20"))
+          machine.succeed("journalctl -b -1 -u tidewaiter.service -o cat | grep -q 'kernel changed since boot; rebooting, as nothing is in use'")
+          # Booted again, installed is booted: nothing more to do.
+          machine.wait_until_succeeds("journalctl -b 0 -u tidewaiter.service -o cat | grep -q 'Automatic reboot (00:00-24:00): not needed'", timeout=dt.timedelta(seconds=30))
+          answers("v2")
     '';
 }

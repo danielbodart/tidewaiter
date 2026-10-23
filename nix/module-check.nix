@@ -14,7 +14,10 @@ let
     };
     system.stateVersion = "25.11";
 
-    services.tidewaiter.enable = true;
+    services.tidewaiter = {
+      enable = true;
+      autoReboot.enable = true;
+    };
 
     # Confined, so bindClosure defaults on.
     systemd.services.game = {
@@ -51,6 +54,26 @@ let
     system.stateVersion = "25.11";
   };
 
+  # Both rebooting: autoUpgrade's would not wait for anyone, so it is refused.
+  clash = pkgs.nixos {
+    imports = [ self.nixosModules.default ];
+    boot.loader.grub.enable = false;
+    fileSystems."/" = {
+      device = "none";
+      fsType = "tmpfs";
+    };
+    system.stateVersion = "25.11";
+    services.tidewaiter = {
+      enable = true;
+      autoReboot.enable = true;
+    };
+    system.autoUpgrade = {
+      enable = true;
+      allowReboot = true;
+    };
+  };
+  failed = config: map (a: a.message) (builtins.filter (a: !a.assertion) config.assertions);
+
   inherit (system.config) systemd environment;
 in
 pkgs.runCommand "tidewaiter-module-check"
@@ -70,6 +93,8 @@ pkgs.runCommand "tidewaiter-module-check"
       )
     );
     gamePath = "${game}";
+    systemFailed = builtins.toJSON (failed system.config);
+    clashFailed = builtins.toJSON (failed clash.config);
     nativeBuildInputs = [ pkgs.jq ];
   }
   ''
@@ -107,7 +132,10 @@ pkgs.runCommand "tidewaiter-module-check"
     grep -q -- '--source systemd' <<<"$daemon" || fail "sources not passed"
     grep -q -- '--interval 60' <<<"$daemon" || fail "interval not passed"
     grep -q -- '--activity-interval 15' <<<"$daemon" || fail "activity interval not passed"
-    grep -q -- '--inhibit' <<<"$daemon" || fail "inhibit not passed"
+    if grep -q -- '--inhibit' <<<"$daemon"; then fail "a shutdown lock asked for"; fi
+    grep -q -- '--status-file /run/tidewaiter/status.json' <<<"$daemon" || fail "status file not passed"
+    grep -qx 'RuntimeDirectory=tidewaiter' <<<"$daemon" || fail "no runtime directory for the status"
+    grep -q -- '--auto-reboot-window 03:00-05:00' <<<"$daemon" || fail "auto-reboot window not passed"
     grep -q -- '--units-dir /etc/tidewaiter/units' <<<"$daemon" || fail "units dir not passed"
     if grep -q -- '--docker-socket' <<<"$daemon"; then fail "docker socket passed without docker"; fi
     grep -qx 'StateDirectory=tidewaiter' <<<"$daemon" || fail "no state directory"
@@ -117,6 +145,11 @@ pkgs.runCommand "tidewaiter-module-check"
     grep -qx 'ReadWritePaths=/nix/var/nix/profiles' <<<"$daemon" || fail "profiles not writable"
     grep -qx 'ReadWritePaths=/run/systemd/system' <<<"$daemon" || fail "drop-ins not writable"
     grep -qx 'IPAddressDeny=any' <<<"$daemon" || fail "IP not restricted for systemd only"
+
+    # Auto-reboot on its own is fine; with autoUpgrade's allowReboot it is refused.
+    [[ $systemFailed == "[]" ]] || fail "assertions failed: $systemFailed"
+    jq -e 'length == 1 and (.[0] | contains("allowReboot = false"))' <<<"$clashFailed" >/dev/null \
+      || fail "autoReboot with allowReboot not refused: $clashFailed"
 
     # Imported with nothing opted in and the daemon off: nothing runs, nothing in /etc.
     [[ $bareEnabled == false ]] || fail "prepare enabled with nothing to prepare"

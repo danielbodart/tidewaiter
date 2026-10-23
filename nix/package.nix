@@ -6,7 +6,6 @@
   conntrack-tools,
   iproute2,
   nix,
-  systemd,
   version,
   src,
 }:
@@ -42,9 +41,9 @@ stdenvNoCC.mkDerivation {
   '';
 
   # What it runs: conntrack (the activity detector), ss (sockets by cgroup),
-  # systemd-inhibit (the shutdown lock), nix-env and nix-store (profiles and
-  # closures). Suffixed, not prefixed, so the host's own come first: on NixOS
-  # the module puts config.nix.package and the running systemd on PATH.
+  # nix-env and nix-store (profiles and closures). Suffixed, not prefixed, so
+  # the host's own come first: on NixOS the module puts config.nix.package on
+  # PATH. systemd itself is only ever spoken to over the bus.
   installPhase = ''
     runHook preInstall
     install -Dm755 tidewaiter $out/libexec/tidewaiter
@@ -53,7 +52,6 @@ stdenvNoCC.mkDerivation {
         lib.makeBinPath [
           conntrack-tools
           iproute2
-          systemd
           nix
         ]
       }
