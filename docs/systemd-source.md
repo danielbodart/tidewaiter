@@ -438,13 +438,27 @@ substituted) by the `nixos-rebuild` that wrote the file - "builds the new versio
 as soon as it's published" is the system build itself.
 
 **Crash recovery.** If Tidewaiter dies mid-swap the profile may point at
-`desired` with the gate never run. On start it cannot tell that from a healthy
-earlier swap, so it does what Docker does - adopts what is running as the
-baseline, with a warning - but it does have one more fact: if the unit is
-`failed` and the profile's current generation is newer than the daemon's last
-recorded good one, it rolls back to that one (holding the inhibitor, with the
-same gate) and pins the version it found. "Last good generation" is recorded per
-unit after every healthy swap, and on first sight of a unit that is up.
+`desired` with the gate never run - or never even restarted into, the unit still
+running the old version. So before the swap changes anything it writes, and
+saves, a record of it: the generation it starts from, that generation's target,
+`desired`, and the unit's `InvocationID`. The record is cleared, and saved, once
+the gate commits or the rollback ends. On start, a unit with a record is
+resumed by whether its invocation moved on:
+
+| The unit | What it means | What is done |
+| --- | --- | --- |
+| same invocation | the restart never happened (or its stop is still running) | profile switched back to `from`, drop-in rebound for it, reload - no restart; the idle-gated path swaps again |
+| new invocation, `failed` | the new version did not come up | rolled back to `from` (restart, gate), `desired` pinned out |
+| new invocation, up or activating | restarted, never gated | gated now; committed if healthy, else rolled back and pinned |
+| new invocation, stopped | someone stopped it since | record dropped; the stopped-unit path moves the profile |
+
+Without a record, a unit that is up is adopted as it is (with a warning if its
+generation differs from the last good one: someone moved the profile by hand),
+and a unit `failed` on a generation newer than the last recorded good one is
+rolled back to that one and the version pinned. "Last good generation" is
+recorded per unit after every healthy swap, and on first sight of a unit that is
+up with no record. Pins, `good` and the record are each saved the moment they
+change, not at the end of the pass.
 
 ## 6. Holding off reboots: the logind inhibitor
 
@@ -563,6 +577,15 @@ BindReadOnlyPaths=/nix/store/...-glibc-2.40
   profile, below) and reloads systemd, before any managed unit starts - `/run`
   is empty after a reboot. (Designed as an activation snippet; see section 9
   for why it is a unit.)
+- `prepare` writes a drop-in only when there is none, or the one there names
+  another profile (a `# Profile:` line records which); a missing one is
+  created with `link()`, so it never replaces one the daemon wrote meanwhile.
+  Once a drop-in exists the daemon is its only writer: a switch restarts
+  `prepare` while the daemon may be swapping, and a `prepare` that read the
+  profile before the daemon's `set` and wrote after the daemon's bind would put
+  the old closure back under the new version's restart. To have `prepare`
+  rewrite a drop-in by hand (after moving a profile yourself), delete it and
+  `systemctl restart tidewaiter-prepare`.
 
 This keeps the confinement as tight as Chandlery wants it - only the running
 version's closure - while letting the version change underneath. The simpler
@@ -764,7 +787,7 @@ recognise root by uid - as the VM test shows.
 | Chandlery `ExecStop` save-and-quit, `TimeoutStopSec=5min`, `Type=notify` | Tidewaiter only `RestartUnit`s; the job waits for ExecStop and then READY=1. The `systemd` check reads a failed job as unhealthy. |
 | Chandlery console FIFO socket unit | Untouched. Restarting the service leaves `chandlery-<n>.socket` and its FIFO up. |
 | Treesinger socket, ExecStartPre minting | Untouched: it runs on each start, including Tidewaiter's restart. A failed mint degrades to unauthenticated per its own contract, which the `systemd` check sees as a normal start. |
-| Portical `systemd.services.<unit>.portical.forward` | Independent. Typically the same port list appears in both; a unit can share a `let ports = ...` between `portical.forward` and `tidewaiter.ports`. Nothing depends on Portical. |
+| Portical `systemd.services.<unit>.portical.forward` | Independent. Typically the same ports appear in both; a unit can share a `let ports = ...` between `portical.forward` and `tidewaiter.ports` only while no forward remaps a port. For `external:internal/proto` (e.g. `19133:19132/udp`), `tidewaiter.ports` takes the internal port (`19132/udp`) - the one the unit binds and conntrack sees flows reach - written out or derived with `map (p: lib.last (lib.splitString ":" p))`. Nothing depends on Portical. |
 
 A Chandlery server, in full, for the README:
 
@@ -823,7 +846,7 @@ fake. Docker tests unchanged and green throughout.
   (new before old), release; the child exits when the daemon's pipe closes.
 - **D-Bus** - Portical's wire-format tests come with `dbus.ts`; new golden bytes
   for `RestartUnit`, `GetAll` on a Service, and a `JobRemoved` signal decoded.
-- **`prepare`** - seeds only missing profiles; writes the drop-in for each.
+- **`prepare`** - seeds only missing profiles; writes the drop-in only where it is missing or names another profile, never over the daemon's.
 - **Arguments** - `--source` repeated and comma separated, unknown rejected,
   `--units-dir`, `--state-dir`/`STATE_DIRECTORY`, `--inhibit`/`--no-inhibit`.
 - **Nix**
@@ -967,10 +990,12 @@ check` (package with `bun test` under nixpkgs' Bun 1.4.2, module, VM).
     only, so the host itself talking *out* to another server on 19132 would
     read as a player. Also match the flow's original destination address
     against the host's own addresses?
-12. **Docker reads a failed conntrack dump as an empty table** - so as idle,
-    though it logs "assuming busy where it matters". That predates this branch
-    and is kept, as promised; the systemd source reads it as busy. Make Docker
-    fail safe too?
+12. **Docker reads a failed conntrack dump as an empty table** in a pass - so
+    as idle, though it logs "assuming busy where it matters". That predates
+    this branch and is kept, as promised; the systemd source reads it as busy.
+    The activity tick, which drives the new inhibitor, does read it as busy
+    for a `conntrack`-detector container, so the lock is never released on a
+    read that failed. Make Docker's swaps fail safe too?
 13. **Symlinked store paths in a closure** are bound as written, where nixpkgs'
     confinement binds their target, since systemd cannot bind a symlink
     (section 7). Not seen in a real closure; handle it anyway?

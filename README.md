@@ -148,9 +148,9 @@ Setting `tidewaiter.desired` on a service:
 
 The daemon runs as root — it restarts other units and writes system profiles — and is otherwise confined: `CAP_NET_ADMIN` only (conntrack), `ProtectSystem=strict` with only `/nix/var/nix/profiles` and `/run/systemd/system` writable, profiles written through the Nix daemon, no `@privileged` system calls, and IP limited to localhost when systemd is the only source. `systemd-analyze security tidewaiter` rates it **2.0 OK**.
 
-**Confined services.** NixOS `confinement.enable` gives a service a root holding only the closure of its own definition — which names the profile but no version. With `bindClosure` (on by default for a confined service), Tidewaiter writes a runtime drop-in binding the profile's directory and its current target's closure before every restart, rollbacks included, and `tidewaiter-prepare` rewrites it at boot.
+**Confined services.** NixOS `confinement.enable` gives a service a root holding only the closure of its own definition — which names the profile but no version. With `bindClosure` (on by default for a confined service), Tidewaiter writes a runtime drop-in binding the profile's directory and its current target's closure before every restart, rollbacks included, and `tidewaiter-prepare` writes it at boot (only where none is there, so it never races the daemon's).
 
-**Combining with Portical.** A unit forwarded by [Portical](https://github.com/danielbodart/portical) typically lists the same ports twice; share them: `let ports = [ "19132/udp" ]; in { portical.forward = ports; tidewaiter.ports = ports; }`.
+**Combining with Portical.** A unit forwarded by [Portical](https://github.com/danielbodart/portical) typically lists the same ports twice. While no forward remaps a port, share one list: `let ports = [ "19132/udp" ]; in { portical.forward = ports; tidewaiter.ports = ports; }`. A remapped forward (`external:internal/proto`) is not a valid `tidewaiter.ports` entry: list the internal port — the one the unit binds, and the one conntrack sees the players' flows reach — e.g. `portical.forward = [ "19133:19132/udp" ]; tidewaiter.ports = [ "19132/udp" ];`, or derive it with `map (p: lib.last (lib.splitString ":" p)) forwards`.
 
 ### Holding off reboots
 
@@ -184,7 +184,7 @@ The design, and what is still open, is in [`docs/systemd-source.md`](./docs/syst
 tidewaiter run      # reconcile continuously on an interval (default)
 tidewaiter check    # reconcile once and exit
 tidewaiter list     # show managed containers and units, and whether an update is waiting
-tidewaiter prepare  # create missing unit profiles and write closure drop-ins, then exit
+tidewaiter prepare  # create missing unit profiles and missing closure drop-ins, then exit
 ```
 
 Options: `-s/--source docker|systemd` (repeat or comma-separate; default `docker`), `-d/--interval SECONDS` (default 300), `-n/--dry-run`, `--inhibit`/`--no-inhibit` (default off), `--activity-interval SECONDS` (default 15), `--version`. Docker: `-l/--label LABEL`, `--docker-socket PATH`. systemd: `--units-dir DIR` (default `/etc/tidewaiter/units`), `--state-dir DIR` (default `/var/lib/tidewaiter`). Env: `TIDEWAITER_SOURCES`, `TIDEWAITER_INTERVAL`, `TIDEWAITER_INHIBIT`, `DOCKER_SOCKET`, `TIDEWAITER_UNITS_DIR`, `STATE_DIRECTORY`.
