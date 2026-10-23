@@ -7,8 +7,11 @@ source of things to update: **systemd units whose program lives in a Nix
 profile**, so a native service on NixOS gets the same care a labelled container
 does. Docker behaviour does not change.
 
-Status: the mechanical groundwork is in (see "Refactors already made"). The
-rest of this document is the plan.
+Status: sections 1-7 are built and unit-tested (see "Where this stands",
+section 12): the `Daemon` over sources, `DockerSource`, `SystemdSource`, the
+inhibitor, profiles, listeners, the closure drop-in and the persisted state.
+Not yet: the D-Bus `SystemdClient`, the command line of section 8, `tidewaiter
+prepare`, and all of section 9 (flake, module, VM test).
 
 The shape, end to end, for one unit:
 
@@ -26,7 +29,8 @@ tidewaiter, every pass:
       systemctl restart chandlery-bedrock.service   (the unit's own ExecStop saves and quits)
       health gate: systemd state, port-bound by cgroup, port-connect, uptime
         healthy   -> keep, prune old generations
-        unhealthy -> nix-env --profile P --switch-generation PREVIOUS, restart, pin DESIRED out
+        unhealthy -> nix-env --profile P --switch-generation PREVIOUS, delete the failed
+                     generation, restart, pin DESIRED out
 ```
 
 ## Contents
@@ -42,7 +46,7 @@ tidewaiter, every pass:
 9. Nix: flake, package, module
 10. How each shared contract is met
 11. Test plan
-12. Refactors already made
+12. Where this stands
 13. Open questions
 
 ---
@@ -60,8 +64,8 @@ source runs its own pass.
 ```ts
 // src/source.ts
 export interface PassContext {
-  /** The host conntrack table, dumped once per pass and shared by every source. */
-  readonly conntrack: readonly ConntrackEntry[];
+  /** The host conntrack table, dumped once per pass; undefined when the dump failed. */
+  readonly conntrack: readonly ConntrackEntry[] | undefined;
   /**
    * Take the shutdown inhibitor for `workload` until the end of the pass.
    * Called before any swap starts, so a reboot cannot land mid-swap.
@@ -73,8 +77,12 @@ export interface Outcome {
   /** "chandlery-bedrock.service", or a container name. Unique within a source. */
   readonly workload: string;
   readonly action: Action;
-  /** The activity verdict this pass, fail-safe (could-not-tell reads as busy). */
-  readonly busy: boolean;
+  /**
+   * The activity verdict this pass, fail-safe (could-not-tell reads as busy).
+   * Undefined when the pass never sampled it (registry or systemd unreachable):
+   * the daemon keeps the workload's last verdict.
+   */
+  readonly busy?: boolean;
 }
 
 export interface Source {
@@ -82,7 +90,7 @@ export interface Source {
   /** Reconcile every workload once. One workload failing never fails the pass. */
   once(context: PassContext): Promise<Outcome[]>;
   /** Activity only - no digests, no swaps - for the inhibitor's faster tick. */
-  activity(conntrack: readonly ConntrackEntry[]): Promise<{ workload: string; busy: boolean }[]>;
+  activity(conntrack: readonly ConntrackEntry[] | undefined): Promise<{ workload: string; busy: boolean }[]>;
   /** One line per workload for `tidewaiter list`. */
   list(): Promise<string[]>;
 }
@@ -116,15 +124,24 @@ What is shared, and where it lives:
 | Pinning and swap-failure back-off | per-source state, same rules | `MAX_SWAP_FAILURES` moves to a shared constant. |
 | Shutdown inhibitor | `src/inhibit.ts` | Daemon-owned, fed by every source (section 6). |
 
-`DockerSource` is today's `Tidewaiter` class renamed, with `once()` taking the
-`PassContext` instead of dumping conntrack itself, and `run()` moving to the
-`Daemon`. Its logic, messages and tests are otherwise untouched: `daemon.test.ts`
-keeps driving it through the same fakes, behind a `Daemon` with one source.
+`DockerSource` (`src/docker-source.ts`) is the old `Tidewaiter` class renamed,
+with `once()` taking the `PassContext` instead of dumping conntrack itself, and
+`run()` moving to the `Daemon`. Its logic, messages and tests are otherwise
+untouched: `daemon.test.ts` keeps driving it through the same fakes, behind a
+`Daemon` with one source. A failed conntrack dump reaches it as `undefined`,
+which it reads as an empty table - exactly what it did before (see open
+question 12).
 
-The summary line stays per pass across all sources. Its wording changes from
-"containers" to the neutral "N up to date" only where a test does not pin the
-current text; where one does, the Docker-only wording is kept when Docker is the
-only source.
+If a source throws, the others still run, its workloads keep their last busy
+verdicts (so a source that cannot be read never drops a lock it held), and the
+first error is rethrown at the end of the pass, so the loop logs it and `check`
+exits non-zero as before.
+
+The summary line stays per pass across all sources, counting "containers"
+when Docker is the only source (unchanged), "units" when systemd is, and
+"workloads" for both. `decide()` takes its reasons' wording as an optional
+`Words` argument - the Docker wording by default, `UNIT_WORDS` for units - so a
+unit's log talks about versions and profiles, not images.
 
 ## 2. The systemd source
 
@@ -230,8 +247,11 @@ export interface Profiles {
   current(profile: string): Promise<string | undefined>;
   /** The current generation number, for an exact rollback. */
   generation(profile: string): Promise<number | undefined>;
+  /** The store path a generation points at. */
+  target(profile: string, generation: number): Promise<string | undefined>;
   set(profile: string, storePath: string): Promise<void>;
   switchGeneration(profile: string, generation: number): Promise<void>;
+  deleteGeneration(profile: string, generation: number): Promise<void>;
   /** Keep the current generation and `keep` before it; delete the rest. */
   prune(profile: string, keep: number): Promise<void>;
 }
@@ -243,8 +263,10 @@ export interface Profiles {
 |---|---|
 | `current` | `realpath` of the profile (a `readlink` chain: `P -> P-N-link -> /nix/store/...`), in-process |
 | `generation` | parse `N` from `readlink P` (`P-N-link`), in-process |
+| `target` | `realpath` of `P-N-link`, in-process |
 | `set` | `mkdir -p $(dirname P)`, then `nix-env --profile P --set PATH` |
 | `switchGeneration` | `nix-env --profile P --switch-generation N` |
+| `deleteGeneration` | `nix-env --profile P --delete-generations N` |
 | `prune` | `nix-env --profile P --delete-generations +(keep+1)` |
 
 Checked on the development host: `nix-env --set` needs the profile's parent
@@ -254,6 +276,14 @@ path that already had a generation is not necessarily the one we left, so the
 rollback is by the generation number recorded before the swap, not
 `--rollback`. Every generation link under `/nix/var/nix/profiles` is a GC root,
 so the version rolled back to is always still in the store.
+
+`--delete-generations +N` keeps the N highest-*numbered* generations, and a new
+generation is numbered one past the highest left. So a rollback deletes the
+generation it leaves (the failed version) straight away: otherwise the failed
+generation, being newest, would be what `prune` keeps as "the previous one" and
+the good version before it would be pruned. Checked against `nix-env` on the
+development host, and in `test/profile.test.ts` wherever a Nix daemon is
+reachable.
 
 `nix build --profile P PATH` would also do, but `nix-env` is in every Nix
 install and its generations are what `nix-env --list-generations` shows an
@@ -279,6 +309,11 @@ Any local address counts - for health, a socket bound only to loopback is still
 the unit serving. Portical's branch parses the same output for its `published`;
 the parser is shared in spirit, not by import (the repos do not depend on each
 other).
+
+`unitBoundPorts` throws - which port-bound and uptime read as "cannot tell yet",
+never "nothing bound" - when the unit has no `ControlGroup` (not running) or
+when `ss` printed no `cgroup:` field on any line (a kernel or iproute2 too old),
+so a host that cannot attribute sockets never fails a healthy update for it.
 
 ## 3. Activity: conntrack for a host unit
 
@@ -332,6 +367,10 @@ const input: HealthInput = {
 | `uptime` | `running` stays true (the `systemd` check's crash signals feed `running` too: `false` once `NRestarts` or `InvocationID` moved) for the grace, and by then a declared port is bound in the cgroup. Unchanged check. |
 | `docker` | Not accepted in a unit's `health`; warned and dropped. |
 
+A restart job that did not end `done` is unhealthy at once, whichever checks
+the policy names - for a `Type=notify` unit it means the program never said it
+was up.
+
 Default: all four. `systemd` is the cheapest and most authoritative for a
 `Type=notify` unit; `port-bound` is the only generic UDP signal and, through the
 cgroup, is not fooled by another process on the same port.
@@ -344,9 +383,12 @@ Per managed unit, each pass (`SystemdSource.once`):
    profiles.current(profile)`. A unit systemd does not know (`not-found`) is
    left alone with a warning.
 2. **Not running** (`inactive`, `failed`): nobody is playing, but it is not
-   Tidewaiter's to start either. If `current != desired`, `set` the profile so
-   the next start, by whoever starts it, runs `desired`; no restart, no gate.
-   Logged as "updated the profile of a stopped unit". (Open question 4.)
+   Tidewaiter's to start either. If `current != desired` and `desired` is not
+   pinned, `set` the profile (binding the closure and reloading first when
+   `bindClosure`) so the next start, by whoever starts it, runs `desired`; no
+   restart, no gate. Logged as "updated the profile of a stopped unit". (Open
+   question 4.) **In transition** (`activating`, `deactivating`): defer, and
+   the idle streak does not count.
 3. **Sample activity** with the policy's detector over the shared conntrack dump;
    `idleStreak` as for Docker.
 4. **Decide**: `decide({ policy, currentDigest: current, desired: { digest:
@@ -362,16 +404,19 @@ Per managed unit, each pass (`SystemdSource.once`):
    7. Gate: `pollVerdict` with `healthTimeout`.
    8. **Healthy**: `profiles.prune(profile, keepGenerations)`; clear failure
       counters; log `updated to <desired> and it is healthy`.
-   9. **Unhealthy**: `profiles.switchGeneration(profile, previous)`; closure
-      drop-in for the previous path; `daemonReload()`; `restart(unit)`; wait for
-      it with the same gate (a failed rollback is logged as "manual attention
-      needed", never retried in a loop); **pin** `desired`.
+   9. **Unhealthy**: `profiles.switchGeneration(profile, previous)` and delete
+      the generation it leaves (section 2); closure drop-in for the previous
+      path; `daemonReload()`; `restart(unit)`; wait for it with the same gate (a
+      failed rollback is logged as "manual attention needed", never retried in
+      a loop); **pin** `desired`.
    10. **A step failed** before the gate (`nix-env` error, the restart could not
       be queued): undo what was done - switch the profile back if it was set,
-      restart only if the restart had been issued - and count it against
+      put the previous closure drop-in back if it was rewritten, and restart
+      only if the unit's `InvocationID` shows it restarted anyway (the bus
+      dropped after the job was queued) - and count it against
       `MAX_SWAP_FAILURES` exactly as Docker's swap-step failures are. A failed
-      *job* is not a step failure: the new version did not come up, which is the
-      gate's `systemd` check failing, so it rolls back and pins.
+      *job* is not a step failure: the new version did not come up, so it rolls
+      back and pins.
 6. **Pinned** while `desired` is the pinned path; a new `desired` clears it.
 
 State that must survive a restart of Tidewaiter is persisted, unlike Docker's
@@ -380,10 +425,12 @@ and a forgotten pin would retry it once on every daemon restart:
 
 ```json
 // /var/lib/tidewaiter/systemd.json  (StateDirectory)
-{ "chandlery-bedrock.service": { "pinned": "/nix/store/...", "failing": "/nix/store/...", "swapFailures": 1 } }
+{ "chandlery-bedrock.service": { "pinned": "/nix/store/...", "failing": "/nix/store/...", "swapFailures": 1, "good": 7 } }
 ```
 
-Written atomically (temp file and rename) after any pass that changed it. The
+Written atomically (temp file and rename) after any pass that changed it. A
+file that cannot be parsed stops the systemd source (logged every pass) rather
+than starting over with no pins. The
 idle streak is not persisted: after a daemon restart it counts up again, which
 only ever delays.
 
@@ -396,15 +443,16 @@ as soon as it's published" is the system build itself.
 earlier swap, so it does what Docker does - adopts what is running as the
 baseline, with a warning - but it does have one more fact: if the unit is
 `failed` and the profile's current generation is newer than the daemon's last
-recorded good one, it rolls back. (Recording "last good generation" per unit in
-the state file is what makes this possible; cheap, so in scope.)
+recorded good one, it rolls back to that one (holding the inhibitor, with the
+same gate) and pins the version it found. "Last good generation" is recorded per
+unit after every healthy swap, and on first sight of a unit that is up.
 
 ## 6. Holding off reboots: the logind inhibitor
 
 While any managed workload (unit or container) is busy or being swapped,
 Tidewaiter holds a logind inhibitor lock:
 
-- `what = shutdown:sleep`, `who = tidewaiter`, `why = "players on
+- `what = shutdown:sleep`, `who = tidewaiter`, `why = "in use:
   chandlery-bedrock.service, chandlery-hytale.service"`.
 - **`mode = block`.** `delay` only defers for `InhibitDelayMaxSec` (5 s by
   default) - useless against a session that lasts hours. `block-weak` is
@@ -424,7 +472,12 @@ passed with `SCM_RIGHTS`; neither the hand-written D-Bus client nor Bun's
 systemd-inhibit --what=shutdown:sleep --mode=block --who=tidewaiter --why="..." cat
 ```
 
-with `cat`'s stdin a pipe from Tidewaiter. Releasing is closing the pipe; and if
+with `cat`'s stdin a pipe from Tidewaiter. `systemd-inhibit` only runs `cat`
+once it holds the lock, so Tidewaiter writes a newline and waits for `cat` to
+echo it back: that echo is the acknowledgement, and a `systemd-inhibit` that
+could not take the lock exits without it, which `set()` reports as an error
+(logged once by the daemon; never fatal). A child that has died is noticed on
+the next `set()` and replaced. Releasing is closing the pipe; and if
 Tidewaiter dies for any reason, the kernel closes it, `cat` exits,
 `systemd-inhibit` exits and the lock is gone - no lock can outlive the daemon.
 Changing the `why` takes the new lock before dropping the old, so there is never
@@ -440,8 +493,9 @@ export class SystemdInhibitor implements Inhibitor { /* spawns systemd-inhibit a
 export const NoInhibitor: Inhibitor;
 ```
 
-**When it is refreshed.** At the end of every pass (busy workloads, plus any
-that called `hold()` this pass), and on a faster **activity tick**
+**When it is refreshed.** On every `hold()` (a swap is about to start), at the
+end of every pass (the busy workloads; holds end with the pass, because the
+swap they covered is over), and on a faster **activity tick**
 (`--activity-interval`, default 15 s) that only dumps conntrack and runs each
 source's `activity()` - no digests, no swaps, no effect on idle streaks. A
 player who joins between update passes is covered within one tick, not one
@@ -770,23 +824,43 @@ fake. Docker tests unchanged and green throughout.
     - `systemd-analyze security tidewaiter.service` printed into the log.
 - Also: `bun run.ts check` (tsc) and the Docker image build unchanged.
 
-## 12. Refactors already made
+## 12. Where this stands
 
-On this branch, behaviour unchanged, 175 tests green, `tsc --noEmit` clean:
+Refactors made first, behaviour unchanged:
 
-- **`src/loop.ts` `runEvery`** - the single-flight interval loop, lifted out of
-  `Tidewaiter.run`, which now calls it. The `Daemon` will run every source's
-  pass through it.
-- **`src/gate.ts` `pollVerdict`, `sleep`** - the health gate's poll-until-settled
-  loop, lifted out of `Tidewaiter.pollHealthy`, which now calls it. The systemd
-  source will gate with it.
-- **`src/decide.ts` `Decidable`** - the part of a `Snapshot` `decide()` reads.
-  `Snapshot extends Decidable`; `decide()` takes `Decidable`.
-- **`src/health.ts` `HealthSubject`, `BoundPorts`, `netnsBoundPorts`** -
-  `HealthInput.container` narrowed to what the checks read (a
-  `RunningContainer` still satisfies it), and `HealthInput.netns` replaced by a
-  `bound` function, which the Docker daemon builds from the container's netns.
-  The test helper builds `bound` the same way, so no assertion changed.
+- **`src/loop.ts` `runEvery`** - the single-flight interval loop.
+- **`src/gate.ts` `pollVerdict`, `sleep`, `uptimeSeconds`** - the health gate's
+  poll-until-settled loop and the uptime grace, shared by both sources.
+- **`src/decide.ts` `Decidable`, `Words`** - the part of a `Snapshot` `decide()`
+  reads, and the wording of its reasons.
+- **`src/health.ts` `HealthSubject`, `BoundPorts`, `netnsBoundPorts`** - the
+  checks read a subject and a bound-ports function, not a container and its
+  netns.
+- **`src/labels.ts`** - `parsePortTerm` and the field validators exported, so a
+  units file is read with the labels' rules.
+
+Built on them, each with in-memory fakes (`test/fakes/systemd.ts`,
+`test/fakes/source.ts`):
+
+| File | What |
+|---|---|
+| `src/source.ts` | `Source`, `PassContext`, `Outcome`, `MAX_SWAP_FAILURES` |
+| `src/daemon.ts` | `Daemon`: shared dump, sources in turn, summary, inhibitor, activity tick |
+| `src/docker-source.ts` | `DockerSource`, plus `activity()` and `list()` |
+| `src/inhibit.ts` | `Inhibitor`, `NoInhibitor`, `SystemdInhibitor` |
+| `src/units.ts` | `parseUnitPolicy`, `DirUnitsDirectory` |
+| `src/listeners.ts` | `parseListeners`, `unitBoundPorts`, `SsListenerSource` |
+| `src/profile.ts` | `Profiles`, `NixProfiles`, `generationOf` |
+| `src/systemd.ts` | `UnitState`, `SystemdClient` (interface only), `systemdVerdict` |
+| `src/closure.ts` | `ClosureBinder`, `NixClosureBinder`, `closureDropIn` |
+| `src/state-store.ts` | `UnitMemory`, `FileStateStore` |
+| `src/systemd-source.ts` | `SystemdSource`: sections 2-5 and 7's swap side |
+
+`main.ts` runs a `Daemon` over `DockerSource` with `NoInhibitor`, so the binary
+and the image behave as before.
+
+Still to do: `DbusSystemdClient` (with Portical's `dbus.ts`), section 8's
+flags and `prepare`, and section 9.
 
 ## 13. Open questions
 
@@ -832,3 +906,7 @@ On this branch, behaviour unchanged, 175 tests green, `tsc --noEmit` clean:
     only, so the host itself talking *out* to another server on 19132 would
     read as a player. Also match the flow's original destination address
     against the host's own addresses?
+12. **Docker reads a failed conntrack dump as an empty table** - so as idle,
+    though it logs "assuming busy where it matters". That predates this branch
+    and is kept, as promised; the systemd source reads it as busy. Make Docker
+    fail safe too?
