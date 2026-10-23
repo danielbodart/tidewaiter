@@ -5,8 +5,8 @@ import type { Action } from "./decide.ts";
  * What a source is handed for one pass.
  *
  * The daemon owns everything a pass shares across sources - one conntrack dump,
- * the shutdown inhibitor - and passes it in, so two sources never dump the
- * table twice and never fight over the lock.
+ * and the record of what is being swapped - and passes it in, so two sources
+ * never dump the table twice.
  */
 export interface PassContext {
   /**
@@ -17,11 +17,12 @@ export interface PassContext {
    */
   readonly conntrack: readonly ConntrackEntry[] | undefined;
   /**
-   * Take the shutdown inhibitor for `workload` until the end of the pass.
+   * Mark `workload` as being swapped until the end of the pass.
    *
-   * Called before any swap starts, so a reboot cannot land mid-swap. Never
-   * throws: a lock that could not be taken is logged by the daemon, and the swap
-   * goes ahead - the lock protects players, and an idle workload has none.
+   * Called before any swap starts, so `tidewaiter status` says so from that
+   * moment, and an automatic reboot never lands mid-swap. Never throws: a
+   * status file that could not be written is logged by the daemon, and the
+   * swap goes ahead.
    */
   hold(workload: string): Promise<void>;
 }
@@ -39,9 +40,15 @@ export interface Outcome {
    * it last knew about the workload rather than guessing either way.
    */
   readonly busy?: boolean;
+  /**
+   * Idle for the workload's whole idle-samples debounce this pass - what an
+   * automatic reboot waits for, as a swap does. Undefined reads as not: a
+   * workload that was not sampled, or has just been swapped, holds a reboot off.
+   */
+  readonly settled?: boolean;
 }
 
-/** One workload's activity, for the inhibitor's faster tick. */
+/** One workload's activity, for the faster tick between passes. */
 export interface Activity {
   readonly workload: string;
   readonly busy: boolean;
@@ -59,7 +66,7 @@ export interface Source {
   readonly name: SourceName;
   /** Reconcile every workload once. One workload failing never fails the pass. */
   once(context: PassContext): Promise<Outcome[]>;
-  /** Activity only - no digests, no swaps, no idle streaks - for the inhibitor's tick. */
+  /** Activity only - no digests, no swaps, no idle streaks - for the tick between passes. */
   activity(conntrack: readonly ConntrackEntry[] | undefined): Promise<Activity[]>;
   /** One line per workload for `tidewaiter list`. */
   list(): Promise<string[]>;

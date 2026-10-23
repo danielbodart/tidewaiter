@@ -3,7 +3,6 @@ import type { ConntrackSource } from "../src/conntrack.ts";
 import { Daemon, DEFAULTS, type Options } from "../src/daemon.ts";
 import type { DockerClient } from "../src/docker.ts";
 import { DockerSource } from "../src/docker-source.ts";
-import { NoInhibitor } from "../src/inhibit.ts";
 import type { TcpProbe } from "../src/health.ts";
 import type { NetnsReader } from "../src/netns.ts";
 import type { AuthSource, RegistryClient } from "../src/registry.ts";
@@ -31,7 +30,7 @@ function dockerDaemon(
   tcp?: TcpProbe,
 ) {
   const source = new DockerSource(docker, registry, netns, options, log, now, auth, tcp);
-  const daemon = new Daemon([source], conntrack, NoInhibitor, options, log);
+  const daemon = new Daemon([source], conntrack, options, log);
   return { once: async () => (await daemon.once()).map((outcome) => outcome.action) };
 }
 
@@ -742,7 +741,7 @@ describe("conntrack is dumped once per pass", () => {
   });
 });
 
-describe("activity for the shutdown lock", () => {
+describe("activity for the tick between passes", () => {
   function source() {
     const docker = new FakeDocker();
     const registry = new FakeRegistry();
@@ -754,6 +753,21 @@ describe("activity for the shutdown lock", () => {
     opted(docker, registry, "web", "sha256:old", "sha256:new");
     expect(await subject.activity(undefined)).toEqual([{ workload: "web", busy: true }]);
     expect(await subject.activity([])).toEqual([{ workload: "web", busy: false }]);
+  });
+
+  test("a container is settled once idle for its whole debounce, and not while busy", async () => {
+    const { docker, registry, source: subject } = source();
+    opted(docker, registry, "web", "sha256:same", "sha256:same", { "tidewaiter.idle-samples": "2", "tidewaiter.detector": "none" });
+    const context = { conntrack: [], hold: async () => {} };
+    expect((await subject.once(context))[0]).toMatchObject({ busy: false, settled: false });
+    expect((await subject.once(context))[0]).toMatchObject({ busy: false, settled: true });
+  });
+
+  test("a container whose registry did not answer is not settled", async () => {
+    const { docker, registry, source: subject } = source();
+    opted(docker, registry, "web", "sha256:same", "sha256:same", { "tidewaiter.detector": "none" });
+    registry.failWith = new Error("registry down");
+    expect((await subject.once({ conntrack: [], hold: async () => {} }))[0]!.settled).toBeUndefined();
   });
 
   test("a detector that needs no conntrack still answers when the dump failed", async () => {

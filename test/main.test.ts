@@ -56,7 +56,8 @@ describe("parseArguments: sources and the systemd side", () => {
   test("docker is the only source by default, so the image behaves as it always has", () => {
     const parsed = parseArguments([]);
     expect(parsed.sources).toEqual(["docker"]);
-    expect(parsed.inhibit).toBe(false);
+    expect(parsed.statusFile).toBeUndefined();
+    expect(parsed.autoRebootWindow).toBeUndefined();
   });
 
   test("--source repeats or takes a comma-separated list, each named once", () => {
@@ -86,12 +87,26 @@ describe("parseArguments: sources and the systemd side", () => {
     expect(parseArguments([], { STATE_DIRECTORY: "/var/lib/tidewaiter:/var/lib/other" }).stateDir).toBe("/var/lib/tidewaiter");
   });
 
-  test("--inhibit and --no-inhibit, last one wins, and the environment", () => {
-    expect(parseArguments(["--inhibit"]).inhibit).toBe(true);
-    expect(parseArguments(["--inhibit", "--no-inhibit"]).inhibit).toBe(false);
-    expect(parseArguments([], { TIDEWAITER_INHIBIT: "true" }).inhibit).toBe(true);
-    expect(parseArguments(["--no-inhibit"], { TIDEWAITER_INHIBIT: "1" }).inhibit).toBe(false);
-    expect(() => parseArguments([], { TIDEWAITER_INHIBIT: "maybe" })).toThrow(/true or false/);
+  test("there is no shutdown lock to ask for any more", () => {
+    expect(() => parseArguments(["--inhibit"])).toThrow(/unknown option/);
+  });
+
+  test("--status-file, and the environment", () => {
+    expect(parseArguments(["--status-file", "/run/t/s.json"]).statusFile).toBe("/run/t/s.json");
+    expect(parseArguments([], { TIDEWAITER_STATUS_FILE: "/e.json" }).statusFile).toBe("/e.json");
+    expect(parseArguments(["--status-file", "/f.json"], { TIDEWAITER_STATUS_FILE: "/e.json" }).statusFile).toBe("/f.json");
+    expect(parseArguments(["status"]).command).toBe("status");
+  });
+
+  test("--auto-reboot-window, checked when given, and the systems it compares", () => {
+    const parsed = parseArguments(["--auto-reboot-window", "23:00-01:00"]);
+    expect(parsed.autoRebootWindow).toBe("23:00-01:00");
+    expect(parsed.bootedSystem).toBe("/run/booted-system");
+    expect(parsed.currentSystem).toBe("/nix/var/nix/profiles/system");
+    expect(parseArguments([], { TIDEWAITER_AUTO_REBOOT_WINDOW: "03:00-05:00" }).autoRebootWindow).toBe("03:00-05:00");
+    expect(() => parseArguments(["--auto-reboot-window", "3am"])).toThrow(/not a window/);
+    const systems = parseArguments(["--booted-system", "/b", "--current-system", "/c"]);
+    expect([systems.bootedSystem, systems.currentSystem]).toEqual(["/b", "/c"]);
   });
 
   test("--activity-interval, which must be more than nothing", () => {

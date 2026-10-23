@@ -171,8 +171,45 @@ describe("deciding", () => {
   });
 });
 
+describe("settled, for an automatic reboot", () => {
+  test("only once idle for the whole debounce, and not again the moment someone is on", async () => {
+    const h = harness({ desired: V1, idleSamples: 2 });
+    expect((await h.pass())[0]!.settled).toBe(false); // idle 1/2
+    expect((await h.pass())[0]!.settled).toBe(true);
+    h.conntrack.text = PLAYER;
+    expect((await h.pass())[0]!).toMatchObject({ busy: true, settled: false });
+    h.conntrack.text = "";
+    expect((await h.pass())[0]!.settled).toBe(false);
+  });
+
+  test("not straight after a swap", async () => {
+    const h = harness();
+    const [outcome] = await h.pass();
+    expect(outcome!.action.kind).toBe("update");
+    expect(outcome!).toMatchObject({ busy: false, settled: false });
+  });
+
+  test("not while the unit is on its way up", async () => {
+    const h = harness({ desired: V1 });
+    h.systemd.patch(UNIT, { activeState: "activating", subState: "start" });
+    expect((await h.pass())[0]!.settled).toBe(false);
+  });
+
+  test("a stopped unit has nobody to wait for", async () => {
+    const h = harness({ desired: V1 });
+    h.systemd.patch(UNIT, { activeState: "inactive", subState: "dead", mainPid: 0, controlGroup: "" });
+    expect((await h.pass())[0]!).toMatchObject({ busy: false, settled: true });
+  });
+
+  test("a unit that could not be read is not settled", async () => {
+    const h = harness({ desired: V1 });
+    h.systemd.failWith = new Error("bus gone");
+    expect((await h.pass())[0]!.settled).toBeUndefined();
+  });
+});
+
 describe("swapping", () => {
-  test("holds the lock, sets the profile, restarts, gates and prunes - in that order", async () => {
+  test("holds the swap, sets the profile, restarts, gates and prunes - in that order", async () => {
     const h = harness();
     const [outcome] = await h.pass();
 

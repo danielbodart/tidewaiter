@@ -156,7 +156,7 @@ export class DockerSource implements Source {
   }
 
   /**
-   * Whether each opted-in container is busy right now, for the inhibitor.
+   * Whether each opted-in container is busy right now, for the tick between passes.
    *
    * The same detectors and fail-safe as a pass, but nothing is resolved,
    * decided or remembered - in particular no idle streak moves, so the faster
@@ -169,7 +169,7 @@ export class DockerSource implements Source {
       const { policy } = parseLabels(container.spec.labels, container.spec.published);
       if (policy === undefined) continue;
       // A conntrack dump that failed cannot say nobody is on: busy, so the
-      // inhibitor is never released on a read that did not happen.
+      // status and a reboot's gate never read idle on a read that did not happen.
       if (conntrack === undefined && policy.detector === "conntrack") {
         activities.push({ workload: container.spec.name, busy: true });
         continue;
@@ -222,8 +222,8 @@ export class DockerSource implements Source {
     context: PassContext,
   ): Promise<Outcome> {
     const name = container.spec.name;
-    const outcome = (action: Action, busy?: boolean): Outcome =>
-      busy === undefined ? { workload: name, action } : { workload: name, action, busy };
+    const outcome = (action: Action, busy?: boolean, settled = busy === false): Outcome =>
+      busy === undefined ? { workload: name, action } : { workload: name, action, busy, settled };
     const { policy, warnings } = parseLabels(container.spec.labels, container.spec.published);
     for (const warning of warnings) this.log(`${name}: ${warning}`);
 
@@ -321,11 +321,13 @@ export class DockerSource implements Source {
     };
 
     const action = decide(snapshot, previous);
-    // The lock goes on before the swap starts, so a reboot cannot land mid-way.
+    // Held before the swap starts, so an automatic reboot cannot land mid-way.
     if (action.kind === "update" && !this.options.dryRun) await context.hold(name);
     const next = await this.apply(action, container, policy, previous, idleStreak, desiredDigest, currentDigest);
     this.state.set(name, next);
-    return outcome(action, activity.inUse);
+    // A container just recreated is settled again only once a pass says so.
+    const settled = !activity.inUse && idleStreak >= policy.idleSamples && action.kind !== "update";
+    return outcome(action, activity.inUse, settled);
   }
 
   /**

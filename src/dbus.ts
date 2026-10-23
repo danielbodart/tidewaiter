@@ -1,14 +1,14 @@
 import { connect, type Socket } from "node:net";
 
 /**
- * Just enough D-Bus to ask systemd about a unit, restart it and hear the job end.
+ * Just enough D-Bus to ask systemd about a unit, restart it and hear the job
+ * end - and to ask logind for a reboot.
  *
  * Written by hand rather than taken from a library to keep Tidewaiter free of
  * runtime dependencies, which is what lets the Nix package be a plain
  * `bun build` with nothing to fetch. Lifted from Portical's systemd-source
  * branch, as http.ts was lifted from Portical before it. It is not general: no
- * file descriptor passing (which is why the shutdown inhibitor is held by a
- * child - see inhibit.ts), no introspection, no serving of methods, and
+ * file descriptor passing, no introspection, no serving of methods, and
  * authentication only by EXTERNAL, which is all a local system bus asks for.
  *
  * The wire format is in the D-Bus specification, "Message Protocol". Values

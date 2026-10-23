@@ -58,7 +58,7 @@ interface Progress {
  * Per unit, per pass: read the policy, the unit and the profile; a stopped unit
  * just has its profile moved for whoever starts it next; a running one is
  * sampled for activity, judged by the same decide() as a container, and once
- * idle for long enough swapped - hold the inhibitor, look once more for
+ * idle for long enough swapped - mark it held, look once more for
  * players, bind the new closure, `nix-env --set`, restart (the unit's own
  * ExecStop saves and quits), health-gate, and on failure switch the profile
  * back to the generation it left, restart again and pin the version out.
@@ -165,8 +165,9 @@ export class SystemdSource implements Source {
 
   private async reconcile(policy: UnitPolicy, context: PassContext): Promise<Outcome> {
     const { unit, desired, profile } = policy;
-    const outcome = (action: Action, busy?: boolean): Outcome =>
-      busy === undefined ? { workload: unit, action } : { workload: unit, action, busy };
+    // Settled defaults to idle: a unit with nothing running has nobody to wait for.
+    const outcome = (action: Action, busy?: boolean, settled = busy === false): Outcome =>
+      busy === undefined ? { workload: unit, action } : { workload: unit, action, busy, settled };
 
     let state: UnitState;
     try {
@@ -202,7 +203,8 @@ export class SystemdSource implements Source {
     if (!this.seen.has(unit)) {
       this.seen.add(unit);
       const recovered = await this.firstSight(policy, state, read.current, read.generation, context);
-      if (recovered) return outcome(recovered, false);
+      // Something was just finished or undone: not settled until a pass has looked again.
+      if (recovered) return outcome(recovered, false, false);
       // Recovery may have moved the profile back, or gated what it points at.
       state = await this.deps.systemd.unit(unit);
       read = await readProfile();
@@ -218,11 +220,12 @@ export class SystemdSource implements Source {
     // nothing until it settles.
     const idleStreak = activity.inUse || transitional ? 0 : (this.streaks.get(unit) ?? 0) + 1;
     this.streaks.set(unit, idleStreak);
+    const settled = !activity.inUse && idleStreak >= policy.idleSamples;
 
     if (transitional && current !== desired && this.memory(unit).pinned !== desired) {
       const action: Action = { kind: "defer", reason: `the unit is ${state.activeState}; waiting for it to settle` };
       this.log(`${unit}: ${action.reason}`);
-      return outcome(action, activity.inUse);
+      return outcome(action, activity.inUse, false);
     }
 
     const action = decide(
@@ -234,18 +237,19 @@ export class SystemdSource implements Source {
     switch (action.kind) {
       case "keep":
       case "pinned":
-        return outcome(action, activity.inUse);
+        return outcome(action, activity.inUse, settled);
       case "defer":
         this.log(`${unit}: ${action.reason}`);
-        return outcome(action, activity.inUse);
+        return outcome(action, activity.inUse, settled);
       case "update":
         this.log(`${unit}: updating - ${action.reason}`);
         if (this.options.dryRun) {
           this.log(`${unit}: dry run, not touching it`);
-          return outcome(action, activity.inUse);
+          return outcome(action, activity.inUse, settled);
         }
         await context.hold(unit);
-        return outcome((await this.swap(policy, state, current, generation)) ?? action, false);
+        // Just restarted, or someone arrived: settled again only once a pass says so.
+        return outcome((await this.swap(policy, state, current, generation)) ?? action, false, false);
     }
   }
 
