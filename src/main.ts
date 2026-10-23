@@ -1,8 +1,9 @@
 import { CliConntrackSource } from "./conntrack.ts";
-import { DEFAULTS, Tidewaiter, type Options } from "./daemon.ts";
+import { Daemon, DEFAULTS, type Options } from "./daemon.ts";
 import { HttpDockerClient } from "./docker.ts";
+import { DockerSource } from "./docker-source.ts";
 import { http, overUnixSocket, withTimeout } from "./http.ts";
-import { parseLabels } from "./labels.ts";
+import { NoInhibitor } from "./inhibit.ts";
 import { ProcNetnsReader, resolveProcRoot } from "./netns.ts";
 import { dockerConfigAuth, HttpRegistryClient } from "./registry.ts";
 import { version } from "./version.ts";
@@ -111,7 +112,7 @@ export async function main(argv: readonly string[]): Promise<number> {
 
   console.log(`Tidewaiter ${version}`);
 
-  const docker = new HttpDockerClient(overUnixSocket(parsed.socket));
+  const dockerClient = new HttpDockerClient(overUnixSocket(parsed.socket));
   // One credential source, shared by the registry client (for digest lookups)
   // and the daemon (for authenticated `docker pull`), so a private image both
   // resolves and pulls with the same creds from ~/.docker/config.json.
@@ -124,43 +125,15 @@ export async function main(argv: readonly string[]): Promise<number> {
   const procRoot = await resolveProcRoot();
   const netns = new ProcNetnsReader(procRoot);
 
+  const dockerSource = new DockerSource(dockerClient, registry, netns, parsed.options, console.log, Date.now, auth);
+
   if (parsed.command === "list") {
-    const containers = await docker.containers(parsed.options.label);
-    if (containers.length === 0) {
-      console.log("No opted-in containers.");
-      return 0;
-    }
-    for (const container of containers) {
-      const { policy } = parseLabels(container.spec.labels, container.spec.published);
-      if (policy === undefined) {
-        // Has the label key but an unrecognised value - shown so a typo is visible.
-        console.log(`${container.spec.name}  ${container.spec.image}  [not a known autoupdate policy]`);
-        continue;
-      }
-      // Source the desired digest the same way the daemon would for this policy.
-      let desired: string;
-      try {
-        desired = policy.autoupdate === "local"
-          ? (await docker.imageDigest(container.spec.image)) ?? "no local image"
-          : await registry.digest(container.spec.image);
-      } catch {
-        desired = policy.autoupdate === "local" ? "no local image" : "registry unreachable";
-      }
-      // Compare like with like: manifest digest vs the running image's RepoDigest
-      // (by its config id), not inspect's config id directly.
-      const current = await docker.imageDigest(container.imageId).catch(() => undefined);
-      const state = desired.startsWith("no ") || desired.endsWith("unreachable") ? desired
-        : desired === current ? "up to date"
-        : "update available";
-      console.log(
-        `${container.spec.name}  ${container.spec.image}  [${state}]  ` +
-          `autoupdate=${policy.autoupdate} detector=${policy.detector} health=${policy.health.join(",")} idle-samples=${policy.idleSamples}`,
-      );
-    }
+    const lines = await dockerSource.list();
+    console.log(lines.length === 0 ? "No opted-in containers." : lines.join("\n"));
     return 0;
   }
 
-  const tidewaiter = new Tidewaiter(docker, registry, conntrack, netns, parsed.options, console.log, Date.now, auth);
+  const tidewaiter = new Daemon([dockerSource], conntrack, NoInhibitor, parsed.options, console.log);
   if (parsed.options.dryRun) console.log("Dry run - nothing will be changed");
 
   switch (parsed.command) {

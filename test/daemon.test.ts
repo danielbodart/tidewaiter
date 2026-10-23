@@ -1,11 +1,39 @@
 import { describe, expect, test } from "bun:test";
-import { DEFAULTS, Tidewaiter, type Options } from "../src/daemon.ts";
+import type { ConntrackSource } from "../src/conntrack.ts";
+import { Daemon, DEFAULTS, type Options } from "../src/daemon.ts";
+import type { DockerClient } from "../src/docker.ts";
+import { DockerSource } from "../src/docker-source.ts";
+import { NoInhibitor } from "../src/inhibit.ts";
+import type { TcpProbe } from "../src/health.ts";
+import type { NetnsReader } from "../src/netns.ts";
+import type { AuthSource, RegistryClient } from "../src/registry.ts";
 import type { HealthStatus } from "../src/model.ts";
 import { FakeConntrackSource } from "./fakes/conntrack.ts";
 import { FakeDocker, port, runningContainer } from "./fakes/docker.ts";
 import { FakeNetnsReader } from "./fakes/netns.ts";
 import { FakeRegistry } from "./fakes/registry.ts";
 import { FakeTcpProbe } from "./fakes/tcp.ts";
+
+/**
+ * The Docker source behind a Daemon of its own, answering once() with the
+ * pass's actions - the shape these tests were written against before the
+ * daemon learnt to run more than one source.
+ */
+function dockerDaemon(
+  docker: DockerClient,
+  registry: RegistryClient,
+  conntrack: ConntrackSource,
+  netns: NetnsReader,
+  options: Options,
+  log: (message: string) => void,
+  now: () => number,
+  auth: AuthSource | undefined,
+  tcp?: TcpProbe,
+) {
+  const source = new DockerSource(docker, registry, netns, options, log, now, auth, tcp);
+  const daemon = new Daemon([source], conntrack, NoInhibitor, options, log);
+  return { once: async () => (await daemon.once()).map((outcome) => outcome.action) };
+}
 
 /**
  * The whole daemon, wired to a Docker, registry, conntrack and netns that exist
@@ -21,7 +49,7 @@ function tidewaiter(overrides: Partial<Options> = {}) {
   const tcp = new FakeTcpProbe();
   const log: string[] = [];
   let now = 1_000_000;
-  const daemon = new Tidewaiter(
+  const daemon = dockerDaemon(
     docker,
     registry,
     conntrack,
@@ -201,7 +229,7 @@ describe("an idle container with a newer image", () => {
     const docker = new FakeDocker();
     const registry = new FakeRegistry();
     let now = 1_000_000;
-    const daemon = new Tidewaiter(
+    const daemon = dockerDaemon(
       docker, registry, new FakeConntrackSource(), new FakeNetnsReader(),
       { ...DEFAULTS, healthPollMillis: 0 },
       () => {},
@@ -363,7 +391,7 @@ describe("an idle container with a newer image", () => {
     const conntrack = new FakeConntrackSource();
     const netns = new FakeNetnsReader();
     let now = 1_000_000;
-    const daemon = new Tidewaiter(
+    const daemon = dockerDaemon(
       docker, registry, conntrack, netns,
       { ...DEFAULTS, healthPollMillis: 1 },
       () => {},
