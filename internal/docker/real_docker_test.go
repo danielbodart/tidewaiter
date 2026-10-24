@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -241,8 +242,50 @@ func TestARealSwapOntoAMovedTag(t *testing.T) {
 	if s.after.ID == s.before.ID || s.after.ImageID == s.before.ImageID || !s.after.Running {
 		t.Errorf("before %s on %s, after %s on %s (running %v)", s.before.ID, s.before.ImageID, s.after.ID, s.after.ImageID, s.after.Running)
 	}
+	// postgres's own defaults took over from alpine's, beside the
+	// container's own env and command.
+	if !slices.Contains(s.after.Spec.Env, "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/lib/postgresql/18/bin") ||
+		!slices.Contains(s.after.Spec.Env, "TW_E2E=1") || !slices.ContainsFunc(s.after.Spec.Env, func(entry string) bool { return strings.HasPrefix(entry, "PGDATA=") }) {
+		t.Errorf("env %v", s.after.Spec.Env)
+	}
+	if !slices.Equal(s.after.Spec.Entrypoint, []string{"docker-entrypoint.sh"}) || !slices.Equal(s.after.Spec.Cmd, []string{"sleep", "3600"}) {
+		t.Errorf("entrypoint %v, cmd %v", s.after.Spec.Entrypoint, s.after.Spec.Cmd)
+	}
 	if kind := s.pass(t); kind != decide.Keep {
 		t.Errorf("then %v", kind)
+	}
+}
+
+// A binding whose host port Docker picks reads back from a real Docker as
+// one, and a create from it is one again - never started, so nothing binds.
+func TestARealBindingWhoseHostPortDockerPicksIsReplayed(t *testing.T) {
+	client := realDocker(t, "alpine:latest")
+	ctx := t.Context()
+	bindings := []model.PortBinding{
+		{PublishedPort: port(0, 80, model.TCP)},
+		{HostIP: "127.0.0.1", PublishedPort: port(0, 81, model.TCP)},
+		{HostRange: "18000-18010", PublishedPort: port(0, 82, model.UDP)},
+	}
+	var specs []model.ContainerSpec
+	for _, what := range []string{"ephemeral", "ephemeral-copy"} {
+		created := e2eSpec(e2eName(t, client, what), "alpine:latest", 0)
+		created.Bindings, created.Exposed = bindings, []string{"80/tcp", "81/tcp", "82/udp"}
+		if len(specs) > 0 {
+			created.Bindings = specs[0].Bindings
+		}
+		if _, err := client.Create(ctx, created); err != nil {
+			t.Fatal(err)
+		}
+		inspected, err := client.Inspect(ctx, created.Name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		specs = append(specs, inspected.Spec)
+	}
+	for _, spec := range specs {
+		if !reflect.DeepEqual(spec.Bindings, bindings) {
+			t.Errorf("%s: bindings %+v", spec.Name, spec.Bindings)
+		}
 	}
 }
 

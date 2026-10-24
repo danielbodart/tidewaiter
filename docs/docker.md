@@ -61,6 +61,41 @@ A malformed label is reported and the default used — one bad label never stops
 
 `tidewaiter.ports` takes a comma-separated list where each term is a port with an optional protocol: `25565/tcp` (TCP only), `19132/udp` (UDP only), or a bare `25565` (both, or whichever the container actually publishes) — e.g. `tidewaiter.ports=25565,19132/udp`.
 
+## What a recreate keeps
+
+A swap recreates the container under the same name from what `docker inspect`
+says of it, on the new image. Everything that is the container's own comes
+across: its env and labels, mounts, port bindings (host address included),
+networks with their aliases and static addresses, restart policy, caps,
+devices, sysctls, extra hosts, user, working dir, stop signal and timeout, and
+any command, entrypoint or healthcheck it was given.
+
+What it only had from its *old image* does not: inspect shows a container's
+config already merged with its image's, so anything equal to the old image's
+default is left out and Docker fills it from the new image, exactly as a fresh
+`docker run` on the new image would. So a new image's changed `CMD`,
+`ENTRYPOINT`, `ENV`, labels, `EXPOSE`, `WORKDIR`, `USER`, `STOPSIGNAL` and
+`HEALTHCHECK` take effect. It goes entry by entry where Docker merges that way:
+an env variable or label you set keeps your value, the ones you didn't come from
+the new image, and a healthcheck you tuned (say `--health-interval 5s`) keeps
+that setting while the new image's test takes over.
+
+- A setting you gave that happens to equal the old image's default can't be
+  told from it, and is left to the new image too - the same thing a fresh
+  `docker run` without it would get.
+- An `--entrypoint` of your own keeps exactly the command you gave it (or none),
+  even when that equals the image's `CMD`: Docker never hands an overridden
+  entrypoint the image's `CMD`, and nor does a recreate.
+- A port you publish stays exposed, even if the new image stops `EXPOSE`ing it.
+- A `-p 80` with no host port (or `-p 8000-8010:80`, a host range) is replayed as
+  it was given, so Docker picks the host port again - as `docker compose` does
+  on a recreate. Which port it picked is not part of the container's config, so
+  such a binding is outside the activity gate and the port health checks, and
+  `tidewaiter.ports` cannot select it; give it a fixed host port to bring it in.
+- If the image the container runs is no longer present, there is no telling its
+  defaults from the container's own, so the update is deferred (and said)
+  rather than carry the old image's settings onto the new one.
+
 ## Only the docker source
 
 The image updates containers and nothing else. Updating systemd units from inside

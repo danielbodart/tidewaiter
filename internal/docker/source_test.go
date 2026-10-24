@@ -251,6 +251,115 @@ func TestTheRecreatedContainerIsTheOriginalFaithfully(t *testing.T) {
 	}
 }
 
+// The bug a verbatim copy had for real: swapped onto v2, the container still
+// ran v1's CMD, with v1's ENV, labels and HEALTHCHECK. Recreated, it takes
+// v2's defaults, and keeps everything it set itself.
+func TestASwapRunsTheNewImagesCmdAndEnvAndKeepsTheContainersOwn(t *testing.T) {
+	v1 := ImageDefaults{
+		Env: []string{"PATH=/v1/bin", "APP_VERSION=1", "APP_MODE=prod"}, Cmd: []string{"serve", "--v1"}, Entrypoint: []string{"/entry"},
+		Labels: map[string]string{"org.opencontainers.image.version": "1"}, Exposed: []string{"8080/tcp", "9000/tcp"},
+		WorkingDir: "/v1", Healthcheck: &model.Healthcheck{Test: []string{"CMD", "/v1/check"}, Interval: 30 * time.Second},
+	}
+	v2 := ImageDefaults{
+		Env: []string{"PATH=/v2/bin", "APP_VERSION=2", "APP_MODE=prod"}, Cmd: []string{"serve", "--v2"}, Entrypoint: []string{"/entry"},
+		Labels: map[string]string{"org.opencontainers.image.version": "2"}, Exposed: []string{"8080/tcp"},
+		WorkingDir: "/v2", Healthcheck: &model.Healthcheck{Test: []string{"CMD", "/v2/check"}, Interval: 30 * time.Second},
+	}
+	w := newWorld(t)
+	w.opted("web", "sha256:old", "sha256:new", labels(dockerHealth, map[string]string{IdleSamplesLabel: "1"}))
+	w.docker.with(func(f *fakeDocker) {
+		f.configs["sha256:old"], f.configs["sha256:new"] = v1, v2
+		// As Docker stored it at `docker run -e APP_MODE=dev -e TZ=UTC
+		// --health-interval 5s -p 8080:8080` on v1.
+		own := f.running[0].Spec
+		own.Env = []string{"APP_MODE=dev", "TZ=UTC"}
+		own.Healthcheck = &model.Healthcheck{Interval: 5 * time.Second}
+		f.running[0].Spec = merged(own, v1)
+	})
+
+	w.expect(t, decide.Update)
+
+	after := read(w.docker, func(f *fakeDocker) model.ContainerSpec { return f.running[f.find("web")].Spec })
+	expectJSON(t, "Cmd", after.Cmd, `["serve","--v2"]`)
+	expectJSON(t, "Entrypoint", after.Entrypoint, `["/entry"]`)
+	expectJSON(t, "Env", after.Env, `["APP_MODE=dev","TZ=UTC","PATH=/v2/bin","APP_VERSION=2"]`)
+	expectJSON(t, "Labels", after.Labels, `{"org.opencontainers.image.version":"2","tidewaiter.autoupdate":"registry","tidewaiter.health":"docker","tidewaiter.health-timeout":"1","tidewaiter.idle-samples":"1"}`)
+	expectJSON(t, "Exposed", after.Exposed, `["8080/tcp"]`)
+	expectJSON(t, "WorkingDir", after.WorkingDir, `"/v2"`)
+	if want := (&model.Healthcheck{Test: []string{"CMD", "/v2/check"}, Interval: 5 * time.Second}); !reflect.DeepEqual(after.Healthcheck, want) {
+		t.Errorf("healthcheck %+v", after.Healthcheck)
+	}
+	if !reflect.DeepEqual(after.Bindings, bound(port(8080, 8080, model.TCP))) {
+		t.Errorf("bindings %+v", after.Bindings)
+	}
+	// On the wire: only what the container set itself.
+	sent := read(w.docker, func(f *fakeDocker) map[string]any { return f.payloads[0] })
+	expectJSON(t, "sent Env", sent["Env"], `["APP_MODE=dev","TZ=UTC"]`)
+	for _, field := range []string{"Cmd", "Entrypoint", "WorkingDir"} {
+		if value, ok := sent[field]; ok {
+			t.Errorf("sent %s %s", field, jsonOf(value))
+		}
+	}
+}
+
+// Without the running image there is no telling the container's own
+// settings from its image's, and copying them all is the bug: no swap, and
+// nothing pinned.
+func TestASwapIsRefusedWhenTheImageTheContainerRunsIsGone(t *testing.T) {
+	w := newWorld(t)
+	w.opted("web", "sha256:old", "sha256:new", labels(dockerHealth, map[string]string{IdleSamplesLabel: "1"}))
+	w.docker.with(func(f *fakeDocker) { delete(f.images, "config-sha256:old") })
+
+	w.expect(t, decide.Update)
+
+	if stops := read(w.docker, func(f *fakeDocker) []stopped { return f.stops }); len(stops) != 0 || len(w.docker.created()) != 0 {
+		t.Errorf("stopped %v, created %v", stops, w.docker.created())
+	}
+	if !w.log.Contains("web: the image it was created from (config-sha256:old) is no longer here") {
+		t.Errorf("said %q", w.log.Text())
+	}
+	// Not pinned: once the image is back, the update goes ahead.
+	w.docker.with(func(f *fakeDocker) { f.images["config-sha256:old"] = "sha256:old" })
+	w.expect(t, decide.Update)
+	if created := w.docker.created(); !slices.Equal(created, []string{"web"}) {
+		t.Errorf("created %v", created)
+	}
+}
+
+// The running image's defaults are read before anything is decided, so a
+// lookup that fails leaves the container exactly as it was.
+func TestAnImageLookupThatFailsTouchesNothing(t *testing.T) {
+	w := newWorld(t)
+	w.opted("web", "sha256:old", "sha256:new", labels(dockerHealth, map[string]string{IdleSamplesLabel: "1"}))
+	w.docker.with(func(f *fakeDocker) { f.failImage = "Docker is restarting" })
+
+	w.expect(t, decide.Keep)
+
+	if stops := read(w.docker, func(f *fakeDocker) []stopped { return f.stops }); len(stops) != 0 || len(w.docker.created()) != 0 {
+		t.Errorf("stopped %v, created %v", stops, w.docker.created())
+	}
+	if !w.log.Contains("could not read the running image digest") {
+		t.Errorf("said %q", w.log.Text())
+	}
+}
+
+// A `-p 80` comes back as a `-p 80`: Docker picks the host port again,
+// rather than the recreated container publishing nothing.
+func TestASwapKeepsPublishingAPortWhoseHostPortDockerPicks(t *testing.T) {
+	w := newWorld(t)
+	w.opted("web", "sha256:old", "sha256:new", labels(dockerHealth, map[string]string{IdleSamplesLabel: "1"}))
+	ephemeral := []model.PortBinding{{PublishedPort: port(0, 80, model.TCP)}, {HostIP: "127.0.0.1", HostRange: "18000-18010", PublishedPort: port(0, 81, model.TCP)}}
+	w.docker.with(func(f *fakeDocker) { f.running[0].Spec.Bindings = ephemeral })
+
+	w.expect(t, decide.Update)
+
+	sent := read(w.docker, func(f *fakeDocker) map[string]any { return f.payloads[0] })
+	expectJSON(t, "PortBindings", sent["HostConfig"].(map[string]any)["PortBindings"], `{"80/tcp":[{}],"81/tcp":[{"HostIp":"127.0.0.1","HostPort":"18000-18010"}]}`)
+	if after := read(w.docker, func(f *fakeDocker) model.ContainerSpec { return f.running[f.find("web")].Spec }); !reflect.DeepEqual(after.Bindings, ephemeral) {
+		t.Errorf("bindings %+v", after.Bindings)
+	}
+}
+
 func TestRollsBackAndPinsOutWhenTheNewImageIsUnhealthy(t *testing.T) {
 	w := newWorld(t)
 	w.opted("web", "sha256:old", "sha256:bad", dockerHealth)

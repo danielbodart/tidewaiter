@@ -1,6 +1,7 @@
 package docker
 
 import (
+	"cmp"
 	"encoding/json"
 	"fmt"
 	"maps"
@@ -31,12 +32,18 @@ type fakeDocker struct {
 	// lands a new image; an id's never does, which is why "current" is looked
 	// up by the container's image id rather than its tag.
 	images map[string]model.Digest
+	// What each image's own config sets, by its manifest digest: served by
+	// /images/{name}/json, and merged into a container created from it as
+	// Docker merges it. Absent is an image that sets nothing.
+	configs map[model.Digest]ImageDefaults
 	// What a pull of a ref lands: a fresh local image (a new config id) whose
 	// RepoDigest is this, with the tag repointed at it - Docker fetching a
 	// newer manifest while the old container keeps its old image id.
 	pullLands map[string]model.Digest
 	// Non-empty makes listing and inspecting fail, as a Docker restart would.
 	failWith string
+	// Non-empty makes an image lookup fail, as a Docker that cannot answer.
+	failImage string
 	// Non-empty makes a pull fail part-way, inside its 200 progress stream,
 	// as Docker reports a pull that cannot finish.
 	failPull string
@@ -53,7 +60,9 @@ type fakeDocker struct {
 	netBytes     map[string]uint64
 	netBytesFail string
 
-	pulls         []pull
+	pulls []pull
+	// Each create as Docker shows the container after: the spec asked for,
+	// merged with its image's defaults.
 	creates       []model.ContainerSpec
 	payloads      []map[string]any
 	starts        []string
@@ -89,7 +98,7 @@ type connected struct {
 
 func newFakeDocker() *fakeDocker {
 	f := &fakeDocker{
-		images: map[string]model.Digest{}, pullLands: map[string]model.Digest{}, failOp: map[Op]string{},
+		images: map[string]model.Digest{}, configs: map[model.Digest]ImageDefaults{}, pullLands: map[string]model.Digest{}, failOp: map[Op]string{},
 		healthByName: map[string]model.HealthStatus{}, runningByName: map[string]bool{},
 		drivers: map[string]string{}, netBytes: map[string]uint64{},
 		wake: make(chan struct{}, 1), streams: map[int]chan struct{}{},
@@ -300,13 +309,88 @@ func specOf(name string, body []byte) (model.ContainerSpec, error) {
 func (f *fakeDocker) image(w http.ResponseWriter, r *http.Request) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.failImage != "" {
+		refuse(w, http.StatusInternalServerError, f.failImage)
+		return
+	}
 	name := r.PathValue("name")
 	digest, ok := f.images[name]
 	if !ok {
 		refuse(w, http.StatusNotFound, "No such image: "+name)
 		return
 	}
-	answer(w, http.StatusOK, map[string]any{"Id": "sha256:config", "RepoDigests": []string{"app@" + string(digest)}})
+	answer(w, http.StatusOK, map[string]any{"Id": "sha256:config", "RepoDigests": []string{"app@" + string(digest)}, "Config": imageConfigOf(f.configs[digest])})
+}
+
+// imageConfigOf is an image's Config as /images/{name}/json shows it: the
+// same shape as a container's, so written the way a create of it would be.
+func imageConfigOf(image ImageDefaults) map[string]any {
+	config := CreatePayload(model.ContainerSpec{
+		Env: image.Env, Cmd: image.Cmd, Entrypoint: image.Entrypoint, Labels: image.Labels, Exposed: image.Exposed,
+		User: image.User, WorkingDir: image.WorkingDir, StopSignal: image.StopSignal, Healthcheck: image.Healthcheck,
+	})
+	delete(config, "HostConfig")
+	delete(config, "Image")
+	return config
+}
+
+// merged is spec as Docker stores a container created from it on an image
+// with these defaults: moby's merge of the two configs at create, field for
+// field, so what a recreate leaves out comes back from the image it lands on.
+func merged(spec model.ContainerSpec, image ImageDefaults) model.ContainerSpec {
+	spec.Env = slices.Clone(spec.Env)
+	if len(spec.Env) == 0 {
+		spec.Env = slices.Clone(image.Env)
+	} else {
+		for _, entry := range image.Env {
+			key, _, _ := strings.Cut(entry, "=")
+			if !slices.ContainsFunc(spec.Env, func(own string) bool { ownKey, _, _ := strings.Cut(own, "="); return ownKey == key }) {
+				spec.Env = append(spec.Env, entry)
+			}
+		}
+	}
+	spec.Env = orEmpty(spec.Env)
+	spec.Labels = orEmptyMap(spec.Labels)
+	for key, value := range image.Labels {
+		if _, set := spec.Labels[key]; !set {
+			spec.Labels[key] = value
+		}
+	}
+	exposed := slices.Clone(spec.Exposed)
+	for _, port := range image.Exposed {
+		if !slices.Contains(exposed, port) {
+			exposed = append(exposed, port)
+		}
+	}
+	slices.Sort(exposed)
+	spec.Exposed = orEmpty(exposed)
+	if len(spec.Entrypoint) == 0 {
+		if len(spec.Cmd) == 0 {
+			spec.Cmd = image.Cmd
+		}
+		if spec.Entrypoint == nil {
+			spec.Entrypoint = image.Entrypoint
+		}
+	}
+	if check := image.Healthcheck; check != nil {
+		if spec.Healthcheck == nil {
+			spec.Healthcheck = check
+		} else {
+			own := *spec.Healthcheck
+			if len(own.Test) == 0 {
+				own.Test = check.Test
+			}
+			own.Interval = cmp.Or(own.Interval, check.Interval)
+			own.Timeout = cmp.Or(own.Timeout, check.Timeout)
+			own.Retries = cmp.Or(own.Retries, check.Retries)
+			own.StartPeriod = cmp.Or(own.StartPeriod, check.StartPeriod)
+			spec.Healthcheck = &own
+		}
+	}
+	spec.User = cmp.Or(spec.User, image.User)
+	spec.WorkingDir = cmp.Or(spec.WorkingDir, image.WorkingDir)
+	spec.StopSignal = cmp.Or(spec.StopSignal, image.StopSignal)
+	return spec
 }
 
 func (f *fakeDocker) network(w http.ResponseWriter, r *http.Request) {
@@ -398,11 +482,13 @@ func (f *fakeDocker) create(w http.ResponseWriter, r *http.Request) {
 		refuse(w, http.StatusConflict, fmt.Sprintf("Conflict. The container name \"/%s\" is already in use", name))
 		return
 	}
+	// Created from whatever image the tag points at here now - by its id, so
+	// a later lookup of what it runs is stable even if the tag moves again -
+	// and with that image's defaults filled in, as Docker shows it after.
+	spec = merged(spec, f.configs[f.images[spec.Image]])
 	f.creates = append(f.creates, spec)
 	f.payloads = append(f.payloads, payload)
 	id := fmt.Sprintf("id-%s-%d", name, len(f.creates))
-	// Created from whatever image the tag points at here now - by its id, so
-	// a later lookup of what it runs is stable even if the tag moves again.
 	f.running = append(f.running, model.RunningContainer{
 		ID: id, PID: 1000 + len(f.creates), Spec: spec, ImageID: f.imageIDFor(spec.Image), Health: model.NoHealth, Running: true,
 	})

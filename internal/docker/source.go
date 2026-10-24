@@ -281,10 +281,20 @@ func (s *Source) reconcile(ctx context.Context, container model.RunningContainer
 	// (bad) image while the container still runs the old one. "" means that
 	// image has no registry digest here (built, not pulled), which reads as
 	// something to pull.
-	current, err := s.docker.ImageDigest(ctx, container.ImageID)
+	//
+	// The same lookup gives the running image's defaults, which a swap takes
+	// back out of the container's config so the new image's apply instead -
+	// read here, before anything is decided, so a lookup that fails has
+	// touched nothing.
+	running, found, err := s.docker.Image(ctx, container.ImageID)
 	if err != nil {
 		s.log(fmt.Sprintf("%s: could not read the running image digest (%s); leaving it alone", name, err))
 		return keep("running image digest unreadable")
+	}
+	current := running.Digest
+	var defaults *ImageDefaults
+	if found {
+		defaults = &running.Defaults
 	}
 
 	// A pin only holds until the tag moves on.
@@ -318,7 +328,7 @@ func (s *Source) reconcile(ctx context.Context, container model.RunningContainer
 	if action.Kind == decide.Update && !s.options.DryRun && pass.Hold != nil {
 		pass.Hold(name)
 	}
-	s.memory[name] = s.apply(ctx, action, container, policy, previous, idleStreak, desired, current)
+	s.memory[name] = s.apply(ctx, action, container, defaults, policy, previous, idleStreak, desired, current)
 	return source.Outcome{
 		Workload: name,
 		Action:   action,
@@ -382,7 +392,7 @@ func (s *Source) sample(ctx context.Context, container model.RunningContainer, p
 	return detect.Combine(result)
 }
 
-func (s *Source) apply(ctx context.Context, action decide.Action, container model.RunningContainer, policy *Policy, previous memory, idleStreak int, desired, current model.Digest) memory {
+func (s *Source) apply(ctx context.Context, action decide.Action, container model.RunningContainer, defaults *ImageDefaults, policy *Policy, previous memory, idleStreak int, desired, current model.Digest) memory {
 	name := container.Spec.Name
 	base := previous
 	base.idleStreak = idleStreak
@@ -397,7 +407,7 @@ func (s *Source) apply(ctx context.Context, action decide.Action, container mode
 			s.log(name + ": dry run, not touching it")
 			return base
 		}
-		return s.update(ctx, container, policy, base, desired, current)
+		return s.update(ctx, container, defaults, policy, base, desired, current)
 	}
 	return base
 }
@@ -472,11 +482,25 @@ type progress struct {
 //     image is bad", and a bounced API call says nothing about the image.
 //     Only a genuine health failure of a stood-up new container pins (or the
 //     same swap failing source.MaxSwapFailures times running).
-func (s *Source) update(ctx context.Context, container model.RunningContainer, policy *Policy, base memory, desired, current model.Digest) memory {
+//
+// defaults is the running image's, nil when that image is no longer here.
+func (s *Source) update(ctx context.Context, container model.RunningContainer, defaults *ImageDefaults, policy *Policy, base memory, desired, current model.Digest) memory {
 	spec := container.Spec
 	name := spec.Name
 	if reason := Unrecreatable(spec); reason != "" {
 		s.log(name + ": " + reason)
+		return base
+	}
+	// Without the old image's defaults there is no telling the container's own
+	// settings from the ones it inherited, and copying them all would pin the
+	// old image's CMD, ENV and HEALTHCHECK onto the new one - silently, as a
+	// swap that looks like it worked. Docker keeps an image while a container
+	// uses it, so this is an anomaly worth saying, not a case to guess at; it
+	// is refused like an anonymous volume, and pins nothing.
+	if defaults == nil {
+		s.log(fmt.Sprintf("%s: the image it was created from (%s) is no longer here, so which of its settings "+
+			"are its own and which that image's cannot be told; deferring rather than carry the old image's "+
+			"defaults onto the new one", name, container.ImageID))
 		return base
 	}
 	// The reference is fragile: if that other container was itself
@@ -503,9 +527,9 @@ func (s *Source) update(ctx context.Context, container model.RunningContainer, p
 		leaving = &image{ref: spec.Image, digest: current}
 	}
 	// The tag is re-pulled as it is: the ref does not change, only what it
-	// resolves to, so the new spec is the old one - chasing the tag *is* the
-	// update.
-	plan := PlanSwap(spec, spec, grace)
+	// resolves to - chasing the tag *is* the update. The new spec is the old
+	// one less its old image's defaults, so the new image's take their place.
+	plan := PlanSwap(spec, WithoutImageDefaults(spec, *defaults), grace)
 
 	// Only the registry policy pulls: under local the newer image is already
 	// here (that is the point of it), and pulling would defeat it, or fail

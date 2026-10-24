@@ -105,19 +105,47 @@ func (c *Client) Inspect(ctx context.Context, container string) (model.RunningCo
 	return raw.Running(), nil
 }
 
+// LocalImage is a local image as /images/{name}/json shows it: the two things
+// Tidewaiter reads off one.
+type LocalImage struct {
+	// The manifest digest Docker records in RepoDigests, or "" for an image
+	// built rather than pulled, which has no registry digest.
+	Digest model.Digest
+	// What the image's own config sets, which Docker fills into a container
+	// created from it wherever the container did not set its own.
+	Defaults ImageDefaults
+}
+
+// Image is a local image, by id or ref; found is false when it is not here.
+//
+// One lookup gives both the digest and the defaults, so the swap's need for
+// the running image's defaults costs no call beyond the digest read every
+// pass already makes.
+func (c *Client) Image(ctx context.Context, image string) (local LocalImage, found bool, err error) {
+	var raw struct {
+		RepoDigests []string
+		Config      InspectedConfig
+	}
+	found, err = c.lookup(ctx, "/images/"+url.PathEscape(image)+"/json", &raw)
+	if err != nil || !found {
+		return LocalImage{}, found, err
+	}
+	local.Defaults = raw.Config.defaults()
+	if len(raw.RepoDigests) > 0 {
+		// `nginx@sha256:...`: the part after the `@` is what the registry
+		// returns too, so the two compare.
+		first := raw.RepoDigests[0]
+		local.Digest = model.Digest(first[strings.LastIndex(first, "@")+1:])
+	}
+	return local, true, nil
+}
+
 // ImageDigest is the manifest digest of a local image, by id or ref, as
 // Docker records it in RepoDigests - or "" when that image is not here, or
 // was built rather than pulled and so has no registry digest.
 func (c *Client) ImageDigest(ctx context.Context, image string) (model.Digest, error) {
-	var raw struct{ RepoDigests []string }
-	found, err := c.lookup(ctx, "/images/"+url.PathEscape(image)+"/json", &raw)
-	if err != nil || !found || len(raw.RepoDigests) == 0 {
-		return "", err
-	}
-	// `nginx@sha256:...`: the part after the `@` is what the registry
-	// returns too, so the two compare.
-	first := raw.RepoDigests[0]
-	return model.Digest(first[strings.LastIndex(first, "@")+1:]), nil
+	local, _, err := c.Image(ctx, image)
+	return local.Digest, err
 }
 
 // NetworkDriver is a network's driver (bridge, macvlan, overlay, host, ...),
@@ -425,25 +453,7 @@ type Inspected struct {
 		Running    bool
 		Restarting bool
 	}
-	Config struct {
-		Image        string
-		Env          []string
-		Cmd          []string
-		Entrypoint   []string
-		Labels       map[string]string
-		ExposedPorts map[string]struct{}
-		User         string
-		WorkingDir   string
-		StopSignal   string
-		StopTimeout  *int
-		Healthcheck  *struct {
-			Test        []string
-			Interval    time.Duration
-			Timeout     time.Duration
-			Retries     int
-			StartPeriod time.Duration
-		}
-	}
+	Config     InspectedConfig
 	HostConfig struct {
 		// Long-form, as created: a volume's Source is its name.
 		Mounts []struct {
@@ -467,6 +477,69 @@ type Inspected struct {
 	Mounts          []InspectedMount
 	NetworkSettings struct {
 		Networks map[string]InspectedNetwork
+	}
+}
+
+// InspectedConfig is the Config of a container's inspect, or of an image's:
+// Docker gives both the same shape.
+//
+// The slices keep JSON's null apart from []: an Entrypoint of [] is a
+// container that asked for none, where null is one that left it to its image.
+type InspectedConfig struct {
+	Image        string
+	Env          []string
+	Cmd          []string
+	Entrypoint   []string
+	Labels       map[string]string
+	ExposedPorts map[string]struct{}
+	User         string
+	WorkingDir   string
+	StopSignal   string
+	StopTimeout  *int
+	Healthcheck  *struct {
+		Test        []string
+		Interval    time.Duration
+		Timeout     time.Duration
+		Retries     int
+		StartPeriod time.Duration
+	}
+}
+
+// healthcheck is the HEALTHCHECK the config sets, or nil when it sets none.
+//
+// Any field set counts, not only a Test: a container given just
+// `--health-interval` is stored with that alone when its image has no
+// HEALTHCHECK to fill the rest from, and a recreate must keep it.
+func (config InspectedConfig) healthcheck() *model.Healthcheck {
+	check := config.Healthcheck
+	if check == nil {
+		return nil
+	}
+	found := &model.Healthcheck{
+		Test: check.Test, Interval: check.Interval, Timeout: check.Timeout,
+		Retries: check.Retries, StartPeriod: check.StartPeriod,
+	}
+	if found.Unset() {
+		return nil
+	}
+	if len(found.Test) == 0 {
+		found.Test = nil
+	}
+	return found
+}
+
+// defaults is an image's config as the defaults it gives a container.
+func (config InspectedConfig) defaults() ImageDefaults {
+	return ImageDefaults{
+		Env:         config.Env,
+		Cmd:         config.Cmd,
+		Entrypoint:  config.Entrypoint,
+		Labels:      config.Labels,
+		Exposed:     slices.Sorted(maps.Keys(config.ExposedPorts)),
+		User:        config.User,
+		WorkingDir:  config.WorkingDir,
+		StopSignal:  config.StopSignal,
+		Healthcheck: config.healthcheck(),
 	}
 }
 
@@ -556,12 +629,7 @@ func (raw Inspected) Spec() model.ContainerSpec {
 	if policy := host.RestartPolicy; policy != nil && policy.Name != "" && policy.Name != "no" {
 		spec.RestartPolicy = &model.RestartPolicy{Name: policy.Name, MaximumRetryCount: policy.MaximumRetryCount}
 	}
-	if check := config.Healthcheck; check != nil && len(check.Test) > 0 {
-		spec.Healthcheck = &model.Healthcheck{
-			Test: check.Test, Interval: check.Interval, Timeout: check.Timeout,
-			Retries: check.Retries, StartPeriod: check.StartPeriod,
-		}
-	}
+	spec.Healthcheck = config.healthcheck()
 	return spec
 }
 
@@ -609,6 +677,13 @@ func (raw Inspected) mounts() []model.Mount {
 // portBindingsOf is every host binding the container was created with, each
 // with the address it is bound on, so a recreate puts it back exactly; the
 // spec's Published() is the once-per-port view of them.
+//
+// Docker stores a host port as text, in one of three forms: a port (`8080`);
+// nothing, for a `-p 80` that leaves the port to Docker; or a range
+// (`8000-8010`), for a host range onto a single container port, which Docker
+// also picks from. The last two are HostPort 0, the range kept to replay. A
+// range onto a range (`-p 8000-8001:80-81`) Docker splits into one binding per
+// port before storing it, so it needs nothing of its own here.
 func portBindingsOf(bindings map[string][]struct{ HostIP, HostPort string }) []model.PortBinding {
 	found := []model.PortBinding{}
 	// In container-port order, so what is said about them is stable.
@@ -619,18 +694,31 @@ func portBindingsOf(bindings map[string][]struct{ HostIP, HostPort string }) []m
 			continue
 		}
 		for _, binding := range bindings[portProtocol] {
-			hostPort, err := strconv.Atoi(binding.HostPort)
-			if err != nil {
-				continue
-			}
 			found = append(found, model.PortBinding{
 				HostIP:        binding.HostIP,
-				PublishedPort: model.PublishedPort{HostPort: hostPort, ContainerPort: containerPort, Protocol: model.Protocol(protocol)},
+				PublishedPort: model.PublishedPort{ContainerPort: containerPort, Protocol: model.Protocol(protocol)},
 			})
+			last := &found[len(found)-1]
+			switch {
+			case binding.HostPort == "":
+			case hostRange.MatchString(binding.HostPort):
+				last.HostRange = binding.HostPort
+			default:
+				hostPort, err := strconv.Atoi(binding.HostPort)
+				if err != nil || hostPort <= 0 {
+					// Nothing Docker writes; replaying a guess at it could
+					// publish the wrong port, so it is left out.
+					found = found[:len(found)-1]
+					continue
+				}
+				last.HostPort = hostPort
+			}
 		}
 	}
 	return found
 }
+
+var hostRange = regexp.MustCompile(`^[0-9]+-[0-9]+$`)
 
 // networksOf is the container's networks, the one its NetworkMode names
 // first and the rest by name.

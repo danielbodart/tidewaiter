@@ -204,6 +204,53 @@ func TestImageDigestIsEmptyForAnImageThatIsNotHereOrWasNeverPulled(t *testing.T)
 	}
 }
 
+func TestImageReadsTheDigestAndTheDefaultsInOneLookup(t *testing.T) {
+	client, requests := recording(replying(200, `{"RepoDigests":["app@sha256:beef"],"Config":{
+		"Env":["PATH=/bin"],"Cmd":["run"],"Entrypoint":null,"Labels":{"version":"2"},"ExposedPorts":{"9000/tcp":{},"80/tcp":{}},
+		"User":"app","WorkingDir":"/srv","StopSignal":"SIGINT","Healthcheck":{"Test":["CMD","true"],"Interval":5000000000}}}`))
+	local, found, err := client.Image(context.Background(), "config-1")
+	if err != nil || !found || local.Digest != "sha256:beef" {
+		t.Fatalf("got %+v, %v, %v", local, found, err)
+	}
+	want := ImageDefaults{
+		Env: []string{"PATH=/bin"}, Cmd: []string{"run"}, Labels: map[string]string{"version": "2"}, Exposed: []string{"80/tcp", "9000/tcp"},
+		User: "app", WorkingDir: "/srv", StopSignal: "SIGINT", Healthcheck: &model.Healthcheck{Test: []string{"CMD", "true"}, Interval: 5 * time.Second},
+	}
+	if !reflect.DeepEqual(local.Defaults, want) {
+		t.Errorf("got  %+v\nwant %+v", local.Defaults, want)
+	}
+	if len(requests()) != 1 {
+		t.Errorf("asked %d times", len(requests()))
+	}
+}
+
+// Not here is an answer, and told apart from an image built rather than
+// pulled, which is here with no digest.
+func TestImageSaysWhetherTheImageIsHere(t *testing.T) {
+	client, _ := recording(replying(404, `{"message":"No such image"}`))
+	if _, found, err := client.Image(context.Background(), "ghost"); err != nil || found {
+		t.Errorf("found %v, %v", found, err)
+	}
+	client, _ = recording(replying(200, `{"RepoDigests":[],"Config":{"Cmd":["run"]}}`))
+	if local, found, err := client.Image(context.Background(), "built"); err != nil || !found || local.Digest != "" || local.Defaults.Cmd[0] != "run" {
+		t.Errorf("got %+v, %v, %v", local, found, err)
+	}
+}
+
+// `--health-interval 5s` on an image with no HEALTHCHECK is stored as that
+// alone, and is the container's own to keep.
+func TestSpecKeepsAHealthcheckThatSetsOnlyATiming(t *testing.T) {
+	raw := fixture(t, "inspect-nginx.json")
+	raw.Config.Healthcheck.Test = nil
+	if check := raw.Spec().Healthcheck; check == nil || check.Test != nil || check.Interval != 30*time.Second {
+		t.Errorf("got %+v", check)
+	}
+	raw.Config.Healthcheck.Interval, raw.Config.Healthcheck.Timeout, raw.Config.Healthcheck.Retries = 0, 0, 0
+	if check := raw.Spec().Healthcheck; check != nil {
+		t.Errorf("got %+v", check)
+	}
+}
+
 func TestNetworkDriverReadsTheDriverAndAsksForTheNetworkByName(t *testing.T) {
 	client, requests := recording(replying(200, `{"Driver":"macvlan"}`))
 	if driver, err := client.NetworkDriver(context.Background(), "pub-net"); err != nil || driver != "macvlan" {

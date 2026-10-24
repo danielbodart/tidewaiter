@@ -61,8 +61,20 @@ func (p PublishedPort) String() string {
 // and all. A recreate replays every one: dropping the address of a
 // `-p 127.0.0.1:5432:5432` would bring a loopback-only database back up on
 // every interface. An empty HostIP is Docker's default, every interface.
+//
+// A HostPort of 0 is a binding that left the host port to Docker: a bare
+// `-p 80` (or `-p 127.0.0.1::80`), which Docker gives an ephemeral port each
+// time the container starts, or `-p 8000-8010:80`, which it gives one from
+// HostRange. Replayed as asked, so a recreate gets Docker's pick again - as a
+// compose recreate does - rather than pinning the port the old one happened
+// to get, or not publishing the container port at all.
 type PortBinding struct {
 	HostIP string
+	// The host port range Docker picks from, as given (`8000-8010`), for the
+	// one form Docker keeps a range in: a host range onto a single container
+	// port. A range onto a range (`-p 8000-8001:80-81`) is stored by Docker as
+	// one binding per port, so never reaches here as a range.
+	HostRange string
 	PublishedPort
 }
 
@@ -70,10 +82,17 @@ type PortBinding struct {
 // addresses they are bound on: what activity and health look at. Docker
 // shows a plain `-p 8080:80` bound on 0.0.0.0 and on :: as two bindings, and
 // a port counts once however many addresses it listens on.
+//
+// A binding whose host port Docker picks (HostPort 0) is left out: which port
+// it got is not in the spec, and a detector or probe given port 0 would watch
+// or dial nothing while reading as though it had looked.
 func (spec ContainerSpec) Published() []PublishedPort {
 	found := []PublishedPort{}
 	seen := map[string]bool{}
 	for _, binding := range spec.Bindings {
+		if binding.HostPort == 0 {
+			continue
+		}
 		key := fmt.Sprintf("%s/%d", binding.Protocol, binding.HostPort)
 		if !seen[key] {
 			seen[key] = true
@@ -95,7 +114,13 @@ func (spec ContainerSpec) Published() []PublishedPort {
 //
 // A nil slice, a nil pointer or an empty string is "not set", which recreate
 // must leave to the image rather than send as an explicit empty value - an
-// empty Cmd is not the same as the image's own.
+// empty Entrypoint is not the same as the image's own.
+//
+// Read off inspect, the config fields (Env, Cmd, Entrypoint, Labels, Exposed,
+// User, WorkingDir, StopSignal, Healthcheck) are what Docker made of the
+// container's own settings merged with its image's defaults; a swap takes
+// the image's defaults back out (WithoutImageDefaults) so the new image's
+// take their place.
 type ContainerSpec struct {
 	Name string
 	// The image ref as configured, e.g. "nginx:1.27" - the tag we keep chasing.
@@ -177,14 +202,21 @@ type Device struct {
 	CgroupPermissions string
 }
 
-// Healthcheck is an image or container HEALTHCHECK. A zero duration or retry
-// count is "not set", as the Engine API reads it.
+// Healthcheck is an image or container HEALTHCHECK. An empty Test or a zero
+// duration or retry count is "not set", as the Engine API reads it: Docker
+// fills each such field from the image's own HEALTHCHECK.
 type Healthcheck struct {
 	Test        []string
 	Interval    time.Duration
 	Timeout     time.Duration
 	Retries     int
 	StartPeriod time.Duration
+}
+
+// Unset is whether the healthcheck sets nothing at all, leaving every field
+// to the image.
+func (check Healthcheck) Unset() bool {
+	return len(check.Test) == 0 && check.Interval == 0 && check.Timeout == 0 && check.Retries == 0 && check.StartPeriod == 0
 }
 
 // RunningContainer is a container as it is running now, with the facts an
