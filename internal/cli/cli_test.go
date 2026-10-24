@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/danielbodart/gokit/await"
 	"github.com/danielbodart/gokit/clock"
 	"github.com/danielbodart/gokit/httpx"
 	"github.com/danielbodart/gokit/sockdiag"
@@ -47,6 +48,9 @@ type world struct {
 	busErr    error
 	busOpened int
 	registry  int
+	// The User-Agent of every registry request.
+	agents   []string
+	notified []string
 }
 
 func newWorld(t *testing.T) *world {
@@ -67,6 +71,13 @@ func newWorld(t *testing.T) *world {
 	}
 }
 
+// notifications is what systemd has been told, one sd_notify each.
+func (w *world) notifications() []string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return slices.Clone(w.notified)
+}
+
 func (w *world) path(name string) string { return filepath.Join(w.dir, name) }
 
 func (w *world) container(args ...string) *Container {
@@ -78,18 +89,26 @@ func (w *world) container(args ...string) *Container {
 		Stdout: w.stdout,
 		Stderr: w.stderr,
 		Clock:  w.clock,
-		PID:    4321,
+		Notify: func(states ...string) error {
+			w.mu.Lock()
+			defer w.mu.Unlock()
+			w.notified = append(w.notified, strings.Join(states, "\n"))
+			return nil
+		},
 		DockerTransport: func(socket string) http.RoundTripper {
 			if socket != "/var/run/docker.sock" && socket != w.env["EXPECT_SOCKET"] {
 				w.t.Errorf("Docker reached at %s", socket)
 			}
 			return httpx.HandlerTransport(w.docker)
 		},
-		RegistryTransport: httpx.RoundTripperFunc(func(*http.Request) (*http.Response, error) {
+		// A refusal, not a transport error, which would be retried on the
+		// stopped clock.
+		RegistryTransport: httpx.RoundTripperFunc(func(r *http.Request) (*http.Response, error) {
 			w.mu.Lock()
 			defer w.mu.Unlock()
 			w.registry++
-			return nil, errors.New("no registry here")
+			w.agents = append(w.agents, r.Header.Get("User-Agent"))
+			return &http.Response{StatusCode: http.StatusNotFound, Header: http.Header{}, Body: http.NoBody, Request: r}, nil
 		}),
 		DockerConfig: func() ([]byte, error) { return nil, os.ErrNotExist },
 		Bus: func(map[string]string) (systemd.Bus, error) {
@@ -262,6 +281,17 @@ func TestListShowsEachOptedInContainer(t *testing.T) {
 	equal(t, w.registry, 0)
 }
 
+func TestDockerAndTheRegistriesAreToldWhoIsAsking(t *testing.T) {
+	w := newWorld(t)
+	w.docker.run("web", "app:latest", map[string]string{"tidewaiter.autoupdate": "registry"})
+	w.main("check")
+	agent := "tidewaiter/" + version.Version
+	equal(t, w.agents, []string{agent})
+	if agents := w.docker.userAgents(); len(agents) == 0 || slices.ContainsFunc(agents, func(a string) bool { return a != agent }) {
+		t.Fatalf("Docker was told %q", agents)
+	}
+}
+
 func TestListShowsNoManagedUnitsWhenSystemdIsTheOnlySource(t *testing.T) {
 	w := newWorld(t)
 	dir := w.unit(".keep", "")
@@ -320,8 +350,8 @@ func TestRunWritesTheStatusUntilASignalThenClearsItAndExitsZero(t *testing.T) {
 	w := newWorld(t)
 	file := w.path("status.json")
 	code := w.start("--status-file", file, "-l", "tw-e2e.autoupdate")
-	fakes.Await(t, "the first status", func() bool { _, err := os.Stat(file); return err == nil })
-	fakes.Await(t, "the loop to wait", func() bool { return strings.Contains(w.stdout.String(), "Reconciling every 300s...") })
+	await.Until(t, "the first status", func() bool { _, err := os.Stat(file); return err == nil })
+	await.Until(t, "the loop to wait", func() bool { return strings.Contains(w.stdout.String(), "Reconciling every 300s...") })
 
 	w.signals <- syscall.SIGTERM
 	equal(t, w.exited(code), 0)
@@ -331,19 +361,40 @@ func TestRunWritesTheStatusUntilASignalThenClearsItAndExitsZero(t *testing.T) {
 	}
 }
 
+// Ready before the first pass, so `systemctl start` never waits on a swap;
+// then what it is doing; and stopping, once it is told to.
+func TestRunTellsSystemdItIsReadyWhatItIsDoingAndThatItIsStopping(t *testing.T) {
+	w := newWorld(t)
+	code := w.start("-l", "tw-e2e.autoupdate")
+	await.Until(t, "the loop to wait", func() bool { return strings.Contains(w.stdout.String(), "Reconciling every 300s...") })
+	w.signals <- syscall.SIGTERM
+	equal(t, w.exited(code), 0)
+	equal(t, w.notifications(), []string{
+		"READY=1\nSTATUS=Starting the first pass",
+		"STATUS=Idle: No containers to manage",
+		"STOPPING=1\nSTATUS=Stopping",
+	})
+}
+
+func TestOnlyRunTellsSystemdAnything(t *testing.T) {
+	w := newWorld(t)
+	equal(t, w.main("check"), 0)
+	equal(t, w.notifications(), []string(nil))
+}
+
 // What the TypeScript did with its AbortSignal: a swap is never abandoned.
 func TestASignalDuringAPassLetsThePassFinishFirst(t *testing.T) {
 	w := newWorld(t)
 	release := make(chan struct{})
 	w.docker.hold = release
 	code := w.start()
-	fakes.Await(t, "the pass to start", func() bool { return len(w.docker.listings()) == 1 })
+	await.Until(t, "the pass to start", func() bool { return len(w.docker.listings()) == 1 })
 
 	w.signals <- syscall.SIGINT
-	fakes.Await(t, "the signal to be heard", func() bool { return strings.Contains(w.stdout.String(), "Received SIGINT") })
+	await.Until(t, "the signal to be heard", func() bool { return strings.Contains(w.stdout.String(), "Received SIGINT") })
 	// A second Ctrl-C is said, not obeyed.
 	w.signals <- syscall.SIGINT
-	fakes.Await(t, "the second signal to be heard", func() bool { return strings.Count(w.stdout.String(), "Received SIGINT") == 2 })
+	await.Until(t, "the second signal to be heard", func() bool { return strings.Count(w.stdout.String(), "Received SIGINT") == 2 })
 	select {
 	case <-code:
 		t.Fatal("Main returned with a pass still in flight")
@@ -358,7 +409,7 @@ func TestRunWithARebootWindowSaysSoAndRebootsWhenNeededAndIdle(t *testing.T) {
 	w := newWorld(t)
 	w.boot.Need("the kernel changed")
 	code := w.start("--auto-reboot-window", "11:00-13:00", "-l", "tw-e2e.autoupdate")
-	fakes.Await(t, "the reboot", func() bool { return w.rebooter.Reboots() == 1 })
+	await.Until(t, "the reboot", func() bool { return w.rebooter.Reboots() == 1 })
 	contains(t, w.stdout.String(), "Rebooting automatically when needed, between 11:00-13:00, once nothing is in use\n")
 	w.signals <- syscall.SIGTERM
 	equal(t, w.exited(code), 0)
@@ -410,7 +461,7 @@ func TestPrepareExitsOneWhenAUnitFails(t *testing.T) {
 		t.Fatal(err)
 	}
 	equal(t, w.main("--units-dir", dir, "prepare"), 1)
-	contains(t, w.stdout.String(), "game.service: could not prepare it")
+	contains(t, w.stderr.String(), "game.service: could not prepare it")
 	contains(t, w.stdout.String(), "0 closure drop-in(s) written, 1 failed")
 }
 
@@ -445,7 +496,7 @@ func TestRunOverBothSourcesInTheOrderGiven(t *testing.T) {
 	w := newWorld(t)
 	dir := w.unit(".keep", "")
 	code := w.start("-s", "systemd,docker", "--units-dir", dir, "-d", "60")
-	fakes.Await(t, "the loop to wait", func() bool { return strings.Contains(w.stdout.String(), "Reconciling every 60s...") })
+	await.Until(t, "the loop to wait", func() bool { return strings.Contains(w.stdout.String(), "Reconciling every 60s...") })
 	contains(t, w.stdout.String(), "Sources: systemd, docker\n")
 	w.signals <- syscall.SIGTERM
 	equal(t, w.exited(code), 0)

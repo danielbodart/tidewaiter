@@ -186,6 +186,8 @@ pkgs.testers.runNixOSTest {
       with subtest("idle, tidewaiter status says so and exits 0"):
           machine.wait_until_succeeds("runuser -u nobody -- tidewaiter status", timeout=dt.timedelta(seconds=30))
           print(status()[1])
+          # Type=notify: ready, and what it is doing in systemctl status.
+          machine.wait_until_succeeds("systemctl show -p StatusText --value tidewaiter.service | grep -q '^Idle: 1 unit up to date'", timeout=dt.timedelta(seconds=30))
 
       with subtest("a player shows up in tidewaiter status, which exits 1"):
           machine.succeed("systemd-run --unit=player ${player}")

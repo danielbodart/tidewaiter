@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/danielbodart/gokit/clock"
+	"github.com/danielbodart/gokit/logx"
 	"github.com/danielbodart/gokit/sockdiag"
 	"github.com/danielbodart/tidewaiter/internal/decide"
 	"github.com/danielbodart/tidewaiter/internal/detect"
@@ -41,8 +42,9 @@ type Deps struct {
 	Store     statestore.Store
 	Netns     detect.Netns
 	TCP       health.Prober
-	Log       source.Log
-	Clock     clock.Clock
+	// Silent when nil.
+	Log   logx.Logger
+	Clock clock.Clock
 }
 
 // Source is systemd units whose program lives in a Nix profile, kept on the
@@ -84,6 +86,9 @@ var _ source.Source = (*Source)(nil)
 
 // New is the systemd source.
 func New(deps Deps, options Options) *Source {
+	if deps.Log == nil {
+		deps.Log = logx.Discard
+	}
 	return &Source{
 		deps:    deps,
 		options: options,
@@ -96,7 +101,10 @@ func New(deps Deps, options Options) *Source {
 
 func (s *Source) Name() source.Name { return source.Systemd }
 
-func (s *Source) log(format string, args ...any) { s.deps.Log(fmt.Sprintf(format, args...)) }
+func (s *Source) log(format string, args ...any) { s.deps.Log.Log(fmt.Sprintf(format, args...)) }
+
+// fail is log for what someone should look at.
+func (s *Source) fail(format string, args ...any) { s.deps.Log.Error(fmt.Sprintf(format, args...)) }
 
 func (s *Source) Once(ctx context.Context, pass source.Pass) ([]source.Outcome, error) {
 	if err := s.load(); err != nil {
@@ -110,7 +118,7 @@ func (s *Source) Once(ctx context.Context, pass source.Pass) ([]source.Outcome, 
 	for _, policy := range policies {
 		outcome, err := s.reconcile(ctx, policy, pass)
 		if err != nil {
-			s.log("%s: Error: %s", policy.Unit, err)
+			s.fail("%s: Error: %s", policy.Unit, err)
 			outcome = source.Outcome{Workload: policy.Unit, Action: decide.Action{Kind: decide.Keep, Reason: "errored"}}
 		}
 		outcomes = append(outcomes, outcome)
@@ -192,7 +200,7 @@ func (s *Source) policies() ([]*Policy, error) {
 		policy, warnings := ParsePolicy(file.Text, file.Name)
 		if said, ok := s.files[file.Name]; !ok || said != string(file.Text) {
 			for _, warning := range warnings {
-				s.deps.Log(warning)
+				s.deps.Log.Log(warning)
 			}
 			if policy != nil && declared[policy.Unit] {
 				s.log("%s: %s is already declared by another file; skipping this one", file.Name, policy.Unit)
@@ -492,7 +500,7 @@ func (s *Source) undo(ctx context.Context, policy *Policy, before UnitState, cur
 		return nil
 	}()
 	if err != nil {
-		s.log("%s: undoing the swap itself failed (%s); manual attention needed", unit, err)
+		s.fail("%s: undoing the swap itself failed (%s); manual attention needed", unit, err)
 	}
 }
 
@@ -502,7 +510,7 @@ func (s *Source) undo(ctx context.Context, policy *Policy, before UnitState, cur
 func (s *Source) rollBack(ctx context.Context, policy *Policy, previous int, previousTarget string) {
 	unit, desired, profile := policy.Unit, policy.Desired, policy.Profile
 	if previous == 0 || previousTarget == "" {
-		s.log("%s: there is no earlier generation of %s to roll back to; manual attention needed", unit, profile)
+		s.fail("%s: there is no earlier generation of %s to roll back to; manual attention needed", unit, profile)
 		return
 	}
 	verdict, err := func() (health.Verdict, error) {
@@ -525,11 +533,11 @@ func (s *Source) rollBack(ctx context.Context, policy *Policy, previous int, pre
 	}()
 	switch {
 	case err != nil:
-		s.log("%s: rollback itself failed (%s); manual attention needed", unit, err)
+		s.fail("%s: rollback itself failed (%s); manual attention needed", unit, err)
 	case verdict.Healthy:
 		s.log("%s: rolled back to %s and pinned %s out until the desired version moves on", unit, previousTarget, desired)
 	default:
-		s.log("%s: rolled back to %s, but it is not healthy either (%s); manual attention needed", unit, previousTarget, verdict.Reason)
+		s.fail("%s: rolled back to %s, but it is not healthy either (%s); manual attention needed", unit, previousTarget, verdict.Reason)
 	}
 }
 
@@ -852,7 +860,7 @@ func (s *Source) note(unit, key, message string) {
 		return
 	}
 	s.notes[id] = message
-	s.deps.Log(message)
+	s.deps.Log.Log(message)
 }
 
 func (s *Source) memory(unit string) statestore.UnitMemory {

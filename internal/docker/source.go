@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/danielbodart/gokit/clock"
+	"github.com/danielbodart/gokit/logx"
 	"github.com/danielbodart/tidewaiter/internal/decide"
 	"github.com/danielbodart/tidewaiter/internal/detect"
 	"github.com/danielbodart/tidewaiter/internal/health"
@@ -49,8 +50,9 @@ type Deps struct {
 	// Connects for port-connect.
 	TCP     health.Prober
 	Options Options
-	Log     source.Log
-	Clock   clock.Clock
+	// Silent when nil.
+	Log   logx.Logger
+	Clock clock.Clock
 }
 
 // Source is labelled Docker containers, kept on the digest their tag resolves
@@ -68,7 +70,7 @@ type Source struct {
 	netns    detect.Netns
 	tcp      health.Prober
 	options  Options
-	log      source.Log
+	log      logx.Logger
 	clock    clock.Clock
 
 	// Built once and kept: it remembers each container's previous byte
@@ -122,17 +124,10 @@ type image struct {
 
 // NewSource is a Docker source over deps.
 func NewSource(deps Deps) *Source {
+	// A background pull says how it went on its own goroutine, while a pass
+	// may be speaking: a logx.Logger takes both, a line at a time.
 	if deps.Log == nil {
-		deps.Log = func(string) {}
-	}
-	// A background pull says how it went on its own goroutine, while a pass may
-	// be speaking: their lines are taken one at a time.
-	var speaking sync.Mutex
-	log := deps.Log
-	deps.Log = func(line string) {
-		speaking.Lock()
-		defer speaking.Unlock()
-		log(line)
+		deps.Log = logx.Discard
 	}
 	if deps.Clock == nil {
 		deps.Clock = clock.System{}
@@ -266,7 +261,7 @@ func (s *Source) reconcile(ctx context.Context, container model.RunningContainer
 		if policy.Autoupdate == Local {
 			where = "local image"
 		}
-		s.log(fmt.Sprintf("%s: could not resolve %s digest (%s); leaving it alone", name, where, err))
+		s.log.Log(fmt.Sprintf("%s: could not resolve %s digest (%s); leaving it alone", name, where, err))
 		return keep(where + " unreachable")
 	}
 	if desired == "" {
@@ -288,7 +283,7 @@ func (s *Source) reconcile(ctx context.Context, container model.RunningContainer
 	// touched nothing.
 	running, found, err := s.docker.Image(ctx, container.ImageID)
 	if err != nil {
-		s.log(fmt.Sprintf("%s: could not read the running image digest (%s); leaving it alone", name, err))
+		s.log.Log(fmt.Sprintf("%s: could not read the running image digest (%s); leaving it alone", name, err))
 		return keep("running image digest unreadable")
 	}
 	current := running.Digest
@@ -305,7 +300,7 @@ func (s *Source) reconcile(ctx context.Context, container model.RunningContainer
 	// it as the baseline rather than assume anything about a swap we have no
 	// memory of.
 	if !previous.adopted && current != desired && (previous.previous == nil || previous.previous.digest != current) {
-		s.log(name + ": adopting the running image as the current baseline (no rollback record from a prior run)")
+		s.log.Log(name + ": adopting the running image as the current baseline (no rollback record from a prior run)")
 		previous.adopted = true
 	}
 
@@ -347,7 +342,7 @@ func (s *Source) note(name string, warnings []string) {
 	}
 	s.said[name] = said
 	for _, warning := range warnings {
-		s.log(name + ": " + warning)
+		s.log.Log(name + ": " + warning)
 	}
 }
 
@@ -385,7 +380,7 @@ func (s *Source) sample(ctx context.Context, container model.RunningContainer, p
 	})
 	if err != nil {
 		if say {
-			s.log(fmt.Sprintf("%s: activity detector '%s' failed (%s); assuming busy", container.Spec.Name, policy.Detector, err))
+			s.log.Log(fmt.Sprintf("%s: activity detector '%s' failed (%s); assuming busy", container.Spec.Name, policy.Detector, err))
 		}
 		return detect.Busy
 	}
@@ -398,13 +393,13 @@ func (s *Source) apply(ctx context.Context, action decide.Action, container mode
 	base.idleStreak = idleStreak
 	switch action.Kind {
 	case decide.Defer:
-		s.log(name + ": " + action.Reason)
+		s.log.Log(name + ": " + action.Reason)
 	case decide.Pinned:
 		base.pinned = desired
 	case decide.Update:
-		s.log(name + ": updating - " + action.Reason)
+		s.log.Log(name + ": updating - " + action.Reason)
 		if s.options.DryRun {
-			s.log(name + ": dry run, not touching it")
+			s.log.Log(name + ": dry run, not touching it")
 			return base
 		}
 		return s.update(ctx, container, defaults, policy, base, desired, current)
@@ -436,7 +431,7 @@ func (s *Source) prefetch(ctx context.Context, container model.RunningContainer,
 	s.prefetches[name] = desired
 	s.mu.Unlock()
 
-	s.log(fmt.Sprintf("%s: prefetching %s in the background so the swap is ready when the tide goes out", name, ref))
+	s.log.Log(fmt.Sprintf("%s: prefetching %s in the background so the swap is ready when the tide goes out", name, ref))
 	s.pulling.Go(func() {
 		// Not the pass's to cancel: the pull outlives it, bounded by
 		// PullTimeout alone.
@@ -446,7 +441,7 @@ func (s *Source) prefetch(ctx context.Context, container model.RunningContainer,
 				delete(s.prefetches, name)
 			}
 			s.mu.Unlock()
-			s.log(fmt.Sprintf("%s: prefetch of %s failed (%s); will retry", name, ref, err))
+			s.log.Log(fmt.Sprintf("%s: prefetch of %s failed (%s); will retry", name, ref, err))
 		}
 	})
 }
@@ -488,7 +483,7 @@ func (s *Source) update(ctx context.Context, container model.RunningContainer, d
 	spec := container.Spec
 	name := spec.Name
 	if reason := Unrecreatable(spec); reason != "" {
-		s.log(name + ": " + reason)
+		s.log.Log(name + ": " + reason)
 		return base
 	}
 	// Without the old image's defaults there is no telling the container's own
@@ -498,7 +493,7 @@ func (s *Source) update(ctx context.Context, container model.RunningContainer, d
 	// uses it, so this is an anomaly worth saying, not a case to guess at; it
 	// is refused like an anonymous volume, and pins nothing.
 	if defaults == nil {
-		s.log(fmt.Sprintf("%s: the image it was created from (%s) is no longer here, so which of its settings "+
+		s.log.Log(fmt.Sprintf("%s: the image it was created from (%s) is no longer here, so which of its settings "+
 			"are its own and which that image's cannot be told; deferring rather than carry the old image's "+
 			"defaults onto the new one", name, container.ImageID))
 		return base
@@ -508,7 +503,7 @@ func (s *Source) update(ctx context.Context, container model.RunningContainer, d
 	// the moment of a swap rather than every idle pass, and not a refusal -
 	// it works as long as the other container is stable.
 	if strings.HasPrefix(spec.NetworkMode, "container:") {
-		s.log(fmt.Sprintf("%s: network mode is '%s', which shares another container's netns; "+
+		s.log.Log(fmt.Sprintf("%s: network mode is '%s', which shares another container's netns; "+
 			"recreating it verbatim - if that container was replaced the reference may be stale", name, spec.NetworkMode))
 	}
 
@@ -536,14 +531,14 @@ func (s *Source) update(ctx context.Context, container model.RunningContainer, d
 	// outright on an air-gapped or build-on-host box.
 	if policy.Autoupdate == Registry {
 		if err := s.docker.Pull(ctx, spec.Image, s.authFor(spec.Image)); err != nil {
-			s.log(fmt.Sprintf("%s: FAILED to pull %s (%s); leaving it running", name, spec.Image, err))
+			s.log.Log(fmt.Sprintf("%s: FAILED to pull %s (%s); leaving it running", name, spec.Image, err))
 			return base
 		}
 	}
 
 	done, err := s.run(ctx, plan.Swap)
 	if err != nil {
-		s.log(fmt.Sprintf("%s: FAILED during swap (%s); undoing what was done", name, err))
+		s.log.Log(fmt.Sprintf("%s: FAILED during swap (%s); undoing what was done", name, err))
 		s.undo(ctx, name, done)
 		failures := 1
 		if base.failing == desired {
@@ -552,7 +547,7 @@ func (s *Source) update(ctx context.Context, container model.RunningContainer, d
 		next := base
 		next.previous, next.swapFailures, next.failing = leaving, failures, desired
 		if failures >= source.MaxSwapFailures {
-			s.log(fmt.Sprintf("%s: swap has failed %d times running for %s; pinning it out until the tag moves on", name, failures, desired))
+			s.log.Log(fmt.Sprintf("%s: swap has failed %d times running for %s; pinning it out until the tag moves on", name, failures, desired))
 			next.pinned = desired
 		}
 		return next
@@ -561,21 +556,21 @@ func (s *Source) update(ctx context.Context, container model.RunningContainer, d
 	verdict := s.gate(ctx, name, policy)
 	if verdict.Healthy {
 		if err := s.steps(ctx, plan.Commit); err != nil {
-			s.log(fmt.Sprintf("%s: updated, but cleaning up the old container failed (%s)", name, err))
+			s.log.Log(fmt.Sprintf("%s: updated, but cleaning up the old container failed (%s)", name, err))
 		}
 		kept := base.kept
 		if leaving != nil {
 			kept = s.prune(ctx, name, leaving, base.kept, policy.KeepImages)
 		}
-		s.log(fmt.Sprintf("%s: updated to %s and it is healthy", name, desired))
+		s.log.Log(fmt.Sprintf("%s: updated to %s and it is healthy", name, desired))
 		return memory{idleStreak: base.idleStreak, kept: kept, previous: leaving, adopted: true}
 	}
 
 	// A genuinely unhealthy new image after a complete swap: the one case
 	// that both rolls fully back and pins the tag out.
-	s.log(fmt.Sprintf("%s: new image is unhealthy (%s); rolling back", name, verdict.Reason))
+	s.log.Log(fmt.Sprintf("%s: new image is unhealthy (%s); rolling back", name, verdict.Reason))
 	s.undo(ctx, name, done)
-	s.log(name + ": rolled back to the previous image and pinned it out until the tag moves on")
+	s.log.Log(name + ": rolled back to the previous image and pinned it out until the tag moves on")
 	next := base
 	next.pinned, next.previous = desired, leaving
 	return next
@@ -623,7 +618,7 @@ func (s *Source) undo(ctx context.Context, name string, done progress) {
 		steps = append(steps, Step{Op: Start, Container: name})
 	}
 	if err := s.steps(ctx, steps); err != nil {
-		s.log(fmt.Sprintf("%s: rollback itself failed (%s); manual attention needed", name, err))
+		s.log.Error(fmt.Sprintf("%s: rollback itself failed (%s); manual attention needed", name, err))
 	}
 }
 
@@ -667,7 +662,7 @@ func (s *Source) prune(ctx context.Context, name string, superseded *image, kept
 	for _, digest := range history[keepImages:] {
 		reference := repository(superseded.ref) + "@" + string(digest)
 		if err := s.docker.RemoveImage(ctx, reference); err != nil {
-			s.log(fmt.Sprintf("%s: could not prune image %s (%s)", name, digest, err))
+			s.log.Log(fmt.Sprintf("%s: could not prune image %s (%s)", name, digest, err))
 		}
 	}
 	return slices.Clone(history[:keepImages])

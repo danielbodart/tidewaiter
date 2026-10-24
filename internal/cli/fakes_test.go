@@ -51,6 +51,8 @@ type fakeDocker struct {
 	hold chan struct{}
 	// When set, a listing fails with it.
 	failure string
+	// The User-Agent of every request.
+	agents []string
 }
 
 func newFakeDocker() *fakeDocker {
@@ -88,8 +90,17 @@ var (
 	image   = regexp.MustCompile(`^(?:/v[0-9.]+)?/images/(.+)/json$`)
 )
 
+func (d *fakeDocker) userAgents() []string {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return slices.Clone(d.agents)
+}
+
 func (d *fakeDocker) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	path := r.URL.Path
+	d.mu.Lock()
+	d.agents = append(d.agents, r.Header.Get("User-Agent"))
+	d.mu.Unlock()
 	switch {
 	case r.Method == http.MethodGet && listing.MatchString(path):
 		var filters map[string][]string

@@ -4,9 +4,9 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/danielbodart/gokit/await"
 	"github.com/danielbodart/gokit/dbusx"
 	"github.com/danielbodart/gokit/dbusx/dbustest"
-	"github.com/danielbodart/tidewaiter/internal/fakes"
 	"github.com/godbus/dbus/v5"
 )
 
@@ -234,7 +234,7 @@ func TestAsksLogindToRebootNotInteractively(t *testing.T) {
 	assertEqual(t, reboot.Body, []any{false})
 	// On a connection of its own, closed after: no subscription to systemd.
 	assertEqual(t, fake.Calls("Subscribe"), nil)
-	fakes.Await(t, "the reboot's connection to close", func() bool { return fake.Connected() == 0 })
+	await.Until(t, "the reboot's connection to close", func() bool { return fake.Connected() == 0 })
 }
 
 func TestARebootRefusalIsAnErrorForTheDaemonToLog(t *testing.T) {
@@ -275,7 +275,7 @@ func TestToUnitStateReadsAUnitThatIsNotRunningAsHavingNoPidCgroupOrResult(t *tes
 // on a restart that has had its reply.
 func waitingOn(t *testing.T, bus *DBus, n int) {
 	t.Helper()
-	fakes.Await(t, "the restart to wait for its job", func() bool {
+	await.Until(t, "the restart to wait for its job", func() bool {
 		bus.mu.Lock()
 		c := bus.shared
 		bus.mu.Unlock()

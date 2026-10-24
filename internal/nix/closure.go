@@ -3,12 +3,13 @@ package nix
 import (
 	"context"
 	"errors"
-	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
+
+	"github.com/danielbodart/gokit/atomicfile"
 )
 
 // ClosureBinder lets a confined unit see the program its profile points at.
@@ -83,23 +84,17 @@ type NixClosureBinder struct {
 	Run        Runner
 	// The nix-store to run; "nix-store" on PATH when empty.
 	NixStore string
-	// Names this process's temporary files, so two writers never share one.
-	PID int
 }
 
 var _ ClosureBinder = NixClosureBinder{}
 
 func (b NixClosureBinder) Bind(ctx context.Context, unit, profile, target string) error {
 	file := b.file(unit)
-	temporary, err := b.write(ctx, file, profile, target)
+	text, err := b.text(ctx, file, target, profile)
 	if err != nil {
 		return err
 	}
-	if err := os.Rename(temporary, file); err != nil {
-		os.Remove(temporary)
-		return err
-	}
-	return nil
+	return atomicfile.Write(file, text, 0o644)
 }
 
 func (b NixClosureBinder) Ensure(ctx context.Context, unit, profile, target string) (bool, error) {
@@ -113,23 +108,21 @@ func (b NixClosureBinder) Ensure(ctx context.Context, unit, profile, target stri
 		return false, nil
 	}
 
-	temporary, err := b.write(ctx, file, profile, target)
+	text, err := b.text(ctx, file, target, profile)
 	if err != nil {
 		return false, err
 	}
 	if present {
 		// For another profile: the declaration moved, and what was bound is
 		// no use.
-		if err := os.Rename(temporary, file); err != nil {
-			os.Remove(temporary)
+		if err := atomicfile.Write(file, text, 0o644); err != nil {
 			return false, err
 		}
 		return true, nil
 	}
-	// None there: link() rather than rename(), so a drop-in the daemon wrote
-	// in the meantime wins.
-	defer os.Remove(temporary)
-	if err := os.Link(temporary, file); err != nil {
+	// None there: created only if it still is not, so a drop-in the daemon
+	// wrote in the meantime wins.
+	if err := atomicfile.Create(file, text, 0o644); err != nil {
 		if errors.Is(err, fs.ErrExist) {
 			return false, nil
 		}
@@ -146,25 +139,17 @@ func (b NixClosureBinder) file(unit string) string {
 	return filepath.Join(dir, unit+".d", ClosureDropIn)
 }
 
-// write puts the drop-in's text in a temporary file of this process's own,
-// ready to move into place.
-func (b NixClosureBinder) write(ctx context.Context, file, profile, target string) (string, error) {
+// text is the drop-in binding target's closure for profile, with the
+// directory it goes in made ready for it.
+func (b NixClosureBinder) text(ctx context.Context, file, target, profile string) ([]byte, error) {
 	closure, err := b.requisites(ctx, target)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	if err := os.MkdirAll(filepath.Dir(file), 0o755); err != nil {
-		return "", err
+		return nil, err
 	}
-	pid := b.PID
-	if pid == 0 {
-		pid = os.Getpid()
-	}
-	temporary := fmt.Sprintf("%s.%d.tmp", file, pid)
-	if err := os.WriteFile(temporary, []byte(ClosureDropInText(profile, closure)), 0o644); err != nil {
-		return "", err
-	}
-	return temporary, nil
+	return []byte(ClosureDropInText(profile, closure)), nil
 }
 
 func (b NixClosureBinder) requisites(ctx context.Context, target string) ([]string, error) {

@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/danielbodart/tidewaiter/internal/fakes"
+	"github.com/danielbodart/gokit/logx/logtest"
 )
 
 type world struct {
@@ -14,7 +14,7 @@ type world struct {
 	profiles *fakeProfiles
 	closure  *fakeClosure
 	systemd  *fakeSystemd
-	log      *fakes.Log
+	log      *logtest.Logger
 }
 
 func newWorld() *world {
@@ -25,13 +25,13 @@ func newWorld() *world {
 		profiles: newFakeProfiles(journal),
 		closure:  newFakeClosure(journal),
 		systemd:  newFakeSystemd(journal),
-		log:      &fakes.Log{},
+		log:      &logtest.Logger{},
 	}
 }
 
 func (w *world) prepare(t *testing.T) Prepared {
 	t.Helper()
-	prepared, err := Prepare(ctx, PrepareDeps{Units: w.units, Profiles: w.profiles, Closure: w.closure, Systemd: w.systemd, Log: w.log.Line})
+	prepared, err := Prepare(ctx, PrepareDeps{Units: w.units, Profiles: w.profiles, Closure: w.closure, Systemd: w.systemd, Log: w.log})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -103,7 +103,7 @@ func TestPrepareCarriesOnPastAUnitThatFailsAndReportsIt(t *testing.T) {
 	prepared := w.prepare(t)
 	assertEqual(t, prepared.Failed, []string{"a.service"})
 	assertEqual(t, prepared.Seeded, []string{"b.service"})
-	if !w.log.Contains("a.service: could not prepare it (cannot connect") {
+	if !w.log.ErrorContains("a.service: could not prepare it (cannot connect") {
 		t.Fatal(w.log.Text())
 	}
 }
@@ -113,7 +113,7 @@ func TestPrepareFailsEveryUnitAReloadThatFailsWasFor(t *testing.T) {
 	w.systemd.reloadFails = errors.New("no bus")
 	w.units.declare("game.service", map[string]any{"desired": v1, "profile": profile, "bindClosure": true})
 	assertEqual(t, w.prepare(t).Failed, []string{"game.service"})
-	if !w.log.Contains("Error: wrote the closure drop-ins but could not reload systemd (no bus)") {
+	if !w.log.ErrorContains("Error: wrote the closure drop-ins but could not reload systemd (no bus)") {
 		t.Fatal(w.log.Text())
 	}
 }
@@ -133,7 +133,7 @@ func (unreadable) Read() ([]UnitFile, error) { return nil, errors.New("permissio
 
 func TestPrepareFailsWhenTheUnitsDirectoryCannotBeRead(t *testing.T) {
 	w := newWorld()
-	_, err := Prepare(ctx, PrepareDeps{Units: unreadable{}, Profiles: w.profiles, Closure: w.closure, Systemd: w.systemd, Log: w.log.Line})
+	_, err := Prepare(ctx, PrepareDeps{Units: unreadable{}, Profiles: w.profiles, Closure: w.closure, Systemd: w.systemd, Log: w.log})
 	if err == nil {
 		t.Fatal("no error")
 	}

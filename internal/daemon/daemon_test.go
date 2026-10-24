@@ -6,10 +6,13 @@ import (
 	"reflect"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/danielbodart/gokit/await"
 	"github.com/danielbodart/gokit/clock"
+	"github.com/danielbodart/gokit/logx/logtest"
 	"github.com/danielbodart/tidewaiter/internal/decide"
 	"github.com/danielbodart/tidewaiter/internal/detect"
 	"github.com/danielbodart/tidewaiter/internal/fakes"
@@ -35,10 +38,47 @@ type harness struct {
 	sources   []*fakes.Source
 	status    *fakes.Status
 	conntrack *fakes.Conntrack
-	log       *fakes.Log
+	log       *logtest.Logger
 	check     *fakes.BootCheck
 	rebooter  *fakes.Rebooter
 	clock     *clock.Stopped
+	systemd   *notifications
+}
+
+// notifications is what systemd is told, one sd_notify each, failing with
+// err while it is set.
+type notifications struct {
+	mu   sync.Mutex
+	sent []string
+	err  error
+}
+
+func (n *notifications) notify(states ...string) error {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if n.err != nil {
+		return n.err
+	}
+	n.sent = append(n.sent, strings.Join(states, "\n"))
+	return nil
+}
+
+func (n *notifications) failWith(err error) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.err = err
+}
+
+func (n *notifications) told() []string {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return slices.Clone(n.sent)
+}
+
+func (n *notifications) clear() {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.sent = nil
 }
 
 func newHarness(t *testing.T, names ...source.Name) *harness {
@@ -46,10 +86,11 @@ func newHarness(t *testing.T, names ...source.Name) *harness {
 	h := &harness{
 		status:    &fakes.Status{},
 		conntrack: &fakes.Conntrack{},
-		log:       &fakes.Log{},
+		log:       &logtest.Logger{},
 		check:     &fakes.BootCheck{},
 		rebooter:  &fakes.Rebooter{},
 		clock:     clock.NewStopped(time.Date(2026, 10, 23, 4, 30, 0, 0, time.UTC)),
+		systemd:   &notifications{},
 	}
 	var sources []source.Source
 	for _, name := range names {
@@ -65,9 +106,10 @@ func newHarness(t *testing.T, names ...source.Name) *harness {
 		Sources:    sources,
 		Conntrack:  h.conntrack,
 		Options:    Defaults,
-		Log:        h.log.Line,
+		Log:        h.log,
 		Status:     h.status,
 		AutoReboot: &AutoReboot{Window: window, Label: "03:00-05:00", Check: h.check, Rebooter: h.rebooter},
+		Notify:     h.systemd.notify,
 		Clock:      h.clock,
 	})
 	return h
@@ -190,7 +232,7 @@ func TestASourceThatFailsDoesNotStopTheOtherAndTheErrorStillSurfaces(t *testing.
 	if len(h.sources[1].Passes()) != 1 {
 		t.Error("the other source did not run")
 	}
-	if !h.log.Contains("docker: Error: docker socket gone") {
+	if !h.log.ErrorContains("docker: Error: docker socket gone") {
 		t.Errorf("logged %q", h.log.Lines())
 	}
 }
@@ -298,7 +340,7 @@ func TestTheTickKeepsTheStatusFreshWhileALongPassHoldsASwap(t *testing.T) {
 	stop := h.run(t)
 	defer stop()
 	defer close(release)
-	fakes.Await(t, "the pass to start", func() bool { return len(h.sources[0].Passes()) == 1 })
+	await.Until(t, "the pass to start", func() bool { return len(h.sources[0].Passes()) == 1 })
 
 	// Only the tick loop waits on the clock; the pass loop is in the pass. A
 	// tick queued behind the pass would never wait again, so bound the wait.
@@ -419,8 +461,8 @@ func TestRunWritesTheStatusAndClearsItOnTheWayOut(t *testing.T) {
 	h.sources[0].Report(source.Outcome{Workload: "bedrock.service", Action: deferred, Busy: busy})
 
 	stop := h.run(t)
-	fakes.Await(t, "the first pass", func() bool { return len(h.sources[0].Passes()) == 1 })
-	fakes.Await(t, "its status", func() bool {
+	await.Until(t, "the first pass", func() bool { return len(h.sources[0].Passes()) == 1 })
+	await.Until(t, "its status", func() bool {
 		last, ok := h.status.Last()
 		return ok && slices.Equal(last.Busy, []string{"bedrock.service"})
 	})
@@ -435,20 +477,20 @@ func TestRunPassesEveryIntervalAndTicksInBetween(t *testing.T) {
 	h := newHarness(t, source.Systemd)
 	stop := h.run(t)
 	defer stop()
-	fakes.Await(t, "the first pass", func() bool { return len(h.sources[0].Passes()) == 1 })
+	await.Until(t, "the first pass", func() bool { return len(h.sources[0].Passes()) == 1 })
 
 	// The pass loop and the tick loop each waiting on the clock.
 	if err := h.clock.BlockUntil(ctx, 2); err != nil {
 		t.Fatal(err)
 	}
 	h.clock.Advance(Defaults.ActivityInterval)
-	fakes.Await(t, "a tick", func() bool { return len(h.sources[0].Ticks()) == 1 })
+	await.Until(t, "a tick", func() bool { return len(h.sources[0].Ticks()) == 1 })
 	if len(h.sources[0].Passes()) != 1 {
 		t.Error("a tick ran a pass")
 	}
 
 	h.clock.Advance(Defaults.Interval - Defaults.ActivityInterval)
-	fakes.Await(t, "the second pass", func() bool { return len(h.sources[0].Passes()) == 2 })
+	await.Until(t, "the second pass", func() bool { return len(h.sources[0].Passes()) == 2 })
 	if !h.log.Contains("Reconciling every 300s...") {
 		t.Errorf("logged %q", h.log.Lines())
 	}
@@ -471,7 +513,7 @@ func TestRunFinishesThePassInFlightBeforeReturning(t *testing.T) {
 		h.daemon.Run(c)
 		close(done)
 	}()
-	fakes.Await(t, "the pass to start", func() bool { return len(h.sources[0].Passes()) == 1 })
+	await.Until(t, "the pass to start", func() bool { return len(h.sources[0].Passes()) == 1 })
 	cancel()
 	select {
 	case <-done:
@@ -658,7 +700,7 @@ func TestARebootNeverHappensFromAPassThatFailed(t *testing.T) {
 	h := ready(t)
 	h.sources[0].FailWith(errors.New("bus gone"))
 	stop := h.run(t)
-	fakes.Await(t, "the pass", func() bool { return h.log.Contains("Error: bus gone") })
+	await.Until(t, "the pass", func() bool { return h.log.ErrorContains("Error: bus gone") })
 	stop()
 	if h.rebooter.Reboots() != 0 {
 		t.Error("rebooted")
@@ -668,7 +710,7 @@ func TestARebootNeverHappensFromAPassThatFailed(t *testing.T) {
 func TestRunRebootsAtTheEndOfAPass(t *testing.T) {
 	h := ready(t)
 	stop := h.run(t)
-	fakes.Await(t, "the reboot", func() bool { return h.rebooter.Reboots() == 1 })
+	await.Until(t, "the reboot", func() bool { return h.rebooter.Reboots() == 1 })
 	stop()
 }
 
@@ -690,5 +732,108 @@ func TestWithNoStatusAndNoRebootRunDoesNotTick(t *testing.T) {
 	<-done
 	if len(s.Ticks()) != 0 {
 		t.Error("ticked")
+	}
+}
+
+// systemd
+
+func TestAPassTellsSystemdWhatItIsSwappingThenWhatItConcluded(t *testing.T) {
+	h := newHarness(t, source.Systemd)
+	h.sources[0].Hold("bedrock.service")
+	h.sources[0].Report(source.Outcome{Workload: "bedrock.service", Action: keep, Busy: idle, Settled: true})
+
+	h.once(t)
+
+	equal(t, h.systemd.told(), []string{
+		"STATUS=Swapping bedrock.service",
+		"STATUS=Idle: 1 unit up to date, nothing to do",
+	})
+}
+
+func TestSystemdHearsWhatIsInUseAndAFailedPass(t *testing.T) {
+	h := newHarness(t, source.Systemd)
+	h.sources[0].Report(source.Outcome{Workload: "bedrock.service", Action: deferred, Busy: busy})
+	h.once(t)
+	h.sources[0].FailWith(errors.New("bus gone"))
+	h.daemon.Once(ctx)
+
+	equal(t, h.systemd.told(), []string{
+		"STATUS=1 deferred, 0 up to date; in use: bedrock.service",
+		"STATUS=The last pass failed: bus gone; in use: bedrock.service",
+	})
+}
+
+func TestATickTellsSystemdOnlyWhatChanged(t *testing.T) {
+	h := newHarness(t, source.Systemd)
+	h.sources[0].Report(source.Outcome{Workload: "bedrock.service", Action: keep, Busy: idle, Settled: true})
+	h.once(t)
+	h.systemd.clear()
+
+	h.daemon.Tick(ctx)
+	equal(t, h.systemd.told(), []string(nil))
+
+	h.sources[0].Active(source.Activity{Workload: "bedrock.service", Busy: true})
+	h.daemon.Tick(ctx)
+	equal(t, h.systemd.told(), []string{"STATUS=1 unit up to date, nothing to do; in use: bedrock.service"})
+}
+
+func TestSystemdHearsWhenARebootIsNeededAndWhatItWaitsFor(t *testing.T) {
+	h := newHarness(t, source.Systemd)
+	h.check.Need("kernel changed since boot")
+	h.sources[0].Report(source.Outcome{Workload: "bedrock.service", Action: deferred, Busy: busy})
+	h.once(t)
+	h.daemon.ConsiderReboot(ctx)
+
+	told := h.systemd.told()
+	equal(t, told[len(told)-1], "STATUS=1 deferred, 0 up to date; in use: bedrock.service; reboot needed, kernel changed since boot: waiting: bedrock.service in use")
+}
+
+// Ready before the first pass: a pass can swap for minutes, and systemctl
+// start - and a NixOS switch - must not wait on it.
+func TestRunIsReadyBeforeItsFirstPassAndSaysWhenItIsStopping(t *testing.T) {
+	h := newHarness(t, source.Systemd)
+	release := make(chan struct{})
+	h.sources[0].Hold("bedrock.service")
+	h.sources[0].During(func(context.Context) { <-release })
+	h.sources[0].Report(source.Outcome{Workload: "bedrock.service", Action: keep, Busy: idle, Settled: true})
+
+	c, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+	go func() {
+		h.daemon.Run(c)
+		close(done)
+	}()
+	await.Until(t, "the swap to start", func() bool { return len(h.systemd.told()) == 2 })
+	equal(t, h.systemd.told(), []string{"READY=1\nSTATUS=Starting the first pass", "STATUS=Swapping bedrock.service"})
+
+	cancel()
+	await.Until(t, "systemd to hear it is stopping", func() bool { return len(h.systemd.told()) == 3 })
+	close(release)
+	<-done
+	// The pass that finished after it says nothing more.
+	equal(t, h.systemd.told()[2:], []string{"STOPPING=1\nSTATUS=Stopping once the swap of bedrock.service is done"})
+}
+
+func TestSystemdThatCannotBeToldIsWarnedAboutOnce(t *testing.T) {
+	h := newHarness(t, source.Systemd)
+	h.systemd.failWith(errors.New("sd_notify: connection refused"))
+	h.sources[0].Report(source.Outcome{Workload: "bedrock.service", Action: deferred, Busy: busy})
+	h.once(t)
+	h.sources[0].Report(source.Outcome{Workload: "bedrock.service", Action: keep, Busy: idle})
+	h.once(t)
+
+	warnings := 0
+	for _, line := range h.log.Lines() {
+		if strings.Contains(line, "could not tell systemd") {
+			warnings++
+		}
+	}
+	equal(t, warnings, 1)
+}
+
+func equal[T any](t *testing.T, got, want T) {
+	t.Helper()
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("got %#v, want %#v", got, want)
 	}
 }

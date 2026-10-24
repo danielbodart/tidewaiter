@@ -19,7 +19,7 @@ buildGo127Module {
   # godbus, gokit, gokit/dbusx and the golang.org/x/sys godbus needs, as
   # `go mod vendor` lays them out. A go.sum change needs it recomputed: build once with
   # lib.fakeHash and take the hash Nix reports.
-  vendorHash = "sha256-CaQUlxAs8txuSDuOCwXhwn9ataSh4twqHlBVgjoK3JQ=";
+  vendorHash = "sha256-AnUovKOpEnvpLb/qKdAoGIB9VB7VxrXMovBCNlVIw3A=";
 
   nativeBuildInputs = [ makeWrapper ];
 

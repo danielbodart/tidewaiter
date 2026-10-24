@@ -10,6 +10,7 @@ import (
 	"strings"
 	"syscall"
 
+	"github.com/danielbodart/gokit/httpx"
 	"github.com/danielbodart/tidewaiter/internal/daemon"
 	"github.com/danielbodart/tidewaiter/internal/docker"
 	"github.com/danielbodart/tidewaiter/internal/nix"
@@ -29,7 +30,7 @@ func Main(ctx context.Context, c *Container) int {
 
 	config, err := Parse(c.Args, c.Env)
 	if err != nil {
-		c.Fail(fmt.Sprintf("Error: %s\n\n%s", err, Usage))
+		c.Log.Error(fmt.Sprintf("Error: %s\n\n%s", err, Usage))
 		return 2
 	}
 	if config.Version {
@@ -47,16 +48,16 @@ func Main(ctx context.Context, c *Container) int {
 		if err != nil {
 			// Not 1, which says something is busy: a status that cannot be
 			// read says nothing either way.
-			c.Fail("Error: " + err.Error())
+			c.Log.Error("Error: " + err.Error())
 			return status.Unknown
 		}
 		return code
 	}
 
-	c.Note("Tidewaiter " + version.Version)
+	c.Log.Log("Tidewaiter " + version.Version)
 	code, err := run(ctx, c, config)
 	if err != nil {
-		c.Fail("Error: " + err.Error())
+		c.Log.Error("Error: " + err.Error())
 		return 1
 	}
 	return code
@@ -82,7 +83,7 @@ func run(ctx context.Context, c *Container, config Config) (int, error) {
 		}
 	}()
 	profiles := nix.NixProfiles{Run: c.Nix}
-	closure := nix.NixClosureBinder{RuntimeDir: c.RuntimeDir, Run: c.Nix, PID: c.PID}
+	closure := nix.NixClosureBinder{RuntimeDir: c.RuntimeDir, Run: c.Nix}
 	units := systemd.Dir{Path: config.UnitsDir}
 
 	if config.Command == "prepare" {
@@ -91,12 +92,12 @@ func run(ctx context.Context, c *Container, config Config) (int, error) {
 			return 0, err
 		}
 		prepared, err := systemd.Prepare(ctx, systemd.PrepareDeps{
-			Units: units, Profiles: profiles, Closure: closure, Systemd: reloader, Log: c.Note,
+			Units: units, Profiles: profiles, Closure: closure, Systemd: reloader, Log: c.Log,
 		})
 		if err != nil {
 			return 0, err
 		}
-		c.Note(fmt.Sprintf("Prepared %s: %d profile(s) created, %d closure drop-in(s) written, %d failed",
+		c.Log.Log(fmt.Sprintf("Prepared %s: %d profile(s) created, %d closure drop-in(s) written, %d failed",
 			config.UnitsDir, len(prepared.Seeded), len(prepared.Bound), len(prepared.Failed)))
 		if len(prepared.Failed) > 0 {
 			return 1, nil
@@ -104,6 +105,9 @@ func run(ctx context.Context, c *Container, config Config) (int, error) {
 		return 0, nil
 	}
 
+	// Registries in particular want to know who is asking: Docker Hub tells
+	// its rate limits apart by it.
+	identified := httpx.Identifying("tidewaiter/" + version.Version)
 	var sources []source.Source
 	for _, name := range config.Sources {
 		switch name {
@@ -116,13 +120,13 @@ func run(ctx context.Context, c *Container, config Config) (int, error) {
 			options.Label = config.Label
 			options.DryRun = config.DryRun
 			sources = append(sources, docker.NewSource(docker.Deps{
-				Docker:   docker.NewClient(c.DockerTransport(config.Socket)),
-				Registry: registry.New(c.RegistryTransport, auth, c.Clock),
+				Docker:   docker.NewClient(httpx.Decorate(c.DockerTransport(config.Socket), identified)),
+				Registry: registry.New(httpx.Decorate(c.RegistryTransport, identified), auth, c.Clock),
 				Auth:     auth,
 				Netns:    c.Netns,
 				TCP:      c.TCP,
 				Options:  options,
-				Log:      c.Note,
+				Log:      c.Log,
 				Clock:    c.Clock,
 			}))
 
@@ -141,7 +145,7 @@ func run(ctx context.Context, c *Container, config Config) (int, error) {
 				Store:     statestore.File{Path: filepath.Join(config.StateDir, statestore.FileName)},
 				Netns:     c.Netns,
 				TCP:       c.TCP,
-				Log:       c.Note,
+				Log:       c.Log,
 				Clock:     c.Clock,
 			}, systemd.Options{DryRun: config.DryRun, HealthPoll: docker.DefaultOptions.HealthPoll}))
 		}
@@ -158,13 +162,13 @@ func run(ctx context.Context, c *Container, config Config) (int, error) {
 		}
 		switch {
 		case len(lines) > 0:
-			c.Note(strings.Join(lines, "\n"))
+			c.Log.Log(strings.Join(lines, "\n"))
 		case len(config.Sources) > 1:
-			c.Note("Nothing is opted in.")
+			c.Log.Log("Nothing is opted in.")
 		case config.Sources[0] == source.Docker:
-			c.Note("No opted-in containers.")
+			c.Log.Log("No opted-in containers.")
 		default:
-			c.Note("No managed units.")
+			c.Log.Log("No managed units.")
 		}
 		return 0, nil
 	}
@@ -176,12 +180,15 @@ func run(ctx context.Context, c *Container, config Config) (int, error) {
 		Sources:   sources,
 		Conntrack: c.Conntrack,
 		Options:   config.Daemon,
-		Log:       c.Note,
+		Log:       c.Log,
 		Status:    status.None,
 		Clock:     c.Clock,
 	}
 	if running && config.StatusFile != "" {
-		deps.Status = status.File{Path: config.StatusFile, PID: c.PID}
+		deps.Status = status.File{Path: config.StatusFile}
+	}
+	if running {
+		deps.Notify = c.Notify
 	}
 	if running && config.AutoRebootWindow != "" {
 		rebooter, err := c.Rebooter(c.Env)
@@ -199,12 +206,12 @@ func run(ctx context.Context, c *Container, config Config) (int, error) {
 		}
 	}
 	tidewaiter := daemon.New(deps)
-	c.Note("Sources: " + joinNames(config.Sources))
+	c.Log.Log("Sources: " + joinNames(config.Sources))
 	if deps.AutoReboot != nil {
-		c.Note(fmt.Sprintf("Rebooting automatically when needed, between %s, once nothing is in use", config.AutoRebootWindow))
+		c.Log.Log(fmt.Sprintf("Rebooting automatically when needed, between %s, once nothing is in use", config.AutoRebootWindow))
 	}
 	if config.DryRun {
-		c.Note("Dry run - nothing will be changed")
+		c.Log.Log("Dry run - nothing will be changed")
 	}
 
 	if config.Command == "check" {
@@ -237,7 +244,7 @@ func untilInterrupted(ctx context.Context, c *Container) (context.Context, func(
 		for {
 			select {
 			case received := <-signals:
-				c.Note(fmt.Sprintf("\nReceived %s, shutting down...", signalName(received)))
+				c.Log.Log(fmt.Sprintf("\nReceived %s, shutting down...", signalName(received)))
 				cancel()
 			case <-quit:
 				return

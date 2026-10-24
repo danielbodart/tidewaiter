@@ -1,3 +1,8 @@
+// Package fakes is the far ends of Tidewaiter, in memory, for any package's tests:
+// a source, a status file, a boot check and a rebooter, the conntrack table, a
+// netns's socket tables and a TCP prober. Time is gokit/clock's Stopped, a log
+// is gokit/logx/logtest's Logger, and waiting on a goroutine is gokit/await's
+// Until - never a fake here.
 package fakes
 
 import (

@@ -14,6 +14,7 @@ import (
 
 	"github.com/danielbodart/gokit/clock"
 	"github.com/danielbodart/gokit/httpx"
+	"github.com/danielbodart/gokit/logx/logtest"
 	"github.com/danielbodart/tidewaiter/internal/decide"
 	"github.com/danielbodart/tidewaiter/internal/detect"
 	"github.com/danielbodart/tidewaiter/internal/fakes"
@@ -161,7 +162,7 @@ type swapped struct {
 	moved         model.Digest
 	before, after model.RunningContainer
 	action        decide.Kind
-	log           *fakes.Log
+	log           *logtest.Logger
 	source        *Source
 }
 
@@ -184,7 +185,7 @@ func swapReally(t *testing.T, change func(*model.ContainerSpec)) swapped {
 	tag("alpine:latest")
 	t.Cleanup(func() { client.RemoveImage(context.Background(), "tw-e2e-app:latest") })
 
-	s := swapped{client: client, name: e2eName(t, client, "swap"), log: &fakes.Log{}}
+	s := swapped{client: client, name: e2eName(t, client, "swap"), log: &logtest.Logger{}}
 	created := e2eSpec(s.name, "tw-e2e-app:latest", freePort(t))
 	created.Labels[HealthTimeoutLabel] = "4"
 	change(&created)
@@ -205,7 +206,7 @@ func swapReally(t *testing.T, change func(*model.ContainerSpec)) swapped {
 	options := DefaultOptions
 	options.Label = e2eLabel
 	options.HealthPoll = 250 * time.Millisecond
-	s.source = NewSource(Deps{Docker: client, Netns: &fakes.Netns{}, TCP: &fakes.Prober{}, Options: options, Log: s.log.Line, Clock: clock.System{}})
+	s.source = NewSource(Deps{Docker: client, Netns: &fakes.Netns{}, TCP: &fakes.Prober{}, Options: options, Log: s.log, Clock: clock.System{}})
 	s.action = s.pass(t)
 	if s.after, err = client.Inspect(ctx, s.name); err != nil {
 		t.Fatal(err)

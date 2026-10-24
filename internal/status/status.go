@@ -20,6 +20,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/danielbodart/gokit/atomicfile"
 	"github.com/danielbodart/tidewaiter/internal/source"
 )
 
@@ -110,13 +111,10 @@ type none struct{}
 func (none) Write(Status) error { return nil }
 func (none) Clear() error       { return nil }
 
-// File is a JSON file, replaced by rename so a reader never sees it half
-// written.
+// File is a JSON file, replaced whole (atomicfile.Write) so a reader never
+// sees it half written.
 type File struct {
 	Path string
-	// Names the temporary file, so two daemons pointed at one path by mistake
-	// never write into each other's; os.Getpid() when zero.
-	PID int
 }
 
 func (f File) Write(status Status) error {
@@ -127,15 +125,7 @@ func (f File) Write(status Status) error {
 	if err != nil {
 		return err
 	}
-	pid := f.PID
-	if pid == 0 {
-		pid = os.Getpid()
-	}
-	temporary := fmt.Sprintf("%s.%d.tmp", f.Path, pid)
-	if err := os.WriteFile(temporary, append(text, '\n'), 0o644); err != nil {
-		return err
-	}
-	return os.Rename(temporary, f.Path)
+	return atomicfile.Write(f.Path, append(text, '\n'), 0o644)
 }
 
 func (f File) Clear() error {

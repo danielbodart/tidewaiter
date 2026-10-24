@@ -10,10 +10,11 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
+	"github.com/danielbodart/gokit/await"
+	"github.com/danielbodart/gokit/clock"
 	"github.com/danielbodart/gokit/httpx"
 )
 
@@ -36,27 +37,9 @@ func TestParseRef(t *testing.T) {
 	}
 }
 
-// waits is a clock that is always already there, remembering how long it was
-// asked to wait - so a backoff is asserted on, not sat through.
-type waits struct {
-	mu     sync.Mutex
-	waited []time.Duration
-}
-
-func (*waits) Now() time.Time { return time.Date(2026, 10, 23, 12, 0, 0, 0, time.UTC) }
-
-func (w *waits) After(d time.Duration) <-chan time.Time {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	w.waited = append(w.waited, d)
-	done := make(chan time.Time, 1)
-	done <- w.Now()
-	return done
-}
-
-func client(handler http.HandlerFunc, auth Auth) (*Client, *waits) {
-	clock := &waits{}
-	return New(httpx.HandlerTransport(handler), auth, clock), clock
+func client(handler http.HandlerFunc, auth Auth) (*Client, *clock.Instant) {
+	waits := clock.NewInstant(time.Date(2026, 10, 23, 12, 0, 0, 0, time.UTC))
+	return New(httpx.HandlerTransport(handler), auth, waits), waits
 }
 
 func digestOf(digest string) http.HandlerFunc {
@@ -173,67 +156,93 @@ func rateLimitedOnce(retryAfter string) http.HandlerFunc {
 }
 
 func TestWaitsOutA429WithRetryAfterThenSucceeds(t *testing.T) {
-	registry, clock := client(rateLimitedOnce("1"), nil)
+	registry, waits := client(rateLimitedOnce("3"), nil)
 	digest, err := registry.Digest(context.Background(), "nginx:1.27")
 	if err != nil || digest != "sha256:after-wait" {
 		t.Fatalf("got %q, %v", digest, err)
 	}
-	if want := []time.Duration{time.Second}; !slices.Equal(clock.waited, want) {
-		t.Errorf("waited %v, want %v", clock.waited, want)
+	if want := []time.Duration{3 * time.Second}; !slices.Equal(waits.Waits(), want) {
+		t.Errorf("waited %v, want %v", waits.Waits(), want)
 	}
 }
 
 func TestUsesADefaultBackoffWhenA429CarriesNoRetryAfter(t *testing.T) {
-	registry, clock := client(rateLimitedOnce(""), nil)
+	registry, waits := client(rateLimitedOnce(""), nil)
 	if _, err := registry.Digest(context.Background(), "nginx:1.27"); err != nil {
 		t.Fatal(err)
 	}
-	if want := []time.Duration{DefaultBackoff}; !slices.Equal(clock.waited, want) {
-		t.Errorf("waited %v, want %v", clock.waited, want)
+	if want := []time.Duration{DefaultBackoff}; !slices.Equal(waits.Waits(), want) {
+		t.Errorf("waited %v, want %v", waits.Waits(), want)
+	}
+}
+
+func TestRetriesARegistryErrorBackingOffTwiceAsLongEachTime(t *testing.T) {
+	calls := 0
+	registry, waits := client(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		if calls < 3 {
+			http.Error(w, "bad gateway", http.StatusBadGateway)
+			return
+		}
+		digestOf("sha256:third-time")(w, r)
+	}, nil)
+	if digest, err := registry.Digest(context.Background(), "nginx:1.27"); err != nil || digest != "sha256:third-time" {
+		t.Fatalf("got %q, %v", digest, err)
+	}
+	if want := []time.Duration{DefaultBackoff, 2 * DefaultBackoff}; !slices.Equal(waits.Waits(), want) {
+		t.Errorf("waited %v, want %v", waits.Waits(), want)
+	}
+}
+
+// Waiting it out would hold the pass, and every container after it, for as
+// long as the registry liked: the next pass asks again instead.
+func TestARetryAfterLongerThanItWillWaitIsRateLimitedAtOnce(t *testing.T) {
+	registry, waits := client(rateLimitedOnce("3600"), nil)
+	_, err := registry.Digest(context.Background(), "nginx:1.27")
+	if err == nil || !strings.Contains(err.Error(), "rate-limited") || !strings.Contains(err.Error(), "Retry-After: 3600") {
+		t.Errorf("got %v", err)
+	}
+	if len(waits.Waits()) != 0 {
+		t.Errorf("waited %v", waits.Waits())
 	}
 }
 
 func TestGivesUpWithARateLimitedErrorAfterPersistent429s(t *testing.T) {
+	calls := 0
 	registry, _ := client(func(w http.ResponseWriter, r *http.Request) {
+		calls++
 		w.Header().Set("Retry-After", "0")
 		http.Error(w, "slow down", http.StatusTooManyRequests)
 	}, nil)
 	if _, err := registry.Digest(context.Background(), "nginx:1.27"); err == nil || !strings.Contains(err.Error(), "rate-limited") {
 		t.Errorf("got %v", err)
 	}
+	if calls != 3 {
+		t.Errorf("asked %d times, want the first and two retries", calls)
+	}
 }
 
 func TestABackoffEndsWithTheContext(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	registry := New(httpx.HandlerTransport(rateLimitedOnce("60")), nil, stuck{})
-	if _, err := registry.Digest(ctx, "nginx"); !errors.Is(err, context.Canceled) {
-		t.Errorf("got %v", err)
+	defer cancel()
+	stopped := clock.NewStopped(time.Date(2026, 10, 23, 12, 0, 0, 0, time.UTC))
+	registry := New(httpx.HandlerTransport(rateLimitedOnce("5")), nil, stopped)
+	failed := make(chan error, 1)
+	go func() {
+		_, err := registry.Digest(ctx, "nginx")
+		failed <- err
+	}()
+	if err := stopped.BlockUntil(ctx, 1); err != nil {
+		t.Fatal(err)
 	}
-}
-
-type stuck struct{}
-
-func (stuck) Now() time.Time                       { return time.Time{} }
-func (stuck) After(time.Duration) <-chan time.Time { return nil }
-
-func TestRetryAfter(t *testing.T) {
-	now := time.Date(2026, 10, 23, 12, 0, 0, 0, time.UTC)
-	for _, c := range []struct {
-		header string
-		want   time.Duration
-	}{
-		{"5", 5 * time.Second},
-		{"", 2 * time.Second},
-		{"not-a-date", 2 * time.Second},
-		// Strict: a fractional number of seconds is not the grammar.
-		{"1.5", 2 * time.Second},
-		{"Thu, 01 Jan 1970 00:00:00 GMT", 0},
-		{"Fri, 23 Oct 2026 12:00:30 GMT", 30 * time.Second},
-	} {
-		if got := RetryAfter(c.header, now, 2*time.Second); got != c.want {
-			t.Errorf("RetryAfter(%q) = %v, want %v", c.header, got, c.want)
+	cancel()
+	select {
+	case err := <-failed:
+		if !errors.Is(err, context.Canceled) {
+			t.Errorf("got %v", err)
 		}
+	case <-time.After(await.Timeout):
+		t.Fatal("the backoff outlived its context")
 	}
 }
 

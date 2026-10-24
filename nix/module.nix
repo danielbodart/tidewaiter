@@ -421,6 +421,11 @@ in
         };
 
         serviceConfig = {
+          # Ready once it is up and before its first pass, which may pull or
+          # swap for minutes: a switch never waits on a swap, and
+          # TimeoutStartSec never cuts one short. `systemctl status` shows
+          # what it is doing.
+          Type = "notify";
           ExecStart = escapeShellArgs (
             [
               exe

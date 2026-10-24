@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/danielbodart/gokit/logx/logtest"
 	"github.com/danielbodart/tidewaiter/internal/decide"
 	"github.com/danielbodart/tidewaiter/internal/detect"
 	"github.com/danielbodart/tidewaiter/internal/fakes"
@@ -42,7 +43,7 @@ type harness struct {
 	conntrack *fakes.Conntrack
 	units     *fakeUnits
 	store     *memoryStore
-	log       *fakes.Log
+	log       *logtest.Logger
 	source    *Source
 }
 
@@ -68,7 +69,7 @@ func newHarness(t *testing.T, fields map[string]any, store *memoryStore) *harnes
 		conntrack: &fakes.Conntrack{},
 		units:     newFakeUnits().declare(unit, defaults(fields)),
 		store:     store,
-		log:       &fakes.Log{},
+		log:       &logtest.Logger{},
 	}
 	h.restartDaemon(false)
 	return h
@@ -87,7 +88,7 @@ func (h *harness) restartDaemon(dryRun bool) {
 		Store:     h.store,
 		Netns:     &fakes.Netns{},
 		TCP:       &fakes.Prober{},
-		Log:       h.log.Line,
+		Log:       h.log,
 		Clock:     &ticking{now: time.Date(2026, 10, 23, 12, 0, 0, 0, time.UTC)},
 	}, Options{DryRun: dryRun})
 }
@@ -537,7 +538,9 @@ func TestARollbackThatIsItselfUnhealthyAsksForAPersonRatherThanLooping(t *testin
 	h.pass()
 	h.pass()
 
-	h.mustLog("manual attention needed")
+	if !h.log.ErrorContains("manual attention needed") {
+		t.Fatalf("never asked for a person, as an error:\n%s", h.log.Text())
+	}
 	assertEqual(t, len(h.journal.starting("restart")), 2)
 }
 

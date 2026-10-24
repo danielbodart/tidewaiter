@@ -5,6 +5,14 @@
 // reconcile, a Tidewaiter source also acts - how a container is swapped has
 // nothing in common with how a unit is - so a source runs its own pass, built
 // from the shared pieces (decide, detect, health).
+//
+// Every source, and the daemon, is given a logx.Logger to say what it is
+// doing: Log for commentary, Error for what someone should look at. Unlike
+// Portical's sources, which return warnings for the daemon to report, a source
+// here logs its own - swaps, rollbacks, warnings about a label - as it acts,
+// since a swap's lines must appear as it happens rather than at the end of a
+// pass. A standing condition is the source's to say once, until it changes,
+// not every pass.
 package source
 
 import (
@@ -103,15 +111,6 @@ type Source interface {
 	// List is one line per workload, for `tidewaiter list`.
 	List(ctx context.Context) ([]string, error)
 }
-
-// Log is where Tidewaiter says what it is doing, one line at a time, without a
-// trailing newline: the daemon, and every source, are given one. Unlike
-// Portical's sources, which return warnings for the daemon to report, a
-// source here logs its own - swaps, rollbacks, warnings about a label - as it
-// acts, since a swap's lines must appear as it happens rather than at the end
-// of a pass. A standing condition is the source's to say once, until it
-// changes, not every pass.
-type Log func(line string)
 
 // MaxSwapFailures is how many consecutive swap-step failures on one target pin
 // it out.

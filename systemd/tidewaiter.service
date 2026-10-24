@@ -30,6 +30,10 @@ Wants=nix-daemon.socket
 After=network.target nix-daemon.socket
 
 [Service]
+# Ready once it is up and before its first pass, which may pull or swap for
+# minutes: `systemctl start` never waits on a swap, and TimeoutStartSec never
+# cuts one short. `systemctl status` shows what it is doing.
+Type=notify
 Environment=TIDEWAITER_SOURCES=systemd
 Environment=TIDEWAITER_STATUS_FILE=/run/tidewaiter/status.json
 # nix-env and nix-store from the default profile, where a multi-user install

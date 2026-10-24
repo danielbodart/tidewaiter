@@ -12,8 +12,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/danielbodart/gokit/await"
 	"github.com/danielbodart/gokit/httpx"
-	"github.com/danielbodart/tidewaiter/internal/fakes"
 	"github.com/danielbodart/tidewaiter/internal/model"
 )
 
@@ -396,7 +396,7 @@ func TestEventsHandsOverEachEventAsItHappensWithTheHealthVerdictSplitOut(t *test
 		t.Errorf("got %+v, %v", seen, err)
 	}
 	// Stopping let go of the stream.
-	fakes.Await(t, "the stream to close", func() bool { return docker.open() == 0 })
+	await.Until(t, "the stream to close", func() bool { return docker.open() == 0 })
 }
 
 func TestEventsEndsWithItsContextAndLetsGoOfTheStream(t *testing.T) {
@@ -405,13 +405,13 @@ func TestEventsEndsWithItsContextAndLetsGoOfTheStream(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	ended := make(chan error)
 	go func() { ended <- client.Events(ctx, AutoupdateLabel, func(Event) bool { return false }) }()
-	fakes.Await(t, "the stream to open", func() bool { return docker.open() == 1 })
+	await.Until(t, "the stream to open", func() bool { return docker.open() == 1 })
 
 	cancel()
 	if err := <-ended; err != nil {
 		t.Errorf("got %v", err)
 	}
-	fakes.Await(t, "the stream to close", func() bool { return docker.open() == 0 })
+	await.Until(t, "the stream to close", func() bool { return docker.open() == 0 })
 }
 
 func TestEventsReturnsWhenDockerDropsTheStream(t *testing.T) {
@@ -421,7 +421,7 @@ func TestEventsReturnsWhenDockerDropsTheStream(t *testing.T) {
 	go func() {
 		ended <- client.Events(context.Background(), AutoupdateLabel, func(Event) bool { return false })
 	}()
-	fakes.Await(t, "the stream to open", func() bool { return docker.open() == 1 })
+	await.Until(t, "the stream to open", func() bool { return docker.open() == 1 })
 
 	docker.dropStreams()
 	if err := <-ended; err != nil {

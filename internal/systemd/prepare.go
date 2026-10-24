@@ -4,8 +4,8 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/danielbodart/gokit/logx"
 	"github.com/danielbodart/tidewaiter/internal/nix"
-	"github.com/danielbodart/tidewaiter/internal/source"
 )
 
 // Reloader is systemd's daemon-reload, all prepare needs of it.
@@ -19,7 +19,8 @@ type PrepareDeps struct {
 	Profiles nix.Profiles
 	Closure  nix.ClosureBinder
 	Systemd  Reloader
-	Log      source.Log
+	// Silent when nil.
+	Log logx.Logger
 }
 
 // Prepared is what prepare did, by unit.
@@ -57,6 +58,9 @@ type Prepared struct {
 // One unit failing does not stop the rest; an error only when the units
 // directory could not be read at all.
 func Prepare(ctx context.Context, deps PrepareDeps) (Prepared, error) {
+	if deps.Log == nil {
+		deps.Log = logx.Discard
+	}
 	var prepared Prepared
 	files, err := deps.Units.Read()
 	if err != nil {
@@ -66,7 +70,7 @@ func Prepare(ctx context.Context, deps PrepareDeps) (Prepared, error) {
 	for _, file := range files {
 		policy, warnings := ParsePolicy(file.Text, file.Name)
 		for _, warning := range warnings {
-			deps.Log(warning)
+			deps.Log.Log(warning)
 		}
 		if policy == nil || done[policy.Unit] {
 			continue
@@ -82,13 +86,13 @@ func Prepare(ctx context.Context, deps PrepareDeps) (Prepared, error) {
 		}
 		if err != nil {
 			prepared.Failed = append(prepared.Failed, policy.Unit)
-			deps.Log(fmt.Sprintf("%s: could not prepare it (%s)", policy.Unit, err))
+			deps.Log.Error(fmt.Sprintf("%s: could not prepare it (%s)", policy.Unit, err))
 		}
 	}
 
 	if len(prepared.Bound) > 0 {
 		if err := deps.Systemd.DaemonReload(ctx); err != nil {
-			deps.Log(fmt.Sprintf("Error: wrote the closure drop-ins but could not reload systemd (%s)", err))
+			deps.Log.Error(fmt.Sprintf("Error: wrote the closure drop-ins but could not reload systemd (%s)", err))
 			prepared.Failed = append(prepared.Failed, prepared.Bound...)
 		}
 	}
@@ -105,7 +109,7 @@ func prepareUnit(ctx context.Context, deps PrepareDeps, policy *Policy) (seeded,
 			return false, false, err
 		}
 		current, seeded = policy.Desired, true
-		deps.Log(fmt.Sprintf("%s: created %s on %s", policy.Unit, policy.Profile, policy.Desired))
+		deps.Log.Log(fmt.Sprintf("%s: created %s on %s", policy.Unit, policy.Profile, policy.Desired))
 	}
 	if policy.BindClosure {
 		bound, err = deps.Closure.Ensure(ctx, policy.Unit, policy.Profile, current)

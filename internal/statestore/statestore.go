@@ -19,6 +19,8 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+
+	"github.com/danielbodart/gokit/atomicfile"
 )
 
 // FileName is the store's file under the state directory.
@@ -66,9 +68,9 @@ type Store interface {
 	Save(Memories) error
 }
 
-// File is a JSON file, written whole and atomically (a temporary file renamed
-// over it), so a crash mid-write leaves the previous state rather than half of
-// one. A file that is not there is no memories; one that cannot be parsed is
+// File is a JSON file, written whole, atomically and durably
+// (atomicfile.Write), so a crash or a power cut mid-write leaves the previous
+// state rather than half of one. A file that is not there is no memories; one that cannot be parsed is
 // an error, because silently forgetting pins is exactly what this file exists
 // to stop.
 type File struct {
@@ -104,9 +106,5 @@ func (f File) Save(memories Memories) error {
 	if err != nil {
 		return err
 	}
-	temporary := f.Path + ".tmp"
-	if err := os.WriteFile(temporary, append(text, '\n'), 0o644); err != nil {
-		return err
-	}
-	return os.Rename(temporary, f.Path)
+	return atomicfile.Write(f.Path, append(text, '\n'), 0o644)
 }

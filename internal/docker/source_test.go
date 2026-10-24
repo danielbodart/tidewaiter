@@ -8,8 +8,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/danielbodart/gokit/await"
 	"github.com/danielbodart/gokit/clock"
 	"github.com/danielbodart/gokit/httpx"
+	"github.com/danielbodart/gokit/logx/logtest"
 	"github.com/danielbodart/tidewaiter/internal/daemon"
 	"github.com/danielbodart/tidewaiter/internal/decide"
 	"github.com/danielbodart/tidewaiter/internal/detect"
@@ -29,7 +31,7 @@ type world struct {
 	conntrack *fakes.Conntrack
 	netns     *fakes.Netns
 	tcp       *fakes.Prober
-	log       *fakes.Log
+	log       *logtest.Logger
 	clock     clock.Clock
 	source    *Source
 	daemon    *daemon.Daemon
@@ -46,22 +48,24 @@ func newWorld(t *testing.T, settings ...setting) *world {
 	t.Helper()
 	w := &world{
 		docker: newFakeDocker(), registry: newFakeRegistry(), conntrack: &fakes.Conntrack{},
-		netns: &fakes.Netns{}, tcp: &fakes.Prober{}, log: &fakes.Log{},
+		netns: &fakes.Netns{}, tcp: &fakes.Prober{}, log: &logtest.Logger{},
 		clock: clock.NewStopped(time.Date(2026, 10, 23, 12, 0, 0, 0, time.UTC)),
 	}
 	options := DefaultOptions
 	options.HealthPoll = time.Millisecond
 	deps := Deps{
 		Docker: NewClient(httpx.StreamingHandlerTransport(w.docker)), Netns: w.netns, TCP: w.tcp,
-		Options: options, Log: w.log.Line, Clock: w.clock,
+		Options: options, Log: w.log, Clock: w.clock,
 	}
 	for _, apply := range settings {
 		apply(&deps)
 	}
 	w.clock = deps.Clock
-	deps.Registry = registry.New(httpx.HandlerTransport(w.registry), deps.Auth, w.clock)
+	// Its retries waited out at once: how long they wait is the registry
+	// package's to prove, and a stopped clock would hold a pass on them.
+	deps.Registry = registry.New(httpx.HandlerTransport(w.registry), deps.Auth, clock.NewInstant(time.Time{}))
 	w.source = NewSource(deps)
-	w.daemon = daemon.New(daemon.Deps{Sources: []source.Source{w.source}, Conntrack: w.conntrack, Options: daemon.Defaults, Log: w.log.Line, Clock: w.clock})
+	w.daemon = daemon.New(daemon.Deps{Sources: []source.Source{w.source}, Conntrack: w.conntrack, Options: daemon.Defaults, Log: w.log, Clock: w.clock})
 	t.Cleanup(w.source.Prefetched)
 	return w
 }
@@ -401,7 +405,7 @@ func TestCommitsOnAHealthyEventWithoutWaitingOutThePoll(t *testing.T) {
 		t.Error("not committed")
 	}
 	// The gate let go of its stream on the way out.
-	fakes.Await(t, "the event stream to close", func() bool { return w.docker.open() == 0 })
+	await.Until(t, "the event stream to close", func() bool { return w.docker.open() == 0 })
 }
 
 func TestRollsBackOnAnUnhealthyEvent(t *testing.T) {
@@ -430,14 +434,14 @@ func TestReopensAnEventStreamThatDropsDuringTheGate(t *testing.T) {
 	passed := make(chan []decide.Kind)
 	go func() { passed <- w.once(t) }()
 
-	fakes.Await(t, "the gate to watch for events", func() bool { return w.docker.open() == 1 })
+	await.Until(t, "the gate to watch for events", func() bool { return w.docker.open() == 1 })
 	w.docker.dropStreams()
 	// The poll waiting a minute, the watch a second before it looks again.
 	if err := stopped.BlockUntil(t.Context(), 2); err != nil {
 		t.Fatal(err)
 	}
 	stopped.Advance(time.Second)
-	fakes.Await(t, "the stream to be opened again", func() bool { return w.docker.open() == 1 && w.docker.everOpened() == 2 })
+	await.Until(t, "the stream to be opened again", func() bool { return w.docker.open() == 1 && w.docker.everOpened() == 2 })
 	w.docker.emit(Event{Action: "health_status: healthy", Container: "web"})
 
 	if got := <-passed; !slices.Equal(got, []decide.Kind{decide.Update}) {

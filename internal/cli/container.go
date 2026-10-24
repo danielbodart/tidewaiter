@@ -2,20 +2,20 @@ package cli
 
 import (
 	"errors"
-	"fmt"
 	"io"
 	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
-	"strings"
-	"sync"
 	"syscall"
 
 	"github.com/danielbodart/gokit/clock"
 	"github.com/danielbodart/gokit/conntrack"
+	"github.com/danielbodart/gokit/environ"
 	"github.com/danielbodart/gokit/httpx"
+	"github.com/danielbodart/gokit/logx"
 	"github.com/danielbodart/gokit/sockdiag"
+	sd "github.com/danielbodart/gokit/systemd"
 	"github.com/danielbodart/tidewaiter/internal/activity"
 	"github.com/danielbodart/tidewaiter/internal/detect"
 	"github.com/danielbodart/tidewaiter/internal/health"
@@ -31,17 +31,22 @@ import (
 type Container struct {
 	// The command line, without the program name, and the environment.
 	Args []string
-	Env  map[string]string
-	// What the daemon says goes to Stdout, as it always has, so the journal
-	// and `docker logs` read as before; an error that ends a command goes to
-	// Stderr.
+	Env  environ.Env
+	// What a command prints - `list`, `status`, the version and the usage -
+	// goes to Stdout.
 	Stdout, Stderr io.Writer
+	// What Tidewaiter says it is doing, from the daemon's passes and ticks,
+	// background pulls and the signal handler alike: commentary on Stdout,
+	// as it always has been, so the journal and `docker logs` read as
+	// before, and errors on Stderr. logx.Writers over the two when nil.
+	Log logx.Logger
+	// Tells systemd how the daemon is getting on - ready, what it is doing,
+	// stopping - by sd_notify. Nothing outside systemd, where there is no
+	// NOTIFY_SOCKET, as under Docker.
+	Notify func(states ...string) error
 	// Time, for the intervals, the gates, the reboot window and how old a
 	// status is.
 	Clock clock.Clock
-	// Names this process's temporary files - the status file's, a closure
-	// drop-in's - so two writers never share one.
-	PID int
 
 	// How the Docker Engine API is reached at a socket path.
 	DockerTransport func(socket string) http.RoundTripper
@@ -74,8 +79,6 @@ type Container struct {
 
 	// SIGINT and SIGTERM as they arrive, and how to stop listening for them.
 	Signals func() (<-chan os.Signal, func())
-
-	speaking sync.Mutex
 }
 
 // Wire fills in the leaves left unset.
@@ -84,7 +87,7 @@ func (c *Container) Wire() {
 		c.Args = os.Args[1:]
 	}
 	if c.Env == nil {
-		c.Env = environ()
+		c.Env = environ.Current()
 	}
 	if c.Stdout == nil {
 		c.Stdout = os.Stdout
@@ -92,11 +95,15 @@ func (c *Container) Wire() {
 	if c.Stderr == nil {
 		c.Stderr = os.Stderr
 	}
+	if c.Log == nil {
+		c.Log = logx.Writers(c.Stdout, c.Stderr)
+	}
+	if c.Notify == nil {
+		env := c.Env
+		c.Notify = func(states ...string) error { return sd.Notify(env, states...) }
+	}
 	if c.Clock == nil {
 		c.Clock = clock.System{}
-	}
-	if c.PID == 0 {
-		c.PID = os.Getpid()
 	}
 	if c.DockerTransport == nil {
 		c.DockerTransport = httpx.UnixSocket
@@ -150,34 +157,6 @@ func (c *Container) Wire() {
 	if c.Signals == nil {
 		c.Signals = interrupts
 	}
-}
-
-// Note is a line of what Tidewaiter is doing, on stdout.
-//
-// The daemon's passes and ticks, background pulls and the signal handler all
-// speak through here from their own goroutines, so one line is written at a
-// time.
-func (c *Container) Note(line string) {
-	c.speaking.Lock()
-	defer c.speaking.Unlock()
-	fmt.Fprintln(c.Stdout, line)
-}
-
-// Fail is an error that ends a command, on stderr.
-func (c *Container) Fail(line string) {
-	c.speaking.Lock()
-	defer c.speaking.Unlock()
-	fmt.Fprintln(c.Stderr, line)
-}
-
-func environ() map[string]string {
-	env := map[string]string{}
-	for _, entry := range os.Environ() {
-		if name, value, ok := strings.Cut(entry, "="); ok {
-			env[name] = value
-		}
-	}
-	return env
 }
 
 // interrupts is SIGINT and SIGTERM, caught rather than fatal.

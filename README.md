@@ -78,13 +78,16 @@ tidewaiter prepare  # create missing unit profiles and missing closure drop-ins,
 
 Options: `-s/--source docker|systemd` (repeat or comma-separate; default `docker`), `-d/--interval SECONDS` (default 300), `-n/--dry-run`, `--status-file PATH` (`run` writes none unless given one; `status` reads `/run/tidewaiter/status.json` by default), `--activity-interval SECONDS` (default 15), `--auto-reboot-window HH:MM-HH:MM` with `--booted-system PATH` and `--current-system PATH` (defaults `/run/booted-system`, `/nix/var/nix/profiles/system`), `--version`. Docker: `-l/--label LABEL`, `--docker-socket PATH`. systemd: `--units-dir DIR` (default `/etc/tidewaiter/units`), `--state-dir DIR` (default `/var/lib/tidewaiter`). Env: `TIDEWAITER_SOURCES`, `TIDEWAITER_INTERVAL`, `TIDEWAITER_STATUS_FILE`, `TIDEWAITER_AUTO_REBOOT_WINDOW`, `DOCKER_SOCKET`, `TIDEWAITER_UNITS_DIR`, `STATE_DIRECTORY`.
 
+What `run` is doing goes to stdout, and what someone should look at - a pass that failed, a rollback that needs a person - to stderr. Under systemd it is a `Type=notify` service: ready once it is up, before its first pass, with what it is doing in `systemctl status` (see [systemd](docs/systemd.md)); under Docker there is no one to tell, and it says nothing. Registry and Docker requests name it as `tidewaiter/<version>`; a registry that answers 429, 5xx or not at all is asked twice more, one second then two apart, or after its `Retry-After` when that is ten seconds or less - a longer one leaves the container alone until the next pass.
+
 ## Development
 
 Tidewaiter is Go, and the standard library apart from two dependencies:
 [godbus](https://github.com/godbus/dbus) for the systemd source's system bus and
 logind, and the author's own [gokit](https://github.com/danielbodart/gokit) -
-itself standard library only - for httpx, clock, sockdiag and conntrack (the
-table read over ctnetlink), and its dbusx module for the systemd conversation
+itself standard library only - for httpx (its retries and User-Agent too),
+clock, logx, sd_notify, atomic file writes, sockdiag and conntrack (the table
+read over ctnetlink), and its dbusx module for the systemd conversation
 and the bus the tests talk to.
 
 ```shell

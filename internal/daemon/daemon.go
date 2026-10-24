@@ -26,6 +26,8 @@ import (
 	"time"
 
 	"github.com/danielbodart/gokit/clock"
+	"github.com/danielbodart/gokit/logx"
+	sd "github.com/danielbodart/gokit/systemd"
 	"github.com/danielbodart/tidewaiter/internal/decide"
 	"github.com/danielbodart/tidewaiter/internal/detect"
 	"github.com/danielbodart/tidewaiter/internal/reboot"
@@ -64,12 +66,16 @@ type Deps struct {
 	Conntrack detect.ConntrackDumper
 	Options   Options
 	// Silent when nil.
-	Log source.Log
+	Log logx.Logger
 	// status.None when nil: nothing written, and no activity tick unless
 	// there is an automatic reboot to keep current.
 	Status status.Sink
 	// Nil for none.
 	AutoReboot *AutoReboot
+	// Tells systemd how Run is getting on, by sd_notify: ready as soon as it
+	// starts, a STATUS= line whenever what it would say changes, and
+	// stopping. Nothing when nil.
+	Notify func(states ...string) error
 	// The system clock when nil.
 	Clock clock.Clock
 }
@@ -79,9 +85,10 @@ type Daemon struct {
 	sources    []source.Source
 	conntrack  detect.ConntrackDumper
 	options    Options
-	log        source.Log
+	log        logx.Logger
 	status     status.Sink
 	autoReboot *AutoReboot
+	notify     func(states ...string) error
 	clock      clock.Clock
 
 	// One source call at a time: a pass, a tick's activity read, or the last
@@ -102,6 +109,15 @@ type Daemon struct {
 	lastRebootLine     string
 	// Set once logind has accepted the reboot, so no later pass asks again.
 	rebooting bool
+	// Why the last pass failed, or "" when it did not.
+	lastFailure string
+	// What systemd was last told, so a tick that changes nothing sends
+	// nothing, and the last problem telling it.
+	lastNotified    string
+	lastNotifyError string
+	// Set once Run is shutting down, so a pass finishing after it does not
+	// tell systemd anything but that.
+	stopping bool
 }
 
 // verdicts is one source's workloads as last seen.
@@ -121,25 +137,22 @@ func New(deps Deps) *Daemon {
 	if deps.Status == nil {
 		deps.Status = status.None
 	}
+	// Passes and ticks both speak, on different goroutines: a logx.Logger
+	// takes both, a line at a time.
 	if deps.Log == nil {
-		deps.Log = func(string) {}
+		deps.Log = logx.Discard
 	}
-	// Passes and ticks both speak, on different goroutines, so their lines
-	// are taken one at a time here rather than every Log having to be safe
-	// for it.
-	var speaking sync.Mutex
-	log := func(line string) {
-		speaking.Lock()
-		defer speaking.Unlock()
-		deps.Log(line)
+	if deps.Notify == nil {
+		deps.Notify = func(...string) error { return nil }
 	}
 	return &Daemon{
 		sources:    deps.Sources,
 		conntrack:  deps.Conntrack,
 		options:    deps.Options,
-		log:        log,
+		log:        deps.Log,
 		status:     deps.Status,
 		autoReboot: deps.AutoReboot,
+		notify:     deps.Notify,
 		clock:      deps.Clock,
 		seen:       map[source.Name]*verdicts{},
 		held:       map[string]bool{},
@@ -171,7 +184,7 @@ func (d *Daemon) Once(ctx context.Context) ([]source.Outcome, error) {
 		own, err := s.Once(ctx, pass)
 		if err != nil {
 			if len(d.sources) > 1 {
-				d.log(fmt.Sprintf("%s: Error: %s", s.Name(), err))
+				d.log.Error(fmt.Sprintf("%s: Error: %s", s.Name(), err))
 			}
 			if failure == nil {
 				failure = err
@@ -184,9 +197,10 @@ func (d *Daemon) Once(ctx context.Context) ([]source.Outcome, error) {
 
 	d.mu.Lock()
 	clear(d.held)
-	d.mu.Unlock()
-	d.publish()
 	if failure != nil {
+		d.lastFailure = failure.Error()
+		d.mu.Unlock()
+		d.publish()
 		return nil, failure
 	}
 
@@ -195,12 +209,13 @@ func (d *Daemon) Once(ctx context.Context) ([]source.Outcome, error) {
 		actions[i] = outcome.Action
 	}
 	summary := summarise(actions, d.noun())
-	d.mu.Lock()
 	changed := summary != d.lastSummary
 	d.lastSummary = summary
+	d.lastFailure = ""
 	d.mu.Unlock()
+	d.publish()
 	if changed {
-		d.log(summary)
+		d.log.Log(summary)
 	}
 	return outcomes, nil
 }
@@ -376,8 +391,23 @@ func (d *Daemon) rebootIfReady(ctx context.Context, auto *AutoReboot) {
 // abandoned halfway through a swap, so shutting down cannot leave a container
 // stopped and not yet replaced. Passes run on a context that outlives ctx for
 // that reason; a tick is only reading, so it is cut off.
+//
+// systemd is told it is ready as Run starts, before the first pass: a pass
+// can pull images or swap a unit for minutes, and Type=notify would otherwise
+// hold `systemctl start` - and a NixOS switch - for as long, and kill the
+// daemon when TimeoutStartSec ran out mid-swap. Nothing is ordered after
+// Tidewaiter to need more than that it is up; what it is doing is in its
+// STATUS= line from then on.
 func (d *Daemon) Run(ctx context.Context) {
+	d.mu.Lock()
+	d.tell(sd.Ready, sd.Status("Starting the first pass"))
+	d.mu.Unlock()
+
 	var wg sync.WaitGroup
+	wg.Go(func() {
+		<-ctx.Done()
+		d.stop()
+	})
 	if d.status != status.None || d.autoReboot != nil {
 		wg.Go(func() { d.tickEvery(ctx) })
 	}
@@ -386,7 +416,7 @@ func (d *Daemon) Run(ctx context.Context) {
 			// Not fatal: Docker may be restarting, or the bus briefly gone.
 			// The next pass tries again - and a pass that could not see
 			// everything never leads to a reboot.
-			d.log("Error: " + err.Error())
+			d.log.Error("Error: " + err.Error())
 			return
 		}
 		d.ConsiderReboot(passes)
@@ -403,7 +433,7 @@ func (d *Daemon) Run(ctx context.Context) {
 func (d *Daemon) runEvery(ctx context.Context, pass func(context.Context)) {
 	passes := context.WithoutCancel(ctx)
 	pass(passes)
-	d.log(fmt.Sprintf("Reconciling every %ss...", seconds(d.options.Interval)))
+	d.log.Log(fmt.Sprintf("Reconciling every %ss...", seconds(d.options.Interval)))
 	for {
 		select {
 		case <-ctx.Done():
@@ -515,24 +545,89 @@ func (d *Daemon) rebootVerdict(auto *AutoReboot, needed, verdict string) {
 	d.lastRebootLine = line
 	d.mu.Unlock()
 	if changed {
-		d.log(line)
+		d.log.Log(line)
 	}
 }
 
 // publish writes the status, one write at a time so a tick and a pass never
 // interleave. Never fatal: logged once per distinct problem, since the tick
 // would otherwise repeat it every few seconds.
+//
+// systemd's STATUS= line is told then too, when it has changed.
 func (d *Daemon) publish() {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	err := d.status.Write(d.snapshot())
+	snapshot := d.snapshot()
+	if line := d.statusLine(snapshot); line != d.lastNotified && !d.stopping {
+		d.tell(sd.Status(line))
+	}
+	err := d.status.Write(snapshot)
 	if err == nil {
 		d.lastStatusError = ""
 		return
 	}
 	if message := err.Error(); message != d.lastStatusError {
 		d.lastStatusError = message
-		d.log(fmt.Sprintf("Warning: could not write the status (%s)", message))
+		d.log.Log(fmt.Sprintf("Warning: could not write the status (%s)", message))
+	}
+}
+
+// statusLine is what Tidewaiter is doing, in a line, for systemd's STATUS=:
+// what it is swapping, else what is in use and what the last pass concluded.
+// Called with mu held.
+func (d *Daemon) statusLine(snapshot status.Status) string {
+	if len(snapshot.Swapping) > 0 {
+		return "Swapping " + strings.Join(snapshot.Swapping, ", ")
+	}
+	var line string
+	switch {
+	case d.lastFailure != "":
+		line = "The last pass failed: " + d.lastFailure
+	case d.lastSummary == "":
+		line = "Starting the first pass"
+	case len(snapshot.Busy) == 0:
+		line = "Idle: " + d.lastSummary
+	default:
+		line = d.lastSummary
+	}
+	if len(snapshot.Busy) > 0 {
+		line += "; in use: " + strings.Join(snapshot.Busy, ", ")
+	}
+	if reboot := snapshot.Reboot; reboot != nil && reboot.Needed != "" {
+		line += fmt.Sprintf("; reboot needed, %s: %s", reboot.Needed, reboot.Verdict)
+	}
+	return line
+}
+
+// stop tells systemd Run is shutting down, and what it is waiting for.
+func (d *Daemon) stop() {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.stopping = true
+	line := "Stopping"
+	if len(d.held) > 0 {
+		line = "Stopping once the swap of " + strings.Join(sorted(d.held), ", ") + " is done"
+	}
+	d.tell(sd.Stopping, sd.Status(line))
+}
+
+// tell sends systemd states, remembering the STATUS= line it carried. Never
+// fatal: a problem is logged once per distinct message, as a status file's
+// is. Called with mu held, so what systemd hears is in the order it happened.
+func (d *Daemon) tell(states ...string) {
+	for _, state := range states {
+		if line, ok := strings.CutPrefix(state, "STATUS="); ok {
+			d.lastNotified = line
+		}
+	}
+	err := d.notify(states...)
+	if err == nil {
+		d.lastNotifyError = ""
+		return
+	}
+	if message := err.Error(); message != d.lastNotifyError {
+		d.lastNotifyError = message
+		d.log.Log(fmt.Sprintf("Warning: could not tell systemd how Tidewaiter is getting on (%s)", message))
 	}
 }
 
@@ -545,7 +640,7 @@ func (d *Daemon) dumpConntrack(ctx context.Context) []detect.ConntrackEntry {
 	if err != nil {
 		if message := err.Error(); message != d.lastConntrackError {
 			d.lastConntrackError = message
-			d.log(fmt.Sprintf("Warning: could not read conntrack (%s); assuming busy where it matters", message))
+			d.log.Log(fmt.Sprintf("Warning: could not read conntrack (%s); assuming busy where it matters", message))
 		}
 		return nil
 	}

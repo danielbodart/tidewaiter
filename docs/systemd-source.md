@@ -1037,9 +1037,10 @@ check phase, module, VM).
 8. **Re-sample before the swap for Docker too** (section 3)? Small, and closes
    the same window, but it changes Docker behaviour, which this branch promises
    not to.
-9. **Notification.** "Log/notify": the design logs to the journal. Worth an
-   `--on-rollback COMMAND` hook, or `STATUS=` via `sd_notify` so `systemctl
-   status tidewaiter` shows busy/pinned units?
+9. **Notification.** "Log/notify": the design logs to the journal, and the
+   daemon is `Type=notify` with a `STATUS=` line, so `systemctl status
+   tidewaiter` shows what it is swapping or what is in use. Still worth an
+   `--on-rollback COMMAND` hook?
 10. **A `symlink` profile kind** for plain-systemd hosts without Nix: the same
     flow over `/opt/app/current -> /opt/app/releases/X`, keeping the previous
     target for rollback. Small once `Profiles` is an interface; worth shipping

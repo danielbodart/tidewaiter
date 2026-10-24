@@ -16,7 +16,6 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
-	"strconv"
 	"strings"
 	"time"
 
@@ -25,9 +24,12 @@ import (
 	"github.com/danielbodart/tidewaiter/internal/model"
 )
 
-// Timeout bounds every registry request: a registry that hangs must not hold
-// up a pass, which leaves the container alone and tries again next time.
-const Timeout = 30 * time.Second
+// Timeout bounds every registry request, its retries and its waits together:
+// a registry that hangs must not hold up a pass, which leaves the container
+// alone and tries again next time. Comfortably more than the most retries
+// would wait - one second, then two, or two Retry-Afters of up to maxDelay -
+// so the waits never use up the time the attempts need.
+const Timeout = 60 * time.Second
 
 // Auth is where credentials come from, keyed by registry host.
 //
@@ -39,12 +41,21 @@ type Auth func(registry string) string
 // Anonymous is no credentials for anyone.
 func Anonymous(string) string { return "" }
 
-// How Docker Hub throttling reaches us, and the backoff for it.
-const (
-	maxRateLimitRetries = 2
-	// DefaultBackoff is the wait when a 429 carries no usable Retry-After.
-	DefaultBackoff = time.Second
-)
+// DefaultBackoff is the wait before the first retry, doubled for the next,
+// and the wait when a 429 carries no usable Retry-After.
+const DefaultBackoff = time.Second
+
+// maxDelay is the longest Retry-After waited out. Docker Hub throttles
+// anonymous pulls routinely, and names when it will answer; one that asks for
+// longer is given up on at once, and the container left alone until a later
+// pass.
+const maxDelay = 10 * time.Second
+
+// retries is how a registry request is retried: twice, after a transport
+// error, a 429 or a 5xx.
+func retries(clk clock.Clock) httpx.RetryPolicy {
+	return httpx.RetryPolicy{Retries: 2, BaseDelay: DefaultBackoff, MaxDelay: maxDelay, Clock: clk}
+}
 
 // Ask for the shapes a digest lives behind: v2 manifests, manifest lists and
 // their OCI equivalents. Without this a registry may hand back a v1 manifest
@@ -64,19 +75,22 @@ var accept = strings.Join([]string{
 // manifests endpoint, reading the Docker-Content-Digest header - the digest
 // the registry itself vouches for, so it matches what a pull would land and
 // what Docker records in RepoDigests.
+//
+// Every request it makes - manifests and tokens alike - is retried as retries
+// says, its backoffs and Retry-Afters waited out on the client's clock.
 type Client struct {
-	http  *http.Client
-	auth  Auth
-	clock clock.Clock
+	http *http.Client
+	auth Auth
 }
 
 // New is a client over transport, with credentials from auth (nil for
-// anonymous) and rate-limit backoffs waited out on clk.
+// anonymous) and retries waited out on clk.
 func New(transport http.RoundTripper, auth Auth, clk clock.Clock) *Client {
 	if auth == nil {
 		auth = Anonymous
 	}
-	return &Client{http: &http.Client{Transport: transport, Timeout: Timeout}, auth: auth, clock: clk}
+	retrying := httpx.Decorate(transport, httpx.Retrying(retries(clk)))
+	return &Client{http: &http.Client{Transport: retrying, Timeout: Timeout}, auth: auth}
 }
 
 // Digest is the manifest digest ref's tag points at now.
@@ -128,51 +142,36 @@ func (c *Client) digest(ctx context.Context, image Ref) (model.Digest, error) {
 	return model.Digest(digest), nil
 }
 
-// manifest is one manifest request, through the rate-limit retry.
+// manifest is one manifest request.
 func (c *Client) manifest(ctx context.Context, image Ref, target, method, bearer string) (*http.Response, error) {
-	return c.retrying(ctx, target, func() (*http.Request, error) {
-		request, err := http.NewRequestWithContext(ctx, method, target, nil)
-		if err != nil {
-			return nil, err
-		}
-		request.Header.Set("Accept", accept)
-		if bearer != "" {
-			request.Header.Set("Authorization", "Bearer "+bearer)
-		} else if basic := basicAuth(c.auth(image.Registry)); basic != "" {
-			request.Header.Set("Authorization", basic)
-		}
-		return request, nil
-	})
+	request, err := http.NewRequestWithContext(ctx, method, target, nil)
+	if err != nil {
+		return nil, err
+	}
+	request.Header.Set("Accept", accept)
+	if bearer != "" {
+		request.Header.Set("Authorization", "Bearer "+bearer)
+	} else if basic := basicAuth(c.auth(image.Registry)); basic != "" {
+		request.Header.Set("Authorization", basic)
+	}
+	return c.do(request)
 }
 
-// retrying makes a request, waiting out a rate limit.
-//
-// A 429 is not an error to surface at once - Docker Hub throttles anonymous
-// pulls routinely, and the fix is to wait the Retry-After it names and try
-// again. Retried a few times, then given up with a clear "rate-limited" error
-// that leaves the container alone this pass. Every actual HTTP call funnels
-// through here, so the manifest and token requests get the same treatment.
-func (c *Client) retrying(ctx context.Context, target string, build func() (*http.Request, error)) (*http.Response, error) {
-	for attempt := 0; ; attempt++ {
-		request, err := build()
-		if err != nil {
-			return nil, err
-		}
-		response, err := c.http.Do(request)
-		if err != nil {
-			return nil, err
-		}
-		if response.StatusCode != http.StatusTooManyRequests {
-			return response, nil
-		}
-		drain(response)
-		if attempt >= maxRateLimitRetries {
-			return nil, fmt.Errorf("registry rate-limited %s after %d attempts", target, attempt+1)
-		}
-		if err := clock.Sleep(ctx, c.clock, RetryAfter(response.Header.Get("Retry-After"), c.clock.Now(), DefaultBackoff)); err != nil {
-			return nil, err
-		}
+// do is a request, with the retries behind it; a 429 still there after them
+// is an error saying so, which leaves the container alone this pass.
+func (c *Client) do(request *http.Request) (*http.Response, error) {
+	response, err := c.http.Do(request)
+	if err != nil {
+		return nil, err
 	}
+	if response.StatusCode == http.StatusTooManyRequests {
+		drain(response)
+		if after := response.Header.Get("Retry-After"); after != "" {
+			return nil, fmt.Errorf("registry rate-limited %s (Retry-After: %s)", request.URL, after)
+		}
+		return nil, fmt.Errorf("registry rate-limited %s", request.URL)
+	}
+	return response, nil
 }
 
 // tokenFor follows a 401's Bearer challenge to a token, or "" when the
@@ -207,16 +206,14 @@ func (c *Client) tokenFor(ctx context.Context, challenge *http.Response, image R
 	query.Set("scope", scope)
 	realm.RawQuery = query.Encode()
 
-	response, err := c.retrying(ctx, realm.String(), func() (*http.Request, error) {
-		request, err := http.NewRequestWithContext(ctx, http.MethodGet, realm.String(), nil)
-		if err != nil {
-			return nil, err
-		}
-		if basic := basicAuth(c.auth(image.Registry)); basic != "" {
-			request.Header.Set("Authorization", basic)
-		}
-		return request, nil
-	})
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, realm.String(), nil)
+	if err != nil {
+		return "", err
+	}
+	if basic := basicAuth(c.auth(image.Registry)); basic != "" {
+		request.Header.Set("Authorization", basic)
+	}
+	response, err := c.do(request)
 	if err != nil {
 		return "", err
 	}
@@ -252,25 +249,6 @@ func parseChallenge(body string) map[string]string {
 		params[match[1]] = match[2]
 	}
 	return params
-}
-
-// RetryAfter is how long a Retry-After header asks us to wait.
-//
-// The header is a number of seconds or an HTTP-date. Missing or unparseable
-// falls back to fallback rather than hammering the registry; a date in the
-// past is no wait at all.
-func RetryAfter(header string, now time.Time, fallback time.Duration) time.Duration {
-	header = strings.TrimSpace(header)
-	if header == "" {
-		return fallback
-	}
-	if seconds, err := strconv.Atoi(header); err == nil {
-		return max(0, time.Duration(seconds)*time.Second)
-	}
-	if at, err := http.ParseTime(header); err == nil {
-		return max(0, at.Sub(now))
-	}
-	return fallback
 }
 
 // Ref is an image reference, split the way the registry API wants it.
