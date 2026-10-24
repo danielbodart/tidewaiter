@@ -4,8 +4,9 @@
 // Everything here is pure over its inputs - the conntrack table arrives as
 // typed entries, a netns's sockets as /proc text through Netns - so the
 // Docker and systemd sources share one set of detectors, and the kernel-facing
-// readers that feed them (ctnetlink, /proc) live elsewhere, behind
-// ConntrackDumper and Netns.
+// readers that feed them (gokit's conntrack, /proc) live elsewhere, behind
+// ConntrackDumper and Netns; FromConntrack reduces the kernel's table to the
+// entries the detectors read.
 package detect
 
 import (

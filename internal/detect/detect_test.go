@@ -3,11 +3,14 @@ package detect_test
 import (
 	"context"
 	"errors"
+	"net/netip"
 	"os"
+	"reflect"
 	"testing"
 	"time"
 
 	"github.com/danielbodart/gokit/clock"
+	"github.com/danielbodart/gokit/conntrack"
 	"github.com/danielbodart/tidewaiter/internal/detect"
 	"github.com/danielbodart/tidewaiter/internal/fakes"
 	"github.com/danielbodart/tidewaiter/internal/model"
@@ -15,8 +18,8 @@ import (
 
 var ctx = context.Background()
 
-// table is the flows `conntrack -L` showed on a live host, as the netlink dump
-// now hands them over: an ESTABLISHED and a SYN_SENT on 25565, an assured and
+// table is the flows `conntrack -L` showed on a live host, as Reduce hands
+// them over: an ESTABLISHED and a SYN_SENT on 25565, an assured and
 // an unreplied UDP flow on 19132, an ESTABLISHED on 8080 and a TIME_WAIT on
 // 28080. ICMP never gets this far.
 var table = []detect.ConntrackEntry{
@@ -131,11 +134,73 @@ func TestConntrackReadsATimeWaitOnlyFlowAsIdle(t *testing.T) {
 	}
 }
 
-func TestTCPStateNamesAreConntrackToolsOwn(t *testing.T) {
-	for state, want := range map[uint8]string{3: "ESTABLISHED", 7: "TIME_WAIT", 5: "CLOSE_WAIT", 1: "SYN_SENT", 200: ""} {
-		if got := detect.TCPStateName(state); got != want {
-			t.Errorf("%d: got %q, want %q", state, got, want)
-		}
+// flow is a conntrack table entry as the kernel's dump has it, a client at
+// 192.0.2.7 to a host port that NAT sends on to 172.17.0.2:9000.
+func flow(protocol conntrack.Protocol, port int, status conntrack.Status, state conntrack.TCPState) conntrack.Entry {
+	client, host, container := netip.MustParseAddr("192.0.2.7"), netip.MustParseAddr("198.51.100.1"), netip.MustParseAddr("172.17.0.2")
+	return conntrack.Entry{
+		Family:   conntrack.IPv4,
+		Protocol: protocol,
+		Original: conntrack.Tuple{Source: client, Destination: host, SourcePort: 40000, DestinationPort: port},
+		Reply:    conntrack.Tuple{Source: container, Destination: client, SourcePort: 9000, DestinationPort: 40000},
+		Status:   status,
+		TCPState: state,
+	}
+}
+
+func TestReduceKeepsTCPAndUDPFlowsAndDropsEverythingElse(t *testing.T) {
+	icmp := flow(conntrack.ICMP, 0, conntrack.Assured, conntrack.TCPNone)
+	icmp.Original.ICMPType = 8
+	got := detect.Reduce([]conntrack.Entry{
+		flow(conntrack.TCP, 25565, conntrack.Assured|conntrack.SeenReply|conntrack.Confirmed, conntrack.TCPEstablished),
+		icmp,
+		flow(conntrack.UDP, 19132, conntrack.SeenReply, conntrack.TCPNone),
+		flow(conntrack.SCTP, 9899, conntrack.Assured, conntrack.TCPNone),
+	})
+	want := []detect.ConntrackEntry{
+		{Protocol: model.TCP, DestinationPort: 25565, Assured: true, State: "ESTABLISHED"},
+		{Protocol: model.UDP, DestinationPort: 19132},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("got %+v", got)
+	}
+}
+
+// The host port the client aimed at, which published ports are matched
+// against - not the reply's, which NAT made the container's.
+func TestReduceTakesTheOriginalDirectionsDestinationPortNotTheReplys(t *testing.T) {
+	got := detect.Reduce([]conntrack.Entry{flow(conntrack.TCP, 8080, conntrack.Assured, conntrack.TCPTimeWait)})
+	if want := []detect.ConntrackEntry{{Protocol: model.TCP, DestinationPort: 8080, Assured: true, State: "TIME_WAIT"}}; !reflect.DeepEqual(got, want) {
+		t.Errorf("got %+v", got)
+	}
+}
+
+func TestReduceSkipsAFlowWithNoDestinationPort(t *testing.T) {
+	got := detect.Reduce([]conntrack.Entry{flow(conntrack.UDP, 0, conntrack.Assured, conntrack.TCPNone)})
+	if len(got) != 0 {
+		t.Errorf("got %+v", got)
+	}
+}
+
+// A state the detectors do not know is not a closing one, so the flow reads
+// as live, the cautious way.
+func TestReduceLeavesATCPStateItDoesNotKnowCountedAsLive(t *testing.T) {
+	table := detect.Reduce([]conntrack.Entry{flow(conntrack.TCP, 25565, conntrack.Assured, conntrack.TCPState(200))})
+	got := inUse(t, detect.Conntrack, detect.Input{Published: []model.PublishedPort{tcp(25565)}, Conntrack: table})
+	if want := (detect.Result{InUse: true, Sessions: 1, Counted: true, Confident: true}); got != want {
+		t.Errorf("got %+v from %+v", got, table)
+	}
+}
+
+func TestFromConntrackReadsAnEmptyTableAsNoFlowsAndAnErrorAsCouldNotTell(t *testing.T) {
+	empty := detect.FromConntrack(conntrack.DumperFunc(func(context.Context) ([]conntrack.Entry, error) { return []conntrack.Entry{}, nil }))
+	if got, err := empty.Dump(ctx); err != nil || got == nil || len(got) != 0 {
+		t.Errorf("got %#v, %v", got, err)
+	}
+	refused := errors.New("operation not permitted")
+	failing := detect.FromConntrack(conntrack.DumperFunc(func(context.Context) ([]conntrack.Entry, error) { return nil, refused }))
+	if got, err := failing.Dump(ctx); !errors.Is(err, refused) || got != nil {
+		t.Errorf("got %#v, %v", got, err)
 	}
 }
 

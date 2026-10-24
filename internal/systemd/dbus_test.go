@@ -4,34 +4,22 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/danielbodart/gokit/dbusx"
+	"github.com/danielbodart/gokit/dbusx/dbustest"
 	"github.com/danielbodart/tidewaiter/internal/fakes"
 	"github.com/godbus/dbus/v5"
 )
 
-func address(t *testing.T, env map[string]string) string {
+// on is the adapter, talking to this bus through DBUS_SYSTEM_BUS_ADDRESS, as
+// it finds the real one.
+func on(t *testing.T, fake *dbustest.Bus) *DBus {
 	t.Helper()
-	bus, err := SystemBus(env)
+	bus, err := SystemBus(map[string]string{"DBUS_SYSTEM_BUS_ADDRESS": fake.Address()})
 	if err != nil {
 		t.Fatal(err)
 	}
-	return bus.address
-}
-
-func TestSystemBusIsTheStandardSocketByDefault(t *testing.T) {
-	assertEqual(t, address(t, map[string]string{}), "unix:path=/run/dbus/system_bus_socket")
-	assertEqual(t, address(t, map[string]string{"DBUS_SYSTEM_BUS_ADDRESS": ""}), "unix:path=/run/dbus/system_bus_socket")
-}
-
-func TestSystemBusFollowsDBUS_SYSTEM_BUS_ADDRESS(t *testing.T) {
-	assertEqual(t, address(t, map[string]string{"DBUS_SYSTEM_BUS_ADDRESS": "unix:path=/run/other/bus"}), "unix:path=/run/other/bus")
-	assertEqual(t, address(t, map[string]string{"DBUS_SYSTEM_BUS_ADDRESS": "tcp:host=x;unix:guid=1,path=/run/b"}), "unix:guid=1,path=/run/b")
-}
-
-func TestSystemBusRefusesAnAddressItWillNotUse(t *testing.T) {
-	_, err := SystemBus(map[string]string{"DBUS_SYSTEM_BUS_ADDRESS": "tcp:host=x,port=1"})
-	if err == nil || !strings.Contains(err.Error(), "only unix: addresses") {
-		t.Fatalf("got %v", err)
-	}
+	t.Cleanup(func() { bus.Close() })
+	return bus
 }
 
 func TestSaysWhereItWasGoingWhenThereIsNoBus(t *testing.T) {
@@ -44,24 +32,19 @@ func TestSaysWhereItWasGoingWhenThereIsNoBus(t *testing.T) {
 	}
 }
 
-func TestUnitPathsAreEscapedAsSystemdEscapesThem(t *testing.T) {
-	assertEqual(t, unitPath("chandlery-bedrock.service"), dbus.ObjectPath("/org/freedesktop/systemd1/unit/chandlery_2dbedrock_2eservice"))
-	assertEqual(t, unitPath("2fast.service"), dbus.ObjectPath("/org/freedesktop/systemd1/unit/_32fast_2eservice"))
-}
-
 const job7 = dbus.ObjectPath("/org/freedesktop/systemd1/job/7")
 
 // systemdAnswers is systemd's side of the conversation, for one running
 // unit, with jobs numbered from 7.
-func systemdAnswers(call *dbus.Message) answer {
-	switch header[string](call, dbus.FieldMember) {
+func systemdAnswers(call *dbus.Message) dbustest.Reply {
+	switch dbustest.Header[string](call, dbus.FieldMember) {
 	case "AddMatch", "Subscribe", "Reload":
-		return answer{}
+		return dbustest.Reply{}
 	case "LoadUnit":
-		return answer{body: []any{unitPath(call.Body[0].(string))}}
+		return dbustest.Reply{Body: []any{dbusx.UnitPath(call.Body[0].(string))}}
 	case "GetAll":
-		if call.Body[0] == unitIface {
-			return answer{body: []any{map[string]dbus.Variant{
+		if call.Body[0] == dbusx.SystemdUnit {
+			return dbustest.Reply{Body: []any{map[string]dbus.Variant{
 				"Id":           dbus.MakeVariant("game.service"),
 				"LoadState":    dbus.MakeVariant("loaded"),
 				"ActiveState":  dbus.MakeVariant("active"),
@@ -69,26 +52,26 @@ func systemdAnswers(call *dbus.Message) answer {
 				"InvocationID": dbus.MakeVariant([]byte{0xde, 0xad, 0xbe, 0xef, 0, 1}),
 			}}}
 		}
-		return answer{body: []any{map[string]dbus.Variant{
+		return dbustest.Reply{Body: []any{map[string]dbus.Variant{
 			"Result":       dbus.MakeVariant("success"),
 			"NRestarts":    dbus.MakeVariant(uint32(2)),
 			"MainPID":      dbus.MakeVariant(uint32(4242)),
 			"ControlGroup": dbus.MakeVariant("/system.slice/game.service"),
 		}}}
 	case "RestartUnit":
-		return answer{body: []any{job7}}
+		return dbustest.Reply{Body: []any{job7}}
 	}
-	return answer{err: dbus.NewError("org.freedesktop.DBus.Error.UnknownMethod", []any{"Unknown method"})}
+	return dbustest.Reply{Err: dbus.NewError("org.freedesktop.DBus.Error.UnknownMethod", []any{"Unknown method"})}
 }
 
-func removeJob(fake *fakeBus, job dbus.ObjectPath, result string) {
-	fake.Signal(managerPath, manager, "JobRemoved", uint32(7), job, "game.service", result)
+func removeJob(fake *dbustest.Bus, job dbus.ObjectPath, result string) {
+	fake.Signal(dbusx.SystemdPath, dbusx.SystemdManager, "JobRemoved", uint32(7), job, "game.service", result)
 }
 
 func TestReadsAUnitsStateFromItsUnitAndServiceProperties(t *testing.T) {
-	fake := newFakeBus(t)
+	fake := dbustest.New(t)
 	fake.Answer(systemdAnswers)
-	state, err := fake.Bus(t).Unit(ctx, "game.service")
+	state, err := on(t, fake).Unit(ctx, "game.service")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -106,19 +89,19 @@ func TestReadsAUnitsStateFromItsUnitAndServiceProperties(t *testing.T) {
 
 	// LoadUnit, so a unit nothing has started yet is still found.
 	load := fake.Calls("LoadUnit")[0]
-	assertEqual(t, header[dbus.ObjectPath](load, dbus.FieldPath), managerPath)
-	assertEqual(t, header[string](load, dbus.FieldInterface), manager)
+	assertEqual(t, dbustest.Header[dbus.ObjectPath](load, dbus.FieldPath), dbusx.SystemdPath)
+	assertEqual(t, dbustest.Header[string](load, dbus.FieldInterface), dbusx.SystemdManager)
 	assertEqual(t, load.Body, []any{"game.service"})
 	all := fake.Calls("GetAll")
-	assertEqual(t, header[dbus.ObjectPath](all[0], dbus.FieldPath), unitPath("game.service"))
-	assertEqual(t, all[0].Body, []any{unitIface})
+	assertEqual(t, dbustest.Header[dbus.ObjectPath](all[0], dbus.FieldPath), dbusx.UnitPath("game.service"))
+	assertEqual(t, all[0].Body, []any{dbusx.SystemdUnit})
 	assertEqual(t, all[1].Body, []any{serviceIface})
 }
 
 func TestAUnitThatIsNotAServiceHasNoServicePropertiesToAskFor(t *testing.T) {
-	fake := newFakeBus(t)
+	fake := dbustest.New(t)
 	fake.Answer(systemdAnswers)
-	state, err := fake.Bus(t).Unit(ctx, "game.scope")
+	state, err := on(t, fake).Unit(ctx, "game.scope")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -128,9 +111,9 @@ func TestAUnitThatIsNotAServiceHasNoServicePropertiesToAskFor(t *testing.T) {
 }
 
 func TestSubscribesToJobEndsBeforeItAsksForAnything(t *testing.T) {
-	fake := newFakeBus(t)
+	fake := dbustest.New(t)
 	fake.Answer(systemdAnswers)
-	if _, err := fake.Bus(t).Unit(ctx, "game.service"); err != nil {
+	if _, err := on(t, fake).Unit(ctx, "game.service"); err != nil {
 		t.Fatal(err)
 	}
 	assertEqual(t, fake.Members()[:3], []string{"Hello", "AddMatch", "Subscribe"})
@@ -138,13 +121,13 @@ func TestSubscribesToJobEndsBeforeItAsksForAnything(t *testing.T) {
 	if !strings.Contains(match, "member='JobRemoved'") {
 		t.Fatal(match)
 	}
-	assertEqual(t, header[string](fake.Calls("Subscribe")[0], dbus.FieldInterface), manager)
+	assertEqual(t, dbustest.Header[string](fake.Calls("Subscribe")[0], dbus.FieldInterface), dbusx.SystemdManager)
 }
 
 func TestARestartWaitsForItsOwnJobToBeRemovedAndReturnsItsResult(t *testing.T) {
-	fake := newFakeBus(t)
+	fake := dbustest.New(t)
 	fake.Answer(systemdAnswers)
-	bus := fake.Bus(t)
+	bus := on(t, fake)
 
 	type ended struct {
 		result JobResult
@@ -166,36 +149,36 @@ func TestARestartWaitsForItsOwnJobToBeRemovedAndReturnsItsResult(t *testing.T) {
 }
 
 func TestAJobThatEndsBeforeTheReplyToRestartUnitIsStillHeard(t *testing.T) {
-	fake := newFakeBus(t)
-	fake.Answer(func(call *dbus.Message) answer {
+	fake := dbustest.New(t)
+	fake.Answer(func(call *dbus.Message) dbustest.Reply {
 		reply := systemdAnswers(call)
-		if header[string](call, dbus.FieldMember) == "RestartUnit" {
-			reply.before = func() { removeJob(fake, job7, "done") }
+		if dbustest.Header[string](call, dbus.FieldMember) == "RestartUnit" {
+			reply.Before = func() { removeJob(fake, job7, "done") }
 		}
 		return reply
 	})
-	result, err := fake.Bus(t).Restart(ctx, "game.service")
+	result, err := on(t, fake).Restart(ctx, "game.service")
 	assertEqual(t, err, nil)
 	assertEqual(t, result, JobDone)
 }
 
 func TestAResultItDoesNotKnowIsAFailure(t *testing.T) {
-	fake := newFakeBus(t)
-	fake.Answer(func(call *dbus.Message) answer {
+	fake := dbustest.New(t)
+	fake.Answer(func(call *dbus.Message) dbustest.Reply {
 		reply := systemdAnswers(call)
-		if header[string](call, dbus.FieldMember) == "RestartUnit" {
-			reply.before = func() { removeJob(fake, job7, "frobnicated") }
+		if dbustest.Header[string](call, dbus.FieldMember) == "RestartUnit" {
+			reply.Before = func() { removeJob(fake, job7, "frobnicated") }
 		}
 		return reply
 	})
-	result, _ := fake.Bus(t).Restart(ctx, "game.service")
+	result, _ := on(t, fake).Restart(ctx, "game.service")
 	assertEqual(t, result, JobFailed)
 }
 
 func TestARestartFailsWhenTheBusDropsWhileWaitingRatherThanWaitingForever(t *testing.T) {
-	fake := newFakeBus(t)
+	fake := dbustest.New(t)
 	fake.Answer(systemdAnswers)
-	bus := fake.Bus(t)
+	bus := on(t, fake)
 	failed := make(chan error, 1)
 	go func() {
 		_, err := bus.Restart(ctx, "game.service")
@@ -214,40 +197,40 @@ func TestARestartFailsWhenTheBusDropsWhileWaitingRatherThanWaitingForever(t *tes
 }
 
 func TestARestartThatCannotBeQueuedSaysWhy(t *testing.T) {
-	fake := newFakeBus(t)
-	fake.Answer(func(call *dbus.Message) answer {
-		if header[string](call, dbus.FieldMember) == "RestartUnit" {
-			return answer{err: dbus.NewError("org.freedesktop.systemd1.NoSuchUnit", []any{"Unit game.service not found."})}
+	fake := dbustest.New(t)
+	fake.Answer(func(call *dbus.Message) dbustest.Reply {
+		if dbustest.Header[string](call, dbus.FieldMember) == "RestartUnit" {
+			return dbustest.Reply{Err: dbus.NewError("org.freedesktop.systemd1.NoSuchUnit", []any{"Unit game.service not found."})}
 		}
 		return systemdAnswers(call)
 	})
-	_, err := fake.Bus(t).Restart(ctx, "game.service")
+	_, err := on(t, fake).Restart(ctx, "game.service")
 	if err == nil || !strings.Contains(err.Error(), "org.freedesktop.systemd1.NoSuchUnit: Unit game.service not found.") {
 		t.Fatalf("got %v", err)
 	}
 }
 
 func TestDaemonReloadIsTheManagersReload(t *testing.T) {
-	fake := newFakeBus(t)
+	fake := dbustest.New(t)
 	fake.Answer(systemdAnswers)
-	if err := fake.Bus(t).DaemonReload(ctx); err != nil {
+	if err := on(t, fake).DaemonReload(ctx); err != nil {
 		t.Fatal(err)
 	}
 	reload := fake.Calls("Reload")[0]
-	assertEqual(t, header[string](reload, dbus.FieldInterface), manager)
-	assertEqual(t, header[dbus.ObjectPath](reload, dbus.FieldPath), managerPath)
+	assertEqual(t, dbustest.Header[string](reload, dbus.FieldInterface), dbusx.SystemdManager)
+	assertEqual(t, dbustest.Header[dbus.ObjectPath](reload, dbus.FieldPath), dbusx.SystemdPath)
 }
 
 func TestAsksLogindToRebootNotInteractively(t *testing.T) {
-	fake := newFakeBus(t)
-	if err := fake.Bus(t).Reboot(ctx); err != nil {
+	fake := dbustest.New(t)
+	if err := on(t, fake).Reboot(ctx); err != nil {
 		t.Fatal(err)
 	}
 	reboot := fake.Calls("Reboot")[0]
-	assertEqual(t, header[string](reboot, dbus.FieldDestination), "org.freedesktop.login1")
-	assertEqual(t, header[dbus.ObjectPath](reboot, dbus.FieldPath), dbus.ObjectPath("/org/freedesktop/login1"))
-	assertEqual(t, header[string](reboot, dbus.FieldInterface), "org.freedesktop.login1.Manager")
-	assertEqual(t, header[dbus.Signature](reboot, dbus.FieldSignature).String(), "b")
+	assertEqual(t, dbustest.Header[string](reboot, dbus.FieldDestination), "org.freedesktop.login1")
+	assertEqual(t, dbustest.Header[dbus.ObjectPath](reboot, dbus.FieldPath), dbus.ObjectPath("/org/freedesktop/login1"))
+	assertEqual(t, dbustest.Header[string](reboot, dbus.FieldInterface), "org.freedesktop.login1.Manager")
+	assertEqual(t, dbustest.Header[dbus.Signature](reboot, dbus.FieldSignature).String(), "b")
 	assertEqual(t, reboot.Body, []any{false})
 	// On a connection of its own, closed after: no subscription to systemd.
 	assertEqual(t, fake.Calls("Subscribe"), nil)
@@ -255,18 +238,18 @@ func TestAsksLogindToRebootNotInteractively(t *testing.T) {
 }
 
 func TestARebootRefusalIsAnErrorForTheDaemonToLog(t *testing.T) {
-	fake := newFakeBus(t)
-	fake.Answer(func(call *dbus.Message) answer {
-		return answer{err: dbus.NewError("org.freedesktop.login1.OperationInProgress", []any{"Operation denied due to active block inhibitor"})}
+	fake := dbustest.New(t)
+	fake.Answer(func(call *dbus.Message) dbustest.Reply {
+		return dbustest.Reply{Err: dbus.NewError("org.freedesktop.login1.OperationInProgress", []any{"Operation denied due to active block inhibitor"})}
 	})
-	err := fake.Bus(t).Reboot(ctx)
+	err := on(t, fake).Reboot(ctx)
 	if err == nil || !strings.Contains(err.Error(), "block inhibitor") || !strings.Contains(err.Error(), "OperationInProgress") {
 		t.Fatalf("got %v", err)
 	}
 }
 
 func signal(member string, body ...any) *dbus.Signal {
-	return &dbus.Signal{Path: managerPath, Name: manager + "." + member, Body: body}
+	return &dbus.Signal{Path: dbusx.SystemdPath, Name: dbusx.SystemdManager + "." + member, Body: body}
 }
 
 func TestToJobRemovedReadsTheJobPathUnitAndResult(t *testing.T) {

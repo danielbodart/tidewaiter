@@ -8,54 +8,36 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/danielbodart/gokit/dbusx"
 	"github.com/danielbodart/tidewaiter/internal/reboot"
 	"github.com/godbus/dbus/v5"
 )
 
 const (
-	systemd1        = "org.freedesktop.systemd1"
-	managerPath     = dbus.ObjectPath("/org/freedesktop/systemd1")
-	manager         = "org.freedesktop.systemd1.Manager"
-	unitIface       = "org.freedesktop.systemd1.Unit"
-	serviceIface    = "org.freedesktop.systemd1.Service"
-	propertiesIface = "org.freedesktop.DBus.Properties"
-	unitPaths       = "/org/freedesktop/systemd1/unit"
+	serviceIface = "org.freedesktop.systemd1.Service"
 
 	login1        = "org.freedesktop.login1"
 	login1Path    = dbus.ObjectPath("/org/freedesktop/login1")
 	login1Manager = "org.freedesktop.login1.Manager"
-
-	// DefaultSystemBus is where the system bus is when nothing says otherwise.
-	DefaultSystemBus = "unix:path=/run/dbus/system_bus_socket"
 )
 
 // jobRemoved is every JobRemoved systemd sends, which Subscribe turns on for
 // the connection that asked.
-const jobRemoved = "type='signal',sender='" + systemd1 + "',interface='" + manager + "',member='JobRemoved',path='" + string(managerPath) + "'"
+const jobRemoved = "type='signal',sender='" + dbusx.Systemd + "',interface='" + dbusx.SystemdManager + "',member='JobRemoved',path='" + string(dbusx.SystemdPath) + "'"
 
 // SystemBus is systemd and logind over the system bus at
 // DBUS_SYSTEM_BUS_ADDRESS, the variable libdbus and sd-bus read, or the
-// standard socket.
+// standard socket - unix: addresses only, as dbusx.SystemBusAddress takes
+// them.
 //
-// Only unix: addresses are taken, which is all a system bus has ever been:
-// anything else is far more likely a mistake than a bus. Nothing is connected
-// until the first call, so a command that never needs systemd - and the
-// container, which has no bus - never opens one.
+// Nothing is connected until the first call, so a command that never needs
+// systemd - and the container, which has no bus - never opens one.
 func SystemBus(env map[string]string) (*DBus, error) {
-	address := env["DBUS_SYSTEM_BUS_ADDRESS"]
-	if address == "" {
-		address = DefaultSystemBus
+	address, err := dbusx.SystemBusAddress(env)
+	if err != nil {
+		return nil, err
 	}
-	var usable []string
-	for candidate := range strings.SplitSeq(address, ";") {
-		if strings.HasPrefix(candidate, "unix:") {
-			usable = append(usable, candidate)
-		}
-	}
-	if len(usable) == 0 {
-		return nil, fmt.Errorf("cannot use DBUS_SYSTEM_BUS_ADDRESS '%s': only unix: addresses are supported", address)
-	}
-	return &DBus{address: strings.Join(usable, ";")}, nil
+	return &DBus{address: address}, nil
 }
 
 // DBus is systemd's Manager, and logind's, over D-Bus.
@@ -96,13 +78,8 @@ type connection struct {
 }
 
 func (b *DBus) connect(ctx context.Context) (*dbus.Conn, error) {
-	// In order, as systemd sent them; the default handler hands a busy
-	// reader's signals to goroutines.
-	conn, err := dbus.Connect(b.address, dbus.WithContext(ctx), dbus.WithSignalHandler(dbus.NewSequentialSignalHandler()))
-	if err != nil {
-		return nil, fmt.Errorf("D-Bus at %s: %w", b.address, err)
-	}
-	return conn, nil
+	// Signals in order, as systemd sent them.
+	return dbusx.Connect(b.address, dbus.WithContext(ctx))
 }
 
 func (b *DBus) connection(ctx context.Context) (*connection, error) {
@@ -129,15 +106,11 @@ func (b *DBus) connection(ctx context.Context) (*connection, error) {
 	conn.Signal(signals)
 	go c.listen(signals)
 
-	if err := conn.BusObject().CallWithContext(ctx, "org.freedesktop.DBus.AddMatch", 0, jobRemoved).Err; err != nil {
+	// Without the subscription systemd sends no JobRemoved at all. It lasts
+	// as long as this connection does.
+	if err := dbusx.Subscribe(ctx, conn, jobRemoved); err != nil {
 		conn.Close()
-		return nil, fmt.Errorf("asking for systemd's job signals: %w", describe(err))
-	}
-	// Without this systemd sends no JobRemoved at all. It lasts as long as
-	// this connection does.
-	if err := conn.Object(systemd1, managerPath).CallWithContext(ctx, manager+".Subscribe", 0).Err; err != nil {
-		conn.Close()
-		return nil, fmt.Errorf("subscribing to systemd: %w", describe(err))
+		return nil, err
 	}
 	b.shared = c
 	return c, nil
@@ -184,10 +157,10 @@ func (b *DBus) Unit(ctx context.Context, name string) (UnitState, error) {
 	// and GetUnit would call it missing. A name with no unit file comes back
 	// loaded as "not-found", which is the answer.
 	var path dbus.ObjectPath
-	if err := c.conn.Object(systemd1, managerPath).CallWithContext(ctx, manager+".LoadUnit", 0, name).Store(&path); err != nil {
-		return UnitState{}, fmt.Errorf("loading %s: %w", name, describe(err))
+	if err := c.conn.Object(dbusx.Systemd, dbusx.SystemdPath).CallWithContext(ctx, dbusx.SystemdManager+".LoadUnit", 0, name).Store(&path); err != nil {
+		return UnitState{}, fmt.Errorf("loading %s: %w", name, dbusx.Describe(err))
 	}
-	unit, err := getAll(ctx, c.conn, path, unitIface)
+	unit, err := getAll(ctx, c.conn, path, dbusx.SystemdUnit)
 	if err != nil {
 		return UnitState{}, fmt.Errorf("reading %s: %w", name, err)
 	}
@@ -202,8 +175,8 @@ func (b *DBus) Unit(ctx context.Context, name string) (UnitState, error) {
 
 func getAll(ctx context.Context, conn *dbus.Conn, path dbus.ObjectPath, iface string) (map[string]dbus.Variant, error) {
 	var all map[string]dbus.Variant
-	if err := conn.Object(systemd1, path).CallWithContext(ctx, propertiesIface+".GetAll", 0, iface).Store(&all); err != nil {
-		return nil, describe(err)
+	if err := conn.Object(dbusx.Systemd, path).CallWithContext(ctx, dbusx.Properties+".GetAll", 0, iface).Store(&all); err != nil {
+		return nil, dbusx.Describe(err)
 	}
 	return all, nil
 }
@@ -226,8 +199,8 @@ func (b *DBus) Restart(ctx context.Context, name string) (JobResult, error) {
 	}()
 
 	var job dbus.ObjectPath
-	if err := c.conn.Object(systemd1, managerPath).CallWithContext(ctx, manager+".RestartUnit", 0, name, "replace").Store(&job); err != nil {
-		return "", fmt.Errorf("restarting %s: %w", name, describe(err))
+	if err := c.conn.Object(dbusx.Systemd, dbusx.SystemdPath).CallWithContext(ctx, dbusx.SystemdManager+".RestartUnit", 0, name, "replace").Store(&job); err != nil {
+		return "", fmt.Errorf("restarting %s: %w", name, dbusx.Describe(err))
 	}
 	c.mu.Lock()
 	if result, already := c.ended[job]; already {
@@ -265,8 +238,8 @@ func (b *DBus) DaemonReload(ctx context.Context) error {
 	}
 	// Answered once the reload is done, so the drop-in just written is in
 	// force by the time this returns.
-	if err := c.conn.Object(systemd1, managerPath).CallWithContext(ctx, manager+".Reload", 0).Err; err != nil {
-		return fmt.Errorf("reloading systemd: %w", describe(err))
+	if err := c.conn.Object(dbusx.Systemd, dbusx.SystemdPath).CallWithContext(ctx, dbusx.SystemdManager+".Reload", 0).Err; err != nil {
+		return fmt.Errorf("reloading systemd: %w", dbusx.Describe(err))
 	}
 	return nil
 }
@@ -285,24 +258,9 @@ func (b *DBus) Reboot(ctx context.Context) error {
 	}
 	defer conn.Close()
 	if err := conn.Object(login1, login1Path).CallWithContext(ctx, login1Manager+".Reboot", 0, false).Err; err != nil {
-		return fmt.Errorf("asking logind to reboot: %w", describe(err))
+		return fmt.Errorf("asking logind to reboot: %w", dbusx.Describe(err))
 	}
 	return nil
-}
-
-// describe adds the error's name to a D-Bus error, whose own text is only its
-// message - "Operation denied due to active block inhibitor" says less
-// without org.freedesktop.login1.OperationInProgress.
-func describe(err error) error {
-	var named dbus.Error
-	if errors.As(err, &named) {
-		return fmt.Errorf("%s: %w", named.Name, err)
-	}
-	var pointer *dbus.Error
-	if errors.As(err, &pointer) {
-		return fmt.Errorf("%s: %w", pointer.Name, err)
-	}
-	return err
 }
 
 // removal is a JobRemoved signal's job path, unit and result.
@@ -314,15 +272,15 @@ type removal struct {
 
 // toJobRemoved reads a JobRemoved signal, and nothing else.
 func toJobRemoved(signal *dbus.Signal) (removal, bool) {
-	if signal.Name != manager+".JobRemoved" || len(signal.Body) < 4 {
+	if signal.Name != dbusx.SystemdManager+".JobRemoved" || len(signal.Body) < 4 {
 		return removal{}, false
 	}
-	job, ok := signal.Body[1].(dbus.ObjectPath)
+	job, ok := dbusx.Arg[dbus.ObjectPath](signal.Body, 1)
 	if !ok {
 		return removal{}, false
 	}
-	unit, _ := signal.Body[2].(string)
-	said, _ := signal.Body[3].(string)
+	unit, _ := dbusx.Arg[string](signal.Body, 2)
+	said, _ := dbusx.Arg[string](signal.Body, 3)
 	// A result this code does not know is not a success.
 	result := JobFailed
 	for _, known := range jobResults {
@@ -367,21 +325,4 @@ func toUnitState(name string, unit, service map[string]dbus.Variant) UnitState {
 		ControlGroup: text(service, "ControlGroup"),
 		InvocationID: hex.EncodeToString(invocation),
 	}
-}
-
-// unitPath is a unit's object path, escaped as systemd escapes it: every
-// byte that is not a letter or digit, and a leading digit, becomes `_` and
-// two hex digits. Only for tests: calls go through LoadUnit, which returns
-// the path itself.
-func unitPath(name string) dbus.ObjectPath {
-	var escaped strings.Builder
-	for i := 0; i < len(name); i++ {
-		c := name[i]
-		if c >= 'A' && c <= 'Z' || c >= 'a' && c <= 'z' || i > 0 && c >= '0' && c <= '9' {
-			escaped.WriteByte(c)
-		} else {
-			fmt.Fprintf(&escaped, "_%02x", c)
-		}
-	}
-	return dbus.ObjectPath(unitPaths + "/" + escaped.String())
 }

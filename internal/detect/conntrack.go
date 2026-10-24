@@ -3,6 +3,7 @@ package detect
 import (
 	"context"
 
+	"github.com/danielbodart/gokit/conntrack"
 	"github.com/danielbodart/tidewaiter/internal/model"
 )
 
@@ -16,7 +17,7 @@ import (
 // probe or a SYN that went nowhere.
 //
 // State is the TCP connection state, by the names conntrack-tools prints
-// (ESTABLISHED, TIME_WAIT, ... - see TCPStateName), and empty for UDP, which
+// (ESTABLISHED, TIME_WAIT, ... - conntrack.TCPState's), and empty for UDP, which
 // conntrack tracks with no such state. It is load-bearing: a TIME_WAIT or
 // CLOSE_WAIT flow is a connection that has *finished*, and it lingers in the
 // table for up to two minutes. Counting those as in use would make a
@@ -46,22 +47,52 @@ type ConntrackDumperFunc func(ctx context.Context) ([]ConntrackEntry, error)
 
 func (f ConntrackDumperFunc) Dump(ctx context.Context) ([]ConntrackEntry, error) { return f(ctx) }
 
-// The TCP states conntrack-tools prints, indexed by the kernel's
-// enum tcp_conntrack (CTA_PROTOINFO_TCP_STATE), so a netlink dump names a
-// state exactly as `conntrack -L` did and the detectors never see a number.
-var tcpStates = [...]string{
-	"NONE", "SYN_SENT", "SYN_RECV", "ESTABLISHED", "FIN_WAIT",
-	"CLOSE_WAIT", "LAST_ACK", "TIME_WAIT", "CLOSE", "SYN_SENT2",
+// FromConntrack is a ConntrackDumper over the whole table dumper reads -
+// conntrack.Kernel(), in the daemon - each dump reduced by Reduce. An error
+// from it is returned as it is, never as an empty table.
+func FromConntrack(dumper conntrack.Dumper) ConntrackDumper {
+	return ConntrackDumperFunc(func(ctx context.Context) ([]ConntrackEntry, error) {
+		entries, err := dumper.Dump(ctx)
+		if err != nil {
+			return nil, err
+		}
+		return Reduce(entries), nil
+	})
 }
 
-// TCPStateName is the name of the kernel's TCP conntrack state number, or ""
-// for one it does not define - which no detector counts as closing, so an
-// unknown state reads as live, the cautious way.
-func TCPStateName(state uint8) string {
-	if int(state) < len(tcpStates) {
-		return tcpStates[state]
+// Reduce is the flows of a conntrack table a detector counts: TCP and UDP,
+// the protocols the gate is scoped to, with a destination port to match.
+//
+// The destination port is the original direction's - the host port the
+// client aimed at - not the reply's, which NAT may have rewritten to the
+// container's own. Never nil, so an empty table stays "no flows" rather than
+// "could not tell".
+func Reduce(entries []conntrack.Entry) []ConntrackEntry {
+	reduced := []ConntrackEntry{}
+	for _, entry := range entries {
+		var protocol model.Protocol
+		switch entry.Protocol {
+		case conntrack.TCP:
+			protocol = model.TCP
+		case conntrack.UDP:
+			protocol = model.UDP
+		default:
+			continue
+		}
+		if entry.Original.DestinationPort == 0 {
+			continue
+		}
+		flow := ConntrackEntry{
+			Protocol:        protocol,
+			DestinationPort: entry.Original.DestinationPort,
+			Assured:         entry.Status.Has(conntrack.Assured),
+		}
+		if protocol == model.TCP {
+			flow.State = entry.TCPState.String()
+		}
+		reduced = append(reduced, flow)
 	}
-	return ""
+	return reduced
 }
 
 // closingTCPStates are TCP states that mean the connection is closing or

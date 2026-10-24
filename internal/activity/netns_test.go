@@ -5,11 +5,19 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
 
 	"github.com/danielbodart/tidewaiter/internal/detect"
 	"github.com/danielbodart/tidewaiter/internal/model"
 )
+
+func assertEqual[T any](t *testing.T, got, want T) {
+	t.Helper()
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("got  %#v\nwant %#v", got, want)
+	}
+}
 
 func write(t *testing.T, path, text string) {
 	t.Helper()

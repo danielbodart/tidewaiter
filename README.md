@@ -80,11 +80,12 @@ Options: `-s/--source docker|systemd` (repeat or comma-separate; default `docker
 
 ## Development
 
-Tidewaiter is Go, and the standard library apart from two modules:
+Tidewaiter is Go, and the standard library apart from two dependencies:
 [godbus](https://github.com/godbus/dbus) for the systemd source's system bus and
 logind, and the author's own [gokit](https://github.com/danielbodart/gokit) -
-itself standard library only - for httpx, clock and sockdiag. The conntrack
-table is read over ctnetlink with the standard library's syscall package.
+itself standard library only - for httpx, clock, sockdiag and conntrack (the
+table read over ctnetlink), and its dbusx module for the systemd conversation
+and the bus the tests talk to.
 
 ```shell
 mise install       # installs the pinned Go

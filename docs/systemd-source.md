@@ -98,7 +98,7 @@ type Source interface {
 // internal/daemon
 daemon.New(daemon.Deps{
 	Sources:    sources,     // run in this order, every pass
-	Conntrack:  dumper,      // activity.Conntrack(), over netlink
+	Conntrack:  dumper,      // detect.FromConntrack(conntrack.Kernel()), over netlink
 	Options:    options,     // Interval, ActivityInterval
 	Log:        log,
 	Status:     sink,        // status.None without --status-file
@@ -195,7 +195,8 @@ protocols. Each becomes a `PublishedPort` with `HostPort = ContainerPort`.
 
 Over the system bus, with [godbus](https://github.com/godbus/dbus) - one of
 Tidewaiter's two dependencies, the other being the author's own
-standard-library-only [gokit](https://github.com/danielbodart/gokit) - behind
+standard-library-only [gokit](https://github.com/danielbodart/gokit), whose
+`dbusx` module holds the systemd names, the subscription and a test bus - behind
 the narrow interface the source calls, so the source is tested against units in
 memory. The TypeScript carried a hand-written D-Bus client, lifted from
 Portical, to stay at zero dependencies; Go builds with its modules vendored, so
@@ -850,11 +851,11 @@ dump conntrack - run where it is and skip where it is not.
   (`foo.service` vs `foo.service2`) not matched; no cgroup, and
   `ErrUnknownCgroups`, both "cannot tell". The netlink lister itself is tested
   where it lives, in gokit's `sockdiag`.
-- **Conntrack over ctnetlink** - the request's bytes, and captured-shape dumps
-  decoded: TCP and UDP kept, the rest dropped, the original direction's
-  destination port, `IPS_ASSURED`, the TCP state named as `conntrack -L` names
-  it, an error or a truncated message an error and never an empty table; the
-  real kernel's table where permitted (skipped on EPERM), and in the VM test.
+- **Conntrack** - the dump over ctnetlink is tested where it lives, in gokit's
+  `conntrack`; here `detect.Reduce` keeps TCP and UDP and drops the rest, takes
+  the original direction's destination port, `IPS_ASSURED` and the TCP state
+  as `conntrack -L` names it, and `detect.FromConntrack` passes an error on,
+  never an empty table. The real kernel's table is read in the VM test.
 
 - **`NixProfiles`** - against a temporary directory and real `nix-env` where
   available (skipped otherwise): set creates the parent, generation numbers,
@@ -961,14 +962,14 @@ package depends only on the ones below it, with in-memory fakes in
 | `internal/source` | `Source`, `Pass`, `Outcome`, `MaxSwapFailures` |
 | `internal/daemon` | `Daemon`: shared dump, sources in turn, summary, status, activity tick, automatic reboot |
 | `internal/decide` | `Decide`, `Inputs`, `State`, `Words` |
-| `internal/detect` | the detectors, `ConntrackEntry` and `ConntrackDumper` |
-| `internal/activity` | the conntrack dump over ctnetlink, and `/proc` netns reading |
+| `internal/detect` | the detectors, `ConntrackEntry` and `ConntrackDumper`, and `FromConntrack` over gokit's `conntrack.Kernel()` |
+| `internal/activity` | `/proc` netns reading |
 | `internal/health` | the shared checks, `Combine`, `Gate`, `BoundPorts` by netns and by cgroup |
 | `internal/docker` | the Docker Engine client over net/http, labels, the recreate, the Docker `Source` |
 | `internal/registry` | digests from the registry, its token auth and `~/.docker/config.json` |
 | `internal/status` | `Status`, `Sink`, `File`, `Describe`, the `status` command |
 | `internal/reboot` | `ParseWindow`, `Window`, the `NixOS` boot check, `Rebooter`, `Decide` |
-| `internal/systemd` | `ParsePolicy`, `Dir`, `UnitState`, `Bus`, `Verdict`, `DBus` over godbus, `Prepare`, the systemd `Source`: sections 2-5 and 7's swap side |
+| `internal/systemd` | `ParsePolicy`, `Dir`, `UnitState`, `Bus`, `Verdict`, `DBus` over godbus and gokit's `dbusx` (tested against `dbustest`'s bus), `Prepare`, the systemd `Source`: sections 2-5 and 7's swap side |
 | `internal/nix` | `Profiles`, `NixProfiles`, `GenerationOf`, `ClosureBinder`, `NixClosureBinder` |
 | `internal/statestore` | `UnitMemory`, the state file (the TypeScript's, read as it was) |
 | `internal/cli` | the flags, the commands, and the `Container` that wires it all |

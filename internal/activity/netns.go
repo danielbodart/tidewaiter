@@ -1,3 +1,7 @@
+// Package activity holds the /proc reader the activity detectors and health
+// checks are fed a process's socket tables from. The detectors themselves,
+// and what they make of these, are in internal/detect; the conntrack table
+// comes from gokit's conntrack, reduced by detect.FromConntrack.
 package activity
 
 import (

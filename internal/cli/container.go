@@ -13,6 +13,7 @@ import (
 	"syscall"
 
 	"github.com/danielbodart/gokit/clock"
+	"github.com/danielbodart/gokit/conntrack"
 	"github.com/danielbodart/gokit/httpx"
 	"github.com/danielbodart/gokit/sockdiag"
 	"github.com/danielbodart/tidewaiter/internal/activity"
@@ -131,7 +132,7 @@ func (c *Container) Wire() {
 		c.RuntimeDir = nix.DefaultRuntimeDir
 	}
 	if c.Conntrack == nil {
-		c.Conntrack = activity.Conntrack()
+		c.Conntrack = detect.FromConntrack(conntrack.Kernel())
 	}
 	if c.Netns == nil {
 		// The host's /proc, bind-mounted read-only at /host/proc in the
