@@ -80,6 +80,34 @@ Options: `-s/--source docker|systemd` (repeat or comma-separate; default `docker
 
 What `run` is doing goes to stdout, and what someone should look at - a pass that failed, a rollback that needs a person - to stderr. Under systemd it is a `Type=notify` service: ready once it is up, before its first pass, with what it is doing in `systemctl status` (see [systemd](docs/systemd.md)); under Docker there is no one to tell, and it says nothing. Registry and Docker requests name it as `tidewaiter/<version>`; a registry that answers 429, 5xx or not at all is asked twice more, one second then two apart, or after its `Retry-After` when that is ten seconds or less - a longer one leaves the container alone until the next pass.
 
+## Channels
+
+Tidewaiter ships through two channels, each built the way its consumers expect:
+
+- **Upstream** - the Docker image (`danielbodart/tidewaiter` and
+  `ghcr.io/danielbodart/tidewaiter`, for amd64, arm64 and armv7) and the
+  [GitHub releases](https://github.com/danielbodart/tidewaiter/releases): a static
+  binary and a tarball (binary, systemd unit, README, LICENSE) per architecture,
+  `SHA256SUMS`, and a cosign keyless signature of each
+  (`cosign verify-blob --bundle <asset>.sigstore.json --certificate-identity-regexp
+  '^https://github.com/danielbodart/tidewaiter/' --certificate-oidc-issuer
+  https://token.actions.githubusercontent.com <asset>`). Built by
+  [mise](https://mise.jdx.dev) with the Go `mise.toml` pins (`mise run dist`);
+  the image is that binary in an empty image. Consume it with `docker run
+  danielbodart/tidewaiter`, or the tarball and its unit as in
+  [docs/systemd.md](docs/systemd.md).
+- **Distro** - the flake's `packages.default` and `nixosModules.default`, built
+  by nixpkgs (nixos-26.05, `go_1_27`) and cached at `danielbodart.cachix.org`.
+  Consume it as a flake input with `inputs.nixpkgs.follows`, and
+  `services.tidewaiter`.
+
+A release is made when something it is built from changes (`RELEASE_PATHS` in
+`./run`), and only once every channel's tests pass: `mise run check`, the flake
+check with its NixOS VM test, the image run, and the tarball installed under
+systemd. Every dependency - the flake's inputs, mise's tools to their latest
+patch, the base image's digest and the Go modules - moves once a week, on
+Sunday at 21:23 UTC, committed straight to `master` when all of that passes.
+
 ## Development
 
 Tidewaiter is Go, and the standard library apart from two dependencies:
@@ -91,12 +119,12 @@ read over ctnetlink), and its dbusx module for the systemd conversation
 and the bus the tests talk to.
 
 ```shell
-mise install       # installs the pinned Go
-./run test         # go test, every package
-./run check        # gofmt and go vet
-./run build        # a static binary for this machine, into dist/
-./run release      # every architecture's binary, the unit and checksums, into dist/release/
-./run image        # the image, for every architecture, locally
+mise install       # installs the pinned Go, and cosign
+mise run check     # gofmt, go vet and go test, every package
+mise run build     # a static binary for this machine, into dist/
+mise run dist      # every architecture's binary and tarball, the unit and checksums, into dist/
+./run smoke        # the image for this machine from dist/, run: it must say its version
+./run image        # the image, for every architecture, from dist/
 nix build          # the Nix package, running the tests on the way
 nix flake check    # also the module check and the NixOS VM test (needs KVM)
 ```
@@ -109,10 +137,11 @@ is where conntrack meets a real kernel.
 
 ### Versions
 
-Every push to `master` publishes an image, tagged `:latest` and with an exact
-version, and a [GitHub release](https://github.com/danielbodart/tidewaiter/releases)
-of the same version, tagged `v<version>`, with the standalone binaries for `x64`,
-`arm64` and `armv7`, the systemd unit, and their `SHA256SUMS`.
+Every release publishes an image, tagged `:latest` and with an exact version,
+and a [GitHub release](https://github.com/danielbodart/tidewaiter/releases) of the
+same version, tagged `v<version>`, with the standalone binaries for `x64`,
+`arm64` and `armv7`, a tarball of each with the systemd unit, the unit itself,
+their `SHA256SUMS`, and a sigstore bundle for each.
 
 The number is derived from the repository rather than stored in it. Only the
 major is committed - in `MAJOR`, because that one is a decision, and it moves

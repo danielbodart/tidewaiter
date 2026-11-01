@@ -118,8 +118,8 @@ A window busy from start to end simply passes, and the next night's is tried the
 
 ## Without NixOS
 
-Nothing here needs NixOS, only Nix profiles and systemd. Every build of `master`
-is published as a [GitHub release](https://github.com/danielbodart/tidewaiter/releases),
+Nothing here needs NixOS, only Nix profiles and systemd. Every release is
+published as a [GitHub release](https://github.com/danielbodart/tidewaiter/releases),
 with a standalone binary for each architecture and a unit file to run it:
 
 | Asset | |
@@ -128,7 +128,9 @@ with a standalone binary for each architecture and a unit file to run it:
 | `tidewaiter-linux-arm64` | The binary, for 64-bit ARM - a Pi 3/4/5 on 64-bit Raspberry Pi OS, or an ARM NAS. |
 | `tidewaiter-linux-armv7` | The binary, for 32-bit ARMv7 - a Pi 2 onwards on 32-bit Raspberry Pi OS, or an armhf NAS. |
 | `tidewaiter.service` | The unit file. |
+| `tidewaiter-linux-<arch>.tar.gz` | The binary and the unit file together, with the README and LICENSE. |
 | `SHA256SUMS` | Checksums of the above. |
+| `*.sigstore.json` | A cosign keyless signature of each of the above, by this repository's CI. |
 
 The binaries are static, so they run on any distribution, glibc or musl. The
 conntrack table and the sockets are asked of the kernel over netlink, so the only
