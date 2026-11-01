@@ -1,6 +1,7 @@
 {
   lib,
-  buildGo127Module,
+  buildGoModule,
+  go_1_27,
   makeWrapper,
   nix,
   version,
@@ -9,10 +10,10 @@
 
 # The same static build as ./run, by nixpkgs' Go, and the check phase runs the
 # tests on the way - the ones that need a system bus, Docker, cgroupfs or
-# netlink permission skip themselves in the sandbox. buildGo127Module rather
-# than buildGoModule, which is still Go 1.26 in the pinned nixpkgs and would
-# refuse go.mod's `go 1.27`.
-buildGo127Module {
+# netlink permission skip themselves in the sandbox. With go_1_27, the
+# major.minor mise.toml pins, rather than nixpkgs' default Go, which is 1.26
+# and would refuse go.mod's `go 1.27`.
+(buildGoModule.override { go = go_1_27; }) {
   pname = "tidewaiter";
   inherit version src;
 

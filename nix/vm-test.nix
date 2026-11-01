@@ -110,7 +110,7 @@ pkgs.testers.runNixOSTest {
     # Until the test says otherwise, what is installed is what booted.
     systemd.tmpfiles.rules = [ "L+ /run/installed-system - - - - /run/booted-system" ];
     # So the boot before the automatic reboot can be read after it.
-    services.journald.settings.Journal.Storage = "persistent";
+    services.journald.storage = "persistent";
 
     systemd.services.echo-game = {
       wantedBy = [ "multi-user.target" ];
@@ -144,7 +144,6 @@ pkgs.testers.runNixOSTest {
       toplevel = nodes.machine.system.build.toplevel;
     in
     ''
-      import datetime as dt
       import json
 
       def target():
@@ -154,8 +153,8 @@ pkgs.testers.runNixOSTest {
           return machine.succeed("systemctl show -p InvocationID --value echo-game.service").strip()
 
       def answers(version):
-          machine.wait_until_succeeds(f"echo | socat -T2 - TCP:127.0.0.1:7777 | grep -x {version}", timeout=dt.timedelta(seconds=60))
-          machine.wait_until_succeeds(f"echo | socat -T2 - UDP:127.0.0.1:7777 | grep -x {version}", timeout=dt.timedelta(seconds=60))
+          machine.wait_until_succeeds(f"echo | socat -T2 - TCP:127.0.0.1:7777 | grep -x {version}", timeout=60)
+          machine.wait_until_succeeds(f"echo | socat -T2 - UDP:127.0.0.1:7777 | grep -x {version}", timeout=60)
 
       def switch(specialisation):
           machine.succeed(f"${toplevel}/specialisation/{specialisation}/bin/switch-to-configuration test")
@@ -170,7 +169,7 @@ pkgs.testers.runNixOSTest {
 
       def wait_passes(n=5):
           # Passes are every 2s; give it n of them.
-          machine.sleep(duration=dt.timedelta(seconds=2 * n))
+          machine.sleep(2 * n)
 
       machine.wait_for_unit("multi-user.target")
       machine.wait_for_unit("echo-game.service")
@@ -184,14 +183,14 @@ pkgs.testers.runNixOSTest {
           print(machine.succeed("cat /etc/tidewaiter/units/echo-game.service.json"))
 
       with subtest("idle, tidewaiter status says so and exits 0"):
-          machine.wait_until_succeeds("runuser -u nobody -- tidewaiter status", timeout=dt.timedelta(seconds=30))
+          machine.wait_until_succeeds("runuser -u nobody -- tidewaiter status", timeout=30)
           print(status()[1])
           # Type=notify: ready, and what it is doing in systemctl status.
-          machine.wait_until_succeeds("systemctl show -p StatusText --value tidewaiter.service | grep -q '^Idle: 1 unit up to date'", timeout=dt.timedelta(seconds=30))
+          machine.wait_until_succeeds("systemctl show -p StatusText --value tidewaiter.service | grep -q '^Idle: 1 unit up to date'", timeout=30)
 
       with subtest("a player shows up in tidewaiter status, which exits 1"):
           machine.succeed("systemd-run --unit=player ${player}")
-          machine.wait_until_succeeds(says("echo-game.service (systemd)  in use"), timeout=dt.timedelta(seconds=30))
+          machine.wait_until_succeeds(says("echo-game.service (systemd)  in use"), timeout=30)
           code, output = status()
           print(output)
           assert code == 1, f"tidewaiter status exited {code} with a player on"
@@ -218,15 +217,15 @@ pkgs.testers.runNixOSTest {
 
       with subtest("once the player has gone, it moves to v2, and status is idle again"):
           machine.succeed("systemctl stop player")
-          machine.wait_until_succeeds("readlink -f ${profile} | grep -qx ${v2}", timeout=dt.timedelta(seconds=120))
+          machine.wait_until_succeeds("readlink -f ${profile} | grep -qx ${v2}", timeout=120)
           answers("v2")
           assert invocation() != before, "echo-game was not restarted"
           machine.wait_until_succeeds("journalctl -u tidewaiter.service -o cat | grep -q 'updated to ${v2} and it is healthy'")
-          machine.wait_until_succeeds("runuser -u nobody -- tidewaiter status", timeout=dt.timedelta(seconds=30))
+          machine.wait_until_succeeds("runuser -u nobody -- tidewaiter status", timeout=30)
 
       with subtest("a bad version is rolled back, and pinned out"):
           switch("bad")
-          machine.wait_until_succeeds("journalctl -u tidewaiter.service -o cat | grep -q 'rolled back to ${v2}'", timeout=dt.timedelta(seconds=120))
+          machine.wait_until_succeeds("journalctl -u tidewaiter.service -o cat | grep -q 'rolled back to ${v2}'", timeout=120)
           assert target() == "${v2}", target()
           machine.wait_for_unit("echo-game.service")
           answers("v2")
@@ -251,14 +250,14 @@ pkgs.testers.runNixOSTest {
 
       with subtest("a needed reboot waits for the player, inside its window"):
           machine.succeed("systemd-run --unit=player2 ${player}")
-          machine.wait_until_succeeds(says("echo-game.service (systemd)  in use"), timeout=dt.timedelta(seconds=30))
+          machine.wait_until_succeeds(says("echo-game.service (systemd)  in use"), timeout=30)
           # An installed system whose kernel is not the one that booted.
           machine.succeed(
               "rm /run/installed-system && mkdir /run/installed-system"
               " && ln -s /run/booted-system/initrd /run/booted-system/kernel-modules /run/installed-system/"
               " && ln -s /run/booted-system/initrd /run/installed-system/kernel"
           )
-          machine.wait_until_succeeds("journalctl -u tidewaiter.service -o cat | grep -q 'needed, kernel changed since boot; waiting: echo-game.service in use'", timeout=dt.timedelta(seconds=30))
+          machine.wait_until_succeeds("journalctl -u tidewaiter.service -o cat | grep -q 'needed, kernel changed since boot; waiting: echo-game.service in use'", timeout=30)
           wait_passes()
           machine.succeed("true")
           code, output = status()
@@ -270,14 +269,14 @@ pkgs.testers.runNixOSTest {
           boot = machine.succeed("cat /proc/sys/kernel/random/boot_id").strip()
           machine.succeed("systemctl stop player2")
           # The test driver runs the VM with -no-reboot: a reboot powers it off.
-          machine.wait_for_shutdown(timeout=dt.timedelta(seconds=120))
+          machine.wait_for_shutdown()
           machine.start()
           machine.wait_for_unit("tidewaiter.service")
           assert machine.succeed("cat /proc/sys/kernel/random/boot_id").strip() != boot
           print(machine.succeed("journalctl -b -1 -u tidewaiter.service -o cat --no-pager | tail -n 20"))
           machine.succeed("journalctl -b -1 -u tidewaiter.service -o cat | grep -q 'kernel changed since boot; rebooting, as nothing is in use'")
           # Booted again, installed is booted: nothing more to do.
-          machine.wait_until_succeeds("journalctl -b 0 -u tidewaiter.service -o cat | grep -q 'Automatic reboot (00:00-24:00): not needed'", timeout=dt.timedelta(seconds=30))
+          machine.wait_until_succeeds("journalctl -b 0 -u tidewaiter.service -o cat | grep -q 'Automatic reboot (00:00-24:00): not needed'", timeout=30)
           answers("v2")
     '';
 }
