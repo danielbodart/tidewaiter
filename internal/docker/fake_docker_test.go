@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/danielbodart/gokit/httpx"
 	"github.com/danielbodart/tidewaiter/internal/model"
 	"github.com/danielbodart/tidewaiter/internal/registry"
 )
@@ -78,7 +79,9 @@ type fakeDocker struct {
 	wake    chan struct{}
 	streams map[int]chan struct{}
 	opened  int
-	mux     *http.ServeMux
+	// The Engine API versions this Docker speaks, in front of mux.
+	api *versioned
+	mux *http.ServeMux
 }
 
 type pull struct{ ref, auth string }
@@ -104,25 +107,31 @@ func newFakeDocker() *fakeDocker {
 		wake: make(chan struct{}, 1), streams: map[int]chan struct{}{},
 	}
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /v1.41/containers/json", f.list)
-	mux.HandleFunc("GET /v1.41/containers/{id}/json", f.inspect)
-	mux.HandleFunc("GET /v1.41/containers/{id}/stats", f.stats)
-	mux.HandleFunc("GET /v1.41/images/{name}/json", f.image)
-	mux.HandleFunc("GET /v1.41/networks/{name}", f.network)
-	mux.HandleFunc("GET /v1.41/events", f.events)
-	mux.HandleFunc("POST /v1.41/images/create", f.pull)
-	mux.HandleFunc("POST /v1.41/containers/create", f.create)
-	mux.HandleFunc("POST /v1.41/containers/{id}/start", f.start)
-	mux.HandleFunc("POST /v1.41/containers/{id}/stop", f.stop)
-	mux.HandleFunc("POST /v1.41/containers/{id}/rename", f.rename)
-	mux.HandleFunc("DELETE /v1.41/containers/{id}", f.remove)
-	mux.HandleFunc("DELETE /v1.41/images/{name}", f.removeImage)
-	mux.HandleFunc("POST /v1.41/networks/{name}/connect", f.connect)
+	mux.HandleFunc("GET /{version}/containers/json", f.list)
+	mux.HandleFunc("GET /{version}/containers/{id}/json", f.inspect)
+	mux.HandleFunc("GET /{version}/containers/{id}/stats", f.stats)
+	mux.HandleFunc("GET /{version}/images/{name}/json", f.image)
+	mux.HandleFunc("GET /{version}/networks/{name}", f.network)
+	mux.HandleFunc("GET /{version}/events", f.events)
+	mux.HandleFunc("POST /{version}/images/create", f.pull)
+	mux.HandleFunc("POST /{version}/containers/create", f.create)
+	mux.HandleFunc("POST /{version}/containers/{id}/start", f.start)
+	mux.HandleFunc("POST /{version}/containers/{id}/stop", f.stop)
+	mux.HandleFunc("POST /{version}/containers/{id}/rename", f.rename)
+	mux.HandleFunc("DELETE /{version}/containers/{id}", f.remove)
+	mux.HandleFunc("DELETE /{version}/images/{name}", f.removeImage)
+	mux.HandleFunc("POST /{version}/networks/{name}/connect", f.connect)
 	f.mux = mux
+	f.api = &versioned{oldest: "1.24", newest: NewestAPI, next: mux}
 	return f
 }
 
-func (f *fakeDocker) ServeHTTP(w http.ResponseWriter, r *http.Request) { f.mux.ServeHTTP(w, r) }
+func (f *fakeDocker) ServeHTTP(w http.ResponseWriter, r *http.Request) { f.api.ServeHTTP(w, r) }
+
+// client is a Client talking to this Docker.
+func (f *fakeDocker) client() *Client {
+	return NewClient(httpx.StreamingHandlerTransport(f), nil)
+}
 
 // add runs containers, without saying so on the event stream.
 func (f *fakeDocker) add(containers ...model.RunningContainer) {

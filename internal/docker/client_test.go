@@ -163,12 +163,18 @@ func TestSpecDropsANoRestartPolicy(t *testing.T) {
 func recording(handler http.HandlerFunc) (*Client, func() []*http.Request) {
 	var mu sync.Mutex
 	var requests []*http.Request
+	// Docker's versions are answered here and not recorded, so a test sees
+	// only the requests it made.
 	client := NewClient(httpx.StreamingHandlerTransport(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/version" {
+			answer(w, http.StatusOK, map[string]string{"ApiVersion": NewestAPI, "MinAPIVersion": "1.24"})
+			return
+		}
 		mu.Lock()
 		requests = append(requests, r)
 		mu.Unlock()
 		handler(w, r)
-	})))
+	})), nil)
 	return client, func() []*http.Request {
 		mu.Lock()
 		defer mu.Unlock()
@@ -190,7 +196,7 @@ func TestImageDigestReadsTheFirstRepoDigestWithoutItsRepository(t *testing.T) {
 		t.Errorf("got %q, %v", digest, err)
 	}
 	// One path segment, however many slashes the ref has.
-	if path := requests()[0].URL.EscapedPath(); path != "/v1.41/images/ghcr.io%2Fme%2Fapp:1/json" {
+	if path := requests()[0].URL.EscapedPath(); path != "/v"+NewestAPI+"/images/ghcr.io%2Fme%2Fapp:1/json" {
 		t.Errorf("asked %s", path)
 	}
 }
@@ -256,7 +262,7 @@ func TestNetworkDriverReadsTheDriverAndAsksForTheNetworkByName(t *testing.T) {
 	if driver, err := client.NetworkDriver(context.Background(), "pub-net"); err != nil || driver != "macvlan" {
 		t.Errorf("got %q, %v", driver, err)
 	}
-	if path := requests()[0].URL.Path; path != "/v1.41/networks/pub-net" {
+	if path := requests()[0].URL.Path; path != "/v"+NewestAPI+"/networks/pub-net" {
 		t.Errorf("asked %s", path)
 	}
 }
@@ -328,7 +334,7 @@ func TestStopPassesTheGraceAsT(t *testing.T) {
 	if err := client.Stop(context.Background(), "web", 15); err != nil {
 		t.Fatal(err)
 	}
-	if request := requests()[0]; request.URL.Path != "/v1.41/containers/web/stop" || request.URL.Query().Get("t") != "15" {
+	if request := requests()[0]; request.URL.Path != "/v"+NewestAPI+"/containers/web/stop" || request.URL.Query().Get("t") != "15" {
 		t.Errorf("asked %v", request.URL)
 	}
 }
@@ -336,7 +342,7 @@ func TestStopPassesTheGraceAsT(t *testing.T) {
 func TestADockerErrorNamesTheEndpointAndCarriesDockersWords(t *testing.T) {
 	client, _ := recording(replying(500, `{"message":"boom"}`))
 	err := client.Start(context.Background(), "web")
-	if err == nil || !strings.Contains(err.Error(), "/v1.41/containers/web/start") || !strings.Contains(err.Error(), "boom") {
+	if err == nil || !strings.Contains(err.Error(), "/v"+NewestAPI+"/containers/web/start") || !strings.Contains(err.Error(), "boom") {
 		t.Errorf("got %v", err)
 	}
 }
@@ -374,7 +380,7 @@ func TestAContainerWithNoNetworksBlockTotalsZero(t *testing.T) {
 func TestContainersInspectsEachLabelledContainer(t *testing.T) {
 	docker := newFakeDocker()
 	docker.add(container("web"), container("other", func(c *model.RunningContainer) { c.Spec.Labels = map[string]string{} }))
-	containers, err := NewClient(httpx.HandlerTransport(docker)).Containers(context.Background(), AutoupdateLabel)
+	containers, err := NewClient(httpx.HandlerTransport(docker), nil).Containers(context.Background(), AutoupdateLabel)
 	if err != nil || len(containers) != 1 || containers[0].Spec.Name != "web" || containers[0].PID != 4242 {
 		t.Errorf("got %+v, %v", containers, err)
 	}
@@ -382,7 +388,7 @@ func TestContainersInspectsEachLabelledContainer(t *testing.T) {
 
 func TestEventsHandsOverEachEventAsItHappensWithTheHealthVerdictSplitOut(t *testing.T) {
 	docker := newFakeDocker()
-	client := NewClient(httpx.StreamingHandlerTransport(docker))
+	client := NewClient(httpx.StreamingHandlerTransport(docker), nil)
 	docker.emit(Event{Action: "start", Container: "web"})
 	docker.emit(Event{Action: "health_status: unhealthy", Container: "web"})
 
@@ -401,7 +407,7 @@ func TestEventsHandsOverEachEventAsItHappensWithTheHealthVerdictSplitOut(t *test
 
 func TestEventsEndsWithItsContextAndLetsGoOfTheStream(t *testing.T) {
 	docker := newFakeDocker()
-	client := NewClient(httpx.StreamingHandlerTransport(docker))
+	client := NewClient(httpx.StreamingHandlerTransport(docker), nil)
 	ctx, cancel := context.WithCancel(context.Background())
 	ended := make(chan error)
 	go func() { ended <- client.Events(ctx, AutoupdateLabel, func(Event) bool { return false }) }()
@@ -416,7 +422,7 @@ func TestEventsEndsWithItsContextAndLetsGoOfTheStream(t *testing.T) {
 
 func TestEventsReturnsWhenDockerDropsTheStream(t *testing.T) {
 	docker := newFakeDocker()
-	client := NewClient(httpx.StreamingHandlerTransport(docker))
+	client := NewClient(httpx.StreamingHandlerTransport(docker), nil)
 	ended := make(chan error)
 	go func() {
 		ended <- client.Events(context.Background(), AutoupdateLabel, func(Event) bool { return false })

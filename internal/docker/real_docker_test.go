@@ -43,7 +43,7 @@ func realDocker(t *testing.T, images ...string) *Client {
 	if _, err := os.Stat(socket); err != nil {
 		t.Skipf("no Docker socket: %v", err)
 	}
-	client := NewClient(httpx.UnixSocket(socket))
+	client := NewClient(httpx.UnixSocket(socket), nil)
 	for _, image := range images {
 		if digest, err := client.ImageDigest(t.Context(), image); err != nil || digest == "" {
 			t.Skipf("%s is not here with a registry digest, and is never pulled for a test (%v)", image, err)
@@ -172,7 +172,11 @@ func swapReally(t *testing.T, change func(*model.ContainerSpec)) swapped {
 	ctx := t.Context()
 	tag := func(image string) {
 		t.Helper()
-		request, _ := http.NewRequestWithContext(ctx, http.MethodPost, "http://docker/v1.41/images/"+image+"/tag?repo=tw-e2e-app&tag=latest", nil)
+		version, err := client.apiVersion(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		request, _ := http.NewRequestWithContext(ctx, http.MethodPost, "http://docker/v"+version+"/images/"+image+"/tag?repo=tw-e2e-app&tag=latest", nil)
 		response, err := client.http.Do(request)
 		if err == nil {
 			err = httpx.Check(response)

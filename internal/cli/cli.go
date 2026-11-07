@@ -120,7 +120,7 @@ func run(ctx context.Context, c *Container, config Config) (int, error) {
 			options.Label = config.Label
 			options.DryRun = config.DryRun
 			sources = append(sources, docker.NewSource(docker.Deps{
-				Docker:   docker.NewClient(httpx.Decorate(c.DockerTransport(config.Socket), identified)),
+				Docker:   docker.NewClient(httpx.Decorate(c.DockerTransport(config.Socket), identified), c.Log),
 				Registry: registry.New(httpx.Decorate(c.RegistryTransport, identified), auth, c.Clock),
 				Auth:     auth,
 				Netns:    c.Netns,

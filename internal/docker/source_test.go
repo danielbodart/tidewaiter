@@ -54,7 +54,7 @@ func newWorld(t *testing.T, settings ...setting) *world {
 	options := DefaultOptions
 	options.HealthPoll = time.Millisecond
 	deps := Deps{
-		Docker: NewClient(httpx.StreamingHandlerTransport(w.docker)), Netns: w.netns, TCP: w.tcp,
+		Docker: NewClient(httpx.StreamingHandlerTransport(w.docker), nil), Netns: w.netns, TCP: w.tcp,
 		Options: options, Log: w.log, Clock: w.clock,
 	}
 	for _, apply := range settings {
