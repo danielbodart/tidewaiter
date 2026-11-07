@@ -66,7 +66,7 @@ func inspectJSON(t *testing.T, client *Client, name string) map[string]any {
 // goes back to it untouched. At the API version each MAC address rule turns
 // on, and the newest.
 func TestARealRecreatePassesEverythingThrough(t *testing.T) {
-	for _, version := range []string{"1.43", apiEndpointMAC, "1.51", apiInspectEndpointMAC, NewestAPI} {
+	for _, version := range []string{"1.43", apiEndpointMAC, "1.51", apiInspectEndpointMAC, apiConnectMAC, NewestAPI} {
 		t.Run("v"+version, func(t *testing.T) { roundTrip(t, version) })
 	}
 }
