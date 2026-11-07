@@ -15,7 +15,7 @@ import (
 // generically, so the tests see exactly what goes on the wire.
 func payload(t *testing.T, spec model.ContainerSpec) map[string]any {
 	t.Helper()
-	data, err := json.Marshal(CreatePayload(spec))
+	data, err := json.Marshal(CreatePayload(spec, NewestAPI))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -234,7 +234,7 @@ func TestARecreateOnANewImageIsAFreshCreateOfTheContainersOwnSettings(t *testing
 			own := spec("web")
 			change(&own)
 			running := merged(own, v1)
-			recreated, err := specOf("web", []byte(jsonOf(CreatePayload(WithoutImageDefaults(running, v1)))))
+			recreated, err := specOf("web", []byte(jsonOf(CreatePayload(WithoutImageDefaults(running, v1), NewestAPI))), NewestAPI)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -315,7 +315,7 @@ func TestCreateReplaysABindingWhoseHostPortDockerPicks(t *testing.T) {
 	expectJSON(t, "PortBindings", host["PortBindings"],
 		`{"80/tcp":[{}],"81/tcp":[{"HostIp":"127.0.0.1"}],"82/tcp":[{"HostPort":"18000-18010"}],"90/tcp":[{"HostPort":"18100"}],"91/udp":[{"HostPort":"18101"}]}`)
 	// And read back as Docker would show it, the same bindings again.
-	recreated, err := specOf("web", []byte(jsonOf(CreatePayload(spec))))
+	recreated, err := specOf("web", []byte(jsonOf(CreatePayload(spec, NewestAPI))), NewestAPI)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -385,7 +385,7 @@ func TestCreateCarriesDevicesAndPrivileged(t *testing.T) {
 func TestCreateAttachesOnlyTheFirstNetworkWithItsAliasesAndAddress(t *testing.T) {
 	sent := payload(t, fixture(t, "inspect-multinet.json").Spec())
 	expectJSON(t, "NetworkingConfig", sent["NetworkingConfig"], `{"EndpointsConfig":{"frontend":{"Aliases":["api"]}}}`)
-	expectJSON(t, "backend", endpointOf(ExtraNetworks(fixture(t, "inspect-multinet.json").Spec())[0]), `{"Aliases":["api-internal"],"IPAMConfig":{"IPv4Address":"172.28.0.5"}}`)
+	expectJSON(t, "backend", endpointOf(ExtraNetworks(fixture(t, "inspect-multinet.json").Spec())[0], NewestAPI, true), `{"Aliases":["api-internal"],"IPAMConfig":{"IPv4Address":"172.28.0.5"}}`)
 }
 
 func TestCreateNeverLeaksARuntimeOnlyField(t *testing.T) {
@@ -406,7 +406,7 @@ func TestCreateNeverLeaksARuntimeOnlyField(t *testing.T) {
 func TestARecreatedContainerInspectsAsTheOriginal(t *testing.T) {
 	for _, name := range []string{"inspect-nginx.json", "inspect-multinet.json"} {
 		original := fixture(t, name).Spec()
-		recreated, err := specOf(original.Name, []byte(jsonOf(CreatePayload(original))))
+		recreated, err := specOf(original.Name, []byte(jsonOf(CreatePayload(original, NewestAPI))), NewestAPI)
 		if err != nil {
 			t.Fatal(err)
 		}

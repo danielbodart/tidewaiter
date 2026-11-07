@@ -229,7 +229,8 @@ func (c *Client) Create(ctx context.Context, spec model.ContainerSpec) (string, 
 	var created struct {
 		ID string `json:"Id"`
 	}
-	err := c.quick(ctx, http.MethodPost, "/containers/create", url.Values{"name": {spec.Name}}, CreatePayload(spec), &created)
+	payload := perVersion(func(version string) any { return CreatePayload(spec, version) })
+	err := c.quick(ctx, http.MethodPost, "/containers/create", url.Values{"name": {spec.Name}}, payload, &created)
 	return created.ID, err
 }
 
@@ -266,7 +267,9 @@ func (c *Client) RemoveImage(ctx context.Context, image string) error {
 
 // ConnectNetwork attaches an already-created container to another network.
 func (c *Client) ConnectNetwork(ctx context.Context, container string, network model.NetworkAttachment) error {
-	body := map[string]any{"Container": container, "EndpointConfig": endpointOf(network)}
+	body := perVersion(func(version string) any {
+		return map[string]any{"Container": container, "EndpointConfig": endpointOf(network, version, true)}
+	})
 	return c.quick(ctx, http.MethodPost, "/networks/"+url.PathEscape(network.Name)+"/connect", nil, body, nil)
 }
 
@@ -373,27 +376,48 @@ func (c *Client) Events(ctx context.Context, label string, notify func(Event) (s
 // downgraded since the version was negotiated - is asked once more in a
 // freshly negotiated one.
 func (c *Client) do(ctx context.Context, method, path string, query url.Values, body any, prepare func(*http.Request)) (*http.Response, error) {
-	var data []byte
-	if body != nil {
-		var err error
-		if data, err = json.Marshal(body); err != nil {
+	attempt := func(version string) (*http.Response, error) {
+		data, err := encode(body, version)
+		if err != nil {
 			return nil, fmt.Errorf("Docker API %s failed: %w", path, err)
 		}
+		return c.send(ctx, version, method, path, query, data, prepare)
 	}
 	version, err := c.apiVersion(ctx)
 	if err != nil {
 		return nil, err
 	}
-	response, err := c.send(ctx, version, method, path, query, data, prepare)
+	response, err := attempt(version)
 	if versionRefused(err) {
 		c.forget(version)
 		if version, err = c.apiVersion(ctx); err != nil {
 			return nil, err
 		}
-		response, err = c.send(ctx, version, method, path, query, data, prepare)
+		response, err = attempt(version)
 	}
 	return response, err
 }
+
+// perVersion is a request body that depends on the version it is sent in,
+// so a field is only ever sent to a daemon whose version knows it - even
+// when a call is asked again in a renegotiated one.
+type perVersion func(version string) any
+
+// encode is body as JSON for version, or nil for no body.
+func encode(body any, version string) ([]byte, error) {
+	if build, ok := body.(perVersion); ok {
+		body = build(version)
+	}
+	if body == nil {
+		return nil, nil
+	}
+	return json.Marshal(body)
+}
+
+// readsVersion is a reply that needs the version it was read in.
+type readsVersion interface{ readIn(version string) }
+
+func (raw *Inspected) readIn(version string) { raw.APIVersion = version }
 
 // send is one request in version.
 func (c *Client) send(ctx context.Context, version, method, path string, query url.Values, data []byte, prepare func(*http.Request)) (*http.Response, error) {
@@ -461,6 +485,9 @@ func (c *Client) bounded(ctx context.Context, timeout time.Duration, method, pat
 	if err := json.NewDecoder(response.Body).Decode(into); err != nil {
 		return failed(response, err)
 	}
+	if reader, ok := into.(readsVersion); ok {
+		reader.readIn(strings.TrimPrefix(strings.SplitN(response.Request.URL.Path, "/", 3)[1], "v"))
+	}
 	return nil
 }
 
@@ -487,6 +514,10 @@ func filters(spec map[string][]string) string {
 
 // Inspected is the shape of `docker inspect <container>` read.
 type Inspected struct {
+	// The Engine API version it was read in, which decides what some fields
+	// mean - see networksOf. Set by the client, not read from the JSON.
+	APIVersion string `json:"-"`
+
 	ID    string `json:"Id"`
 	Name  string
 	Image string
@@ -501,10 +532,10 @@ type Inspected struct {
 	Config     InspectedConfig
 	HostConfig struct {
 		// Long-form, as created: a volume's Source is its name.
-		Mounts []struct {
-			Type, Source, Target string
-			ReadOnly             bool
-		}
+		Mounts        []HostMount
+		Tmpfs         map[string]string
+		Annotations   map[string]string
+		Umask         *uint32
 		PortBindings  map[string][]struct{ HostIP, HostPort string }
 		RestartPolicy *struct {
 			Name              string
@@ -531,7 +562,10 @@ type Inspected struct {
 // The slices keep JSON's null apart from []: an Entrypoint of [] is a
 // container that asked for none, where null is one that left it to its image.
 type InspectedConfig struct {
-	Image        string
+	Image string
+	// The MAC address the container asked for on its own network. Inspect
+	// shows it here, and only when one was asked for, before API 1.52.
+	MacAddress   string
 	Env          []string
 	Cmd          []string
 	Entrypoint   []string
@@ -542,11 +576,12 @@ type InspectedConfig struct {
 	StopSignal   string
 	StopTimeout  *int
 	Healthcheck  *struct {
-		Test        []string
-		Interval    time.Duration
-		Timeout     time.Duration
-		Retries     int
-		StartPeriod time.Duration
+		Test          []string
+		Interval      time.Duration
+		Timeout       time.Duration
+		Retries       int
+		StartPeriod   time.Duration
+		StartInterval time.Duration
 	}
 }
 
@@ -562,7 +597,7 @@ func (config InspectedConfig) healthcheck() *model.Healthcheck {
 	}
 	found := &model.Healthcheck{
 		Test: check.Test, Interval: check.Interval, Timeout: check.Timeout,
-		Retries: check.Retries, StartPeriod: check.StartPeriod,
+		Retries: check.Retries, StartPeriod: check.StartPeriod, StartInterval: check.StartInterval,
 	}
 	if found.Unset() {
 		return nil
@@ -594,14 +629,46 @@ type InspectedMount struct {
 	Source      string
 	Destination string
 	RW          bool
+	Propagation string
+}
+
+// HostMount is a mount as HostConfig.Mounts shows it: as it was asked for,
+// options and all.
+type HostMount struct {
+	Type, Source, Target string
+	ReadOnly             bool
+	BindOptions          *struct {
+		Propagation            string
+		NonRecursive           bool
+		CreateMountpoint       bool
+		ReadOnlyNonRecursive   bool
+		ReadOnlyForceRecursive bool
+	}
+	VolumeOptions *struct {
+		NoCopy  bool
+		Subpath string
+	}
+	TmpfsOptions *struct {
+		SizeBytes int64
+		Mode      uint32
+		Options   [][]string
+	}
+	ImageOptions *struct {
+		Subpath string
+	}
 }
 
 type InspectedNetwork struct {
 	Aliases    []string
 	IPAMConfig *struct {
-		IPv4Address string
-		IPv6Address string
+		IPv4Address  string
+		IPv6Address  string
+		LinkLocalIPs []string
 	}
+	// What Docker reports, which is the address in use, whether asked for or
+	// picked by Docker - see networksOf.
+	MacAddress string
+	GwPriority int
 	// The runtime address, distinct from IPAMConfig's static one - what the
 	// container is reachable at on this network right now.
 	IPAddress string
@@ -652,7 +719,7 @@ func (raw Inspected) Spec() model.ContainerSpec {
 		Mounts:      raw.mounts(),
 		Bindings:    portBindingsOf(host.PortBindings),
 		Exposed:     orEmpty(slices.Sorted(maps.Keys(config.ExposedPorts))),
-		Networks:    networksOf(raw.NetworkSettings.Networks, host.NetworkMode),
+		Networks:    networksOf(raw.NetworkSettings.Networks, host.NetworkMode, raw.APIVersion, config.MacAddress),
 		NetworkMode: host.NetworkMode,
 		CapAdd:      orEmpty(host.CapAdd),
 		CapDrop:     orEmpty(host.CapDrop),
@@ -664,6 +731,9 @@ func (raw Inspected) Spec() model.ContainerSpec {
 		WorkingDir:  config.WorkingDir,
 		StopSignal:  config.StopSignal,
 		StopTimeout: config.StopTimeout,
+		Tmpfs:       host.Tmpfs,
+		Annotations: host.Annotations,
+		Umask:       host.Umask,
 	}
 	if spec.Labels == nil {
 		spec.Labels = map[string]string{}
@@ -684,7 +754,13 @@ var anonymousVolume = regexp.MustCompile(`^[0-9a-f]{64}$`)
 
 func (raw Inspected) mounts() []model.Mount {
 	mounts := []model.Mount{}
-	add := func(kind, name, source, target string, readOnly bool) {
+	// What was asked for long-form, by target: the options a mount was
+	// created with are only here.
+	asked := map[string]HostMount{}
+	for _, mount := range raw.HostConfig.Mounts {
+		asked[mount.Target] = mount
+	}
+	add := func(kind, name, source, target string, readOnly bool, propagation string) {
 		switch model.MountType(kind) {
 		case model.Bind, model.Volume, model.Tmpfs:
 		default:
@@ -699,24 +775,61 @@ func (raw Inspected) mounts() []model.Mount {
 			mount.Source = cmp.Or(name, source)
 			mount.Anonymous = anonymousVolume.MatchString(name)
 		}
+		if long, found := asked[target]; found && long.Type == kind {
+			withOptions(&mount, long)
+		} else if mount.Type == model.Bind && propagation != "rprivate" {
+			// A -v bind's propagation, as its mode suffix gave it; rprivate
+			// is Docker's default, so it is left to be the default again.
+			mount.Bind.Propagation = propagation
+		}
 		mounts = append(mounts, mount)
 	}
 	if raw.Mounts != nil {
 		for _, mount := range raw.Mounts {
-			add(mount.Type, mount.Name, mount.Source, mount.Destination, !mount.RW)
+			add(mount.Type, mount.Name, mount.Source, mount.Destination, !mount.RW, mount.Propagation)
 		}
-		return mounts
+	} else {
+		// Only an inspect with no Mounts at all falls back to what was asked
+		// for at create, where a volume's Source is its name.
+		for _, mount := range raw.HostConfig.Mounts {
+			name := ""
+			if mount.Type == string(model.Volume) {
+				name = mount.Source
+			}
+			add(mount.Type, name, mount.Source, mount.Target, mount.ReadOnly, "")
+		}
 	}
-	// Only an inspect with no Mounts at all falls back to what was asked for
-	// at create, where a volume's Source is its name.
-	for _, mount := range raw.HostConfig.Mounts {
-		name := ""
-		if mount.Type == string(model.Volume) {
-			name = mount.Source
+	// An image mount is read as it was asked for: its Source is the image
+	// it mounts, which the mounted view does not say the same way.
+	for _, long := range raw.HostConfig.Mounts {
+		if model.MountType(long.Type) == model.Image {
+			mount := model.Mount{Type: model.Image, Source: long.Source, Target: long.Target, ReadOnly: long.ReadOnly}
+			withOptions(&mount, long)
+			mounts = append(mounts, mount)
 		}
-		add(mount.Type, name, mount.Source, mount.Target, mount.ReadOnly)
 	}
 	return mounts
+}
+
+// withOptions gives mount the options it was created with long-form, and
+// marks a bind as created that way.
+func withOptions(mount *model.Mount, long HostMount) {
+	mount.LongForm = mount.Type == model.Bind
+	if options := long.BindOptions; options != nil {
+		mount.Bind = model.BindOptions{
+			Propagation: options.Propagation, NonRecursive: options.NonRecursive, CreateMountpoint: options.CreateMountpoint,
+			ReadOnlyNonRecursive: options.ReadOnlyNonRecursive, ReadOnlyForceRecursive: options.ReadOnlyForceRecursive,
+		}
+	}
+	if options := long.VolumeOptions; options != nil {
+		mount.Volume = model.VolumeOptions{NoCopy: options.NoCopy, Subpath: options.Subpath}
+	}
+	if options := long.TmpfsOptions; options != nil {
+		mount.Tmpfs = model.TmpfsOptions{SizeBytes: options.SizeBytes, Mode: options.Mode, Options: options.Options}
+	}
+	if options := long.ImageOptions; options != nil {
+		mount.Image = model.ImageOptions{Subpath: options.Subpath}
+	}
 }
 
 // portBindingsOf is every host binding the container was created with, each
@@ -772,18 +885,34 @@ var hostRange = regexp.MustCompile(`^[0-9]+-[0-9]+$`)
 // the rest are connected afterwards. Docker writes the map in name order,
 // which says nothing about which network is the container's own; NetworkMode
 // does.
-func networksOf(networks map[string]InspectedNetwork, mode string) []model.NetworkAttachment {
+//
+// A MAC address is kept only where inspect can say it is the container's.
+// Before API 1.52 it shows the one asked for on the container's own network
+// as Config.MacAddress (configMAC), and only when one was; a network's own
+// MacAddress is then the address in use, which older Dockers derive from the
+// IP, so pinning it could later clash with another container's. From 1.52
+// the network's MacAddress is all there is, and Docker 29, the first to
+// speak 1.52, picks a random one for each endpoint, so keeping it is safe.
+func networksOf(networks map[string]InspectedNetwork, mode, version, configMAC string) []model.NetworkAttachment {
 	names := slices.Sorted(maps.Keys(networks))
 	if index := slices.Index(names, mode); index > 0 {
 		names = slices.Concat([]string{mode}, slices.Delete(names, index, index+1))
 	}
+	endpointMACs := atLeast(version, apiInspectEndpointMAC)
 	attachments := []model.NetworkAttachment{}
-	for _, name := range names {
+	for i, name := range names {
 		network := networks[name]
-		attachment := model.NetworkAttachment{Name: name, Aliases: orEmpty(network.Aliases), IPAddress: network.IPAddress}
+		attachment := model.NetworkAttachment{Name: name, Aliases: orEmpty(network.Aliases), IPAddress: network.IPAddress, GwPriority: network.GwPriority}
 		if network.IPAMConfig != nil {
 			attachment.IPv4Address = network.IPAMConfig.IPv4Address
 			attachment.IPv6Address = network.IPAMConfig.IPv6Address
+			attachment.LinkLocalIPs = network.IPAMConfig.LinkLocalIPs
+		}
+		switch {
+		case endpointMACs:
+			attachment.MacAddress = network.MacAddress
+		case i == 0:
+			attachment.MacAddress = configMAC
 		}
 		attachments = append(attachments, attachment)
 	}

@@ -65,10 +65,21 @@ A malformed label is reported and the default used — one bad label never stops
 
 A swap recreates the container under the same name from what `docker inspect`
 says of it, on the new image. Everything that is the container's own comes
-across: its env and labels, mounts, port bindings (host address included),
-networks with their aliases and static addresses, restart policy, caps,
-devices, sysctls, extra hosts, user, working dir, stop signal and timeout, and
-any command, entrypoint or healthcheck it was given.
+across: its env and labels, mounts with their options (a bind's propagation and
+`--mount` bind options, a volume's `nocopy` and subpath, a tmpfs's size, mode and
+options, image mounts), `--tmpfs`, port bindings (host address included),
+networks with their aliases, static and link-local addresses, MAC address and
+gateway priority, restart policy, caps, devices, sysctls, extra hosts,
+annotations, umask, user, working dir, stop signal and timeout, and any command,
+entrypoint or healthcheck it was given, start interval included.
+
+A setting newer than the Engine API version Tidewaiter settled on with the
+daemon is left out of the recreate rather than sent to a Docker that doesn't
+know it; in practice the Docker that let you set it speaks a version that
+carries it. A MAC address is kept on the container's own network wherever it
+was asked for, and on Docker 29 and newer, which say only the address in use
+and pick a random one, every network's address is kept, the ones connected
+after the create from API 1.54, the first that applies it there.
 
 What it only had from its *old image* does not: inspect shows a container's
 config already merged with its image's, so anything equal to the old image's

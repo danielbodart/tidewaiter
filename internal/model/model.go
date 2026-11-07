@@ -147,6 +147,14 @@ type ContainerSpec struct {
 	// The container's own stop timeout, in seconds, if it set one.
 	StopTimeout *int
 	Healthcheck *Healthcheck
+	// What --tmpfs asked for, by target: options as Docker takes them, such
+	// as "size=64m". Not a Mount: Docker keeps these apart and reports them
+	// only here.
+	Tmpfs map[string]string
+	// HostConfig.Annotations, passed to the runtime.
+	Annotations map[string]string
+	// The initial umask of the container's processes, if it set one.
+	Umask *uint32
 }
 
 // MountType is Docker's long-form mount type.
@@ -156,10 +164,12 @@ const (
 	Bind   MountType = "bind"
 	Volume MountType = "volume"
 	Tmpfs  MountType = "tmpfs"
+	// An image's filesystem mounted into the container.
+	Image MountType = "image"
 )
 
-// Mount is faithful to Docker's long form, so bind, volume and tmpfs mounts
-// survive a recreate.
+// Mount is faithful to Docker's long form, so bind, volume, tmpfs and image
+// mounts survive a recreate with their options.
 type Mount struct {
 	Type     MountType
 	Source   string
@@ -167,6 +177,44 @@ type Mount struct {
 	ReadOnly bool
 	// A volume with no name - recreate cannot reproduce it faithfully.
 	Anonymous bool
+	// A bind created long-form (--mount, HostConfig.Mounts) rather than with
+	// -v (HostConfig.Binds). Only the long form takes BindOptions, and it
+	// does not create a missing source directory, as a -v bind does. Every
+	// other type is long-form whatever this says.
+	LongForm bool
+	Bind     BindOptions
+	Volume   VolumeOptions
+	Tmpfs    TmpfsOptions
+	Image    ImageOptions
+}
+
+// BindOptions is a bind mount's options. Propagation is "" for Docker's
+// default, rprivate.
+type BindOptions struct {
+	Propagation            string
+	NonRecursive           bool
+	CreateMountpoint       bool
+	ReadOnlyNonRecursive   bool
+	ReadOnlyForceRecursive bool
+}
+
+// VolumeOptions is a named volume's options that belong to the mount rather
+// than to the volume, which already exists.
+type VolumeOptions struct {
+	NoCopy  bool
+	Subpath string
+}
+
+// TmpfsOptions is a long-form tmpfs mount's options.
+type TmpfsOptions struct {
+	SizeBytes int64
+	Mode      uint32
+	Options   [][]string
+}
+
+// ImageOptions is an image mount's options.
+type ImageOptions struct {
+	Subpath string
 }
 
 // NetworkAttachment is a network the container is attached to, with anything
@@ -177,6 +225,12 @@ type NetworkAttachment struct {
 	// A static address, when one was assigned rather than handed out by IPAM.
 	IPv4Address string
 	IPv6Address string
+	// Link-local addresses asked for on top of IPAM's.
+	LinkLocalIPs []string
+	// The MAC address to keep on this network, or "" to let Docker pick one.
+	MacAddress string
+	// Which network gives the default gateway: the highest wins.
+	GwPriority int
 	// The address the container is ACTUALLY reachable at right now, as Docker
 	// reports it under `NetworkSettings.Networks[name].IPAddress` - the
 	// runtime IP IPAM handed out, distinct from the static IPv4Address a user
@@ -211,12 +265,14 @@ type Healthcheck struct {
 	Timeout     time.Duration
 	Retries     int
 	StartPeriod time.Duration
+	// How often to check during StartPeriod.
+	StartInterval time.Duration
 }
 
 // Unset is whether the healthcheck sets nothing at all, leaving every field
 // to the image.
 func (check Healthcheck) Unset() bool {
-	return len(check.Test) == 0 && check.Interval == 0 && check.Timeout == 0 && check.Retries == 0 && check.StartPeriod == 0
+	return len(check.Test) == 0 && check.Interval == 0 && check.Timeout == 0 && check.Retries == 0 && check.StartPeriod == 0 && check.StartInterval == 0
 }
 
 // RunningContainer is a container as it is running now, with the facts an

@@ -5,6 +5,7 @@ import (
 	"maps"
 	"slices"
 	"strconv"
+	"strings"
 
 	"github.com/danielbodart/tidewaiter/internal/model"
 )
@@ -141,6 +142,9 @@ func ownHealthcheck(check, image *model.Healthcheck) *model.Healthcheck {
 	if own.StartPeriod == image.StartPeriod {
 		own.StartPeriod = 0
 	}
+	if own.StartInterval == image.StartInterval {
+		own.StartInterval = 0
+	}
 	if own.Unset() {
 		return nil
 	}
@@ -167,7 +171,11 @@ func sameList(a, b []string) bool {
 //
 // Only the *first* network is attached at create: Docker's create takes
 // exactly one endpoint, and the rest are connected afterwards (ExtraNetworks).
-func CreatePayload(spec model.ContainerSpec) map[string]any {
+//
+// version is the Engine API version it is sent in: a field newer than that
+// is left out, as it was before Tidewaiter knew it, rather than sent to a
+// daemon that does not (see the api* minimums).
+func CreatePayload(spec model.ContainerSpec, version string) map[string]any {
 	payload := map[string]any{
 		"Image":  spec.Image,
 		"Env":    orEmpty(spec.Env),
@@ -201,10 +209,14 @@ func CreatePayload(spec model.ContainerSpec) map[string]any {
 		if len(check.Test) > 0 {
 			healthcheck["Test"] = check.Test
 		}
-		for key, value := range map[string]int64{
+		timings := map[string]int64{
 			"Interval": int64(check.Interval), "Timeout": int64(check.Timeout),
 			"Retries": int64(check.Retries), "StartPeriod": int64(check.StartPeriod),
-		} {
+		}
+		if atLeast(version, apiStartInterval) {
+			timings["StartInterval"] = int64(check.StartInterval)
+		}
+		for key, value := range timings {
 			if value != 0 {
 				healthcheck[key] = value
 			}
@@ -214,7 +226,7 @@ func CreatePayload(spec model.ContainerSpec) map[string]any {
 
 	host := map[string]any{
 		"Binds":        binds(spec),
-		"Mounts":       longFormMounts(spec),
+		"Mounts":       longFormMounts(spec, version),
 		"PortBindings": portBindings(spec),
 		"Privileged":   spec.Privileged,
 	}
@@ -237,13 +249,57 @@ func CreatePayload(spec model.ContainerSpec) map[string]any {
 	if len(spec.Sysctls) > 0 {
 		host["Sysctls"] = spec.Sysctls
 	}
+	if len(spec.Tmpfs) > 0 {
+		host["Tmpfs"] = spec.Tmpfs
+	}
+	if len(spec.Annotations) > 0 && atLeast(version, apiAnnotations) {
+		host["Annotations"] = spec.Annotations
+	}
+	if spec.Umask != nil && atLeast(version, apiUmask) {
+		host["Umask"] = *spec.Umask
+	}
 	payload["HostConfig"] = host
 
 	if len(spec.Networks) > 0 {
 		primary := spec.Networks[0]
-		payload["NetworkingConfig"] = map[string]any{"EndpointsConfig": map[string]any{primary.Name: endpointOf(primary)}}
+		payload["NetworkingConfig"] = map[string]any{"EndpointsConfig": map[string]any{primary.Name: endpointOf(primary, version, false)}}
+		// Before the endpoint took one, a MAC address was the container's
+		// own, and went on its own network.
+		if primary.MacAddress != "" && !atLeast(version, apiEndpointMAC) {
+			payload["MacAddress"] = primary.MacAddress
+		}
 	}
 	return payload
+}
+
+// The Engine API version each field a recreate carries first appeared in.
+// Below it the field is left out of a create or connect; Mounts long-form
+// and the fields beside them that need nothing newer than 1.25 are not
+// listed.
+const (
+	apiBindNonRecursive  = "1.40" // BindOptions.NonRecursive
+	apiCreateMountpoint  = "1.42" // BindOptions.CreateMountpoint
+	apiAnnotations       = "1.43" // HostConfig.Annotations
+	apiStartInterval     = "1.44" // HealthConfig.StartInterval
+	apiReadOnlyRecursive = "1.44" // BindOptions.ReadOnlyNonRecursive and ReadOnlyForceRecursive
+	// EndpointSettings.MacAddress on create; before it, Config.MacAddress,
+	// which 1.52 no longer takes.
+	apiEndpointMAC   = "1.44"
+	apiVolumeSubpath = "1.45" // VolumeOptions.Subpath
+	apiTmpfsOptions  = "1.46" // TmpfsOptions.Options
+	apiImageMount    = "1.48" // Mount Type "image", with ImageOptions.Subpath
+	apiGwPriority    = "1.48" // EndpointSettings.GwPriority
+	// Inspect drops Config.MacAddress, leaving each network's MacAddress.
+	apiInspectEndpointMAC = "1.52"
+	// Connect applies EndpointSettings.MacAddress; it took and ignored it
+	// from 1.44.
+	apiConnectMAC = "1.54"
+	apiUmask      = "1.56" // HostConfig.Umask
+)
+
+// atLeast is whether version is since or newer.
+func atLeast(version, since string) bool {
+	return compareVersions(version, since) >= 0
 }
 
 // ExtraNetworks is every network beyond the first, which a swap connects
@@ -341,13 +397,22 @@ func PlanSwap(spec, newSpec model.ContainerSpec, grace int) Plan {
 	}
 }
 
+// binds is the -v binds, as `source:target[:options]`, with the read-only
+// flag and the propagation they were made with.
 func binds(spec model.ContainerSpec) []string {
 	binds := []string{}
 	for _, mount := range spec.Mounts {
-		if mount.Type == model.Bind {
+		if mount.Type == model.Bind && !mount.LongForm {
 			bind := mount.Source + ":" + mount.Target
+			var options []string
 			if mount.ReadOnly {
-				bind += ":ro"
+				options = append(options, "ro")
+			}
+			if mount.Bind.Propagation != "" {
+				options = append(options, mount.Bind.Propagation)
+			}
+			if len(options) > 0 {
+				bind += ":" + strings.Join(options, ",")
 			}
 			binds = append(binds, bind)
 		}
@@ -355,21 +420,66 @@ func binds(spec model.ContainerSpec) []string {
 	return binds
 }
 
-// longFormMounts is the named volumes and tmpfs, which go in Mounts
-// long-form; binds stay in Binds.
-func longFormMounts(spec model.ContainerSpec) []map[string]any {
+// longFormMounts is everything but the -v binds, which go in Mounts
+// long-form, with the options version knows. An image mount needs 1.48 and
+// is left out below it.
+func longFormMounts(spec model.ContainerSpec, version string) []map[string]any {
 	mounts := []map[string]any{}
 	for _, mount := range spec.Mounts {
-		if mount.Type == model.Bind {
+		if mount.Type == model.Bind && !mount.LongForm || mount.Type == model.Image && !atLeast(version, apiImageMount) {
 			continue
 		}
 		long := map[string]any{"Type": mount.Type, "Target": mount.Target, "ReadOnly": mount.ReadOnly}
-		if mount.Type == model.Volume {
+		options := map[string]any{}
+		switch mount.Type {
+		case model.Bind:
 			long["Source"] = mount.Source
+			bind := mount.Bind
+			setIf(options, "Propagation", bind.Propagation)
+			setTrue(options, "NonRecursive", bind.NonRecursive && atLeast(version, apiBindNonRecursive))
+			setTrue(options, "CreateMountpoint", bind.CreateMountpoint && atLeast(version, apiCreateMountpoint))
+			setTrue(options, "ReadOnlyNonRecursive", bind.ReadOnlyNonRecursive && atLeast(version, apiReadOnlyRecursive))
+			setTrue(options, "ReadOnlyForceRecursive", bind.ReadOnlyForceRecursive && atLeast(version, apiReadOnlyRecursive))
+			setOptions(long, "BindOptions", options)
+		case model.Volume:
+			long["Source"] = mount.Source
+			setTrue(options, "NoCopy", mount.Volume.NoCopy)
+			if atLeast(version, apiVolumeSubpath) {
+				setIf(options, "Subpath", mount.Volume.Subpath)
+			}
+			setOptions(long, "VolumeOptions", options)
+		case model.Tmpfs:
+			if tmpfs := mount.Tmpfs; tmpfs.SizeBytes != 0 {
+				options["SizeBytes"] = tmpfs.SizeBytes
+			}
+			if tmpfs := mount.Tmpfs; tmpfs.Mode != 0 {
+				options["Mode"] = tmpfs.Mode
+			}
+			if len(mount.Tmpfs.Options) > 0 && atLeast(version, apiTmpfsOptions) {
+				options["Options"] = mount.Tmpfs.Options
+			}
+			setOptions(long, "TmpfsOptions", options)
+		case model.Image:
+			long["Source"] = mount.Source
+			setIf(options, "Subpath", mount.Image.Subpath)
+			setOptions(long, "ImageOptions", options)
 		}
 		mounts = append(mounts, long)
 	}
 	return mounts
+}
+
+func setTrue(into map[string]any, key string, value bool) {
+	if value {
+		into[key] = true
+	}
+}
+
+// setOptions puts options in under key, unless there are none.
+func setOptions(into map[string]any, key string, options map[string]any) {
+	if len(options) > 0 {
+		into[key] = options
+	}
 }
 
 // portBindings is every binding as it was created, host address included -
@@ -397,10 +507,11 @@ func portBindings(spec model.ContainerSpec) map[string][]map[string]string {
 	return bindings
 }
 
-// endpointOf is the EndpointConfig that attaches one network - the same
-// whether in a create's NetworkingConfig or a later connect, so it is written
-// once.
-func endpointOf(network model.NetworkAttachment) map[string]any {
+// endpointOf is the EndpointConfig that attaches one network - in a create's
+// NetworkingConfig or, connect true, a later connect - with what version
+// knows. A MAC address goes on the endpoint from 1.44 at create, but only
+// from 1.54 at connect, the first that applies it there.
+func endpointOf(network model.NetworkAttachment, version string, connect bool) map[string]any {
 	endpoint := map[string]any{}
 	if len(network.Aliases) > 0 {
 		endpoint["Aliases"] = network.Aliases
@@ -408,8 +519,21 @@ func endpointOf(network model.NetworkAttachment) map[string]any {
 	ipam := map[string]any{}
 	setIf(ipam, "IPv4Address", network.IPv4Address)
 	setIf(ipam, "IPv6Address", network.IPv6Address)
+	if len(network.LinkLocalIPs) > 0 {
+		ipam["LinkLocalIPs"] = network.LinkLocalIPs
+	}
 	if len(ipam) > 0 {
 		endpoint["IPAMConfig"] = ipam
+	}
+	macSince := apiEndpointMAC
+	if connect {
+		macSince = apiConnectMAC
+	}
+	if atLeast(version, macSince) {
+		setIf(endpoint, "MacAddress", network.MacAddress)
+	}
+	if network.GwPriority != 0 && atLeast(version, apiGwPriority) {
+		endpoint["GwPriority"] = network.GwPriority
 	}
 	return endpoint
 }
