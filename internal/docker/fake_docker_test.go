@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"testing"
 
 	"github.com/danielbodart/gokit/httpx"
 	"github.com/danielbodart/tidewaiter/internal/model"
@@ -80,6 +81,8 @@ type fakeDocker struct {
 	wake    chan struct{}
 	streams map[int]chan struct{}
 	opened  int
+	// What each container shows on inspect beyond its typed spec, by id.
+	extras map[string]inspectExtra
 	// The Engine API versions this Docker speaks, in front of mux.
 	api *versioned
 	mux *http.ServeMux
@@ -98,6 +101,8 @@ type renamed struct{ container, to string }
 type connected struct {
 	container string
 	network   model.NetworkAttachment
+	// The endpoint settings as sent.
+	endpoint map[string]any
 }
 
 func newFakeDocker() *fakeDocker {
@@ -105,7 +110,7 @@ func newFakeDocker() *fakeDocker {
 		images: map[string]model.Digest{}, configs: map[model.Digest]ImageDefaults{}, pullLands: map[string]model.Digest{}, failOp: map[Op]string{},
 		healthByName: map[string]model.HealthStatus{}, runningByName: map[string]bool{},
 		drivers: map[string]string{}, netBytes: map[string]uint64{},
-		wake: make(chan struct{}, 1), streams: map[int]chan struct{}{},
+		wake: make(chan struct{}, 1), streams: map[int]chan struct{}{}, extras: map[string]inspectExtra{},
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /{version}/containers/json", f.list)
@@ -236,7 +241,7 @@ func (f *fakeDocker) inspect(w http.ResponseWriter, r *http.Request) {
 	if running, ok := f.runningByName[container.Spec.Name]; ok {
 		container.Running = running
 	}
-	answer(w, http.StatusOK, inspectOf(container, requestVersion(r)))
+	answer(w, http.StatusOK, inspectOf(container, f.extras[container.ID], requestVersion(r)))
 }
 
 // requestVersion is the Engine API version a request was made in.
@@ -249,24 +254,30 @@ func requestVersion(r *http.Request) string {
 // config is what a create of it would say (Docker shows back what it was
 // asked for), and the rest is the runtime state around it.
 //
-// A network's MacAddress is the one in use, and before 1.52 the one asked
-// for on the container's own network is Config.MacAddress too, as moby
-// shows them.
-func inspectOf(container model.RunningContainer, version string) map[string]any {
-	created := CreatePayload(container.Spec, NewestAPI)
+// What Docker adds of its own is there too, for the overrides to deal with:
+// the short id as the hostname, its default masked and read-only paths, each
+// network's operational data, and, before 1.45, the short id among a
+// network's aliases. Anything else the container was created with - extras,
+// by its id - is shown back as it was asked for, so what a recreate passes
+// through comes back on the next inspect.
+func inspectOf(container model.RunningContainer, extra inspectExtra, version string) map[string]any {
+	created := typedPayload(container.Spec)
 	config := map[string]any{}
 	for key, value := range created {
 		if key != "HostConfig" && key != "NetworkingConfig" {
 			config[key] = value
 		}
 	}
-	if networks := container.Spec.Networks; len(networks) > 0 && networks[0].MacAddress != "" && !atLeast(version, apiInspectEndpointMAC) {
-		config["MacAddress"] = networks[0].MacAddress
-	}
 	host := created["HostConfig"].(map[string]any)
-	if !atLeast(version, apiUmask) {
-		delete(host, "Umask")
+	if len(container.ID) >= 12 {
+		config["Hostname"] = container.ID[:12]
 	}
+	if !container.Spec.Privileged {
+		host["MaskedPaths"] = []string{"/proc/kcore"}
+		host["ReadonlyPaths"] = []string{"/proc/sys"}
+	}
+	overlay(config, extra.Config)
+	overlay(host, extra.HostConfig)
 	state := map[string]any{"Pid": container.PID, "Running": container.Running, "Restarting": false}
 	if container.Health != model.NoHealth && container.Health != "" {
 		state["Health"] = map[string]any{"Status": container.Health}
@@ -274,13 +285,6 @@ func inspectOf(container model.RunningContainer, version string) map[string]any 
 	mounts := []map[string]any{}
 	for _, mount := range container.Spec.Mounts {
 		entry := map[string]any{"Type": mount.Type, "Source": mount.Source, "Destination": mount.Target, "RW": !mount.ReadOnly}
-		if mount.Type == model.Bind {
-			entry["Propagation"] = cmp.Or(mount.Bind.Propagation, "rprivate")
-		}
-		if mount.Type == model.Image {
-			// The mounted view names the image by id, not as it was asked.
-			entry["Source"] = "/var/lib/docker/image-mounts/" + mount.Target
-		}
 		if mount.Type == model.Volume {
 			entry["Name"] = mount.Source
 			entry["Source"] = "/var/lib/docker/volumes/" + mount.Source + "/_data"
@@ -288,9 +292,16 @@ func inspectOf(container model.RunningContainer, version string) map[string]any 
 		mounts = append(mounts, entry)
 	}
 	networks := map[string]any{}
-	for _, network := range container.Spec.Networks {
-		endpoint := endpointOf(network, NewestAPI, false)
+	for i, network := range container.Spec.Networks {
+		endpoint := typedEndpoint(network)
 		endpoint["IPAddress"] = network.IPAddress
+		endpoint["NetworkID"] = "net-" + network.Name
+		endpoint["EndpointID"] = fmt.Sprintf("ep-%s-%d", container.ID, i)
+		endpoint["DNSNames"] = []string{container.Spec.Name}
+		if len(container.ID) >= 12 && !atLeast(version, apiAliasesWithoutID) && network.Name != "bridge" {
+			endpoint["Aliases"] = append(slices.Clone(network.Aliases), container.ID[:12])
+		}
+		overlay(endpoint, extra.Endpoints[network.Name])
 		networks[network.Name] = endpoint
 	}
 	return map[string]any{
@@ -300,126 +311,243 @@ func inspectOf(container model.RunningContainer, version string) map[string]any 
 	}
 }
 
-// specOf is the spec a create payload asks for in version, read as Docker
-// would show it back in that version - through the client's own inspect
-// mapping, so a field the create drops or garbles comes back wrong.
-func specOf(name string, body []byte, version string) (model.ContainerSpec, error) {
-	raw := Inspected{APIVersion: version}
+// inspectExtra is what a container shows on inspect beyond its typed spec:
+// what its create asked for, or a test gave it.
+type inspectExtra struct {
+	Config, HostConfig map[string]any
+	Endpoints          map[string]map[string]any
+}
+
+// overlay adds what extra has that into does not.
+func overlay(into, extra map[string]any) {
+	for key, value := range extra {
+		if _, set := into[key]; !set {
+			into[key] = value
+		}
+	}
+}
+
+// extraOf is a create body as the extras it shows on inspect.
+func extraOf(body []byte) inspectExtra {
+	var asked struct {
+		HostConfig       map[string]any
+		NetworkingConfig struct {
+			EndpointsConfig map[string]map[string]any
+		}
+	}
+	var config map[string]any
+	json.Unmarshal(body, &config)
+	json.Unmarshal(body, &asked)
+	delete(config, "HostConfig")
+	delete(config, "NetworkingConfig")
+	return inspectExtra{Config: config, HostConfig: asked.HostConfig, Endpoints: asked.NetworkingConfig.EndpointsConfig}
+}
+
+// specOf is the spec a create body asks for, read as Docker would show it
+// back - through the client's own inspect mapping, so a field the create
+// drops or garbles comes back wrong. Typed only: what the body passes
+// through beyond that is the fake's extras.
+func specOf(name string, body []byte) (model.ContainerSpec, error) {
 	var asked struct {
 		HostConfig struct {
 			Binds  []string
-			Mounts []HostMount
+			Mounts []struct {
+				Type, Source, Target string
+				ReadOnly             bool
+			}
 		}
 		NetworkingConfig struct {
-			EndpointsConfig map[string]InspectedNetwork
+			EndpointsConfig map[string]json.RawMessage
 		}
 	}
-	for _, into := range []any{&raw.Config, &asked} {
+	var whole map[string]json.RawMessage
+	for _, into := range []any{&asked, &whole} {
 		if err := json.Unmarshal(body, into); err != nil {
 			return model.ContainerSpec{}, err
 		}
 	}
-	var hostConfig struct{ HostConfig json.RawMessage }
-	json.Unmarshal(body, &hostConfig)
-	if err := json.Unmarshal(hostConfig.HostConfig, &raw.HostConfig); err != nil {
-		return model.ContainerSpec{}, err
-	}
-	raw.Name = "/" + name
-	raw.Mounts = []InspectedMount{}
+	mounts := []map[string]any{}
 	for _, bind := range asked.HostConfig.Binds {
 		parts := strings.Split(bind, ":")
-		mount := InspectedMount{Type: "bind", Source: parts[0], Destination: parts[1], RW: true, Propagation: "rprivate"}
-		if len(parts) > 2 {
-			for _, option := range strings.Split(parts[2], ",") {
-				switch option {
-				case "ro":
-					mount.RW = false
-				case "shared", "rshared", "slave", "rslave", "private", "rprivate":
-					mount.Propagation = option
-				}
-			}
-		}
-		raw.Mounts = append(raw.Mounts, mount)
+		mounts = append(mounts, map[string]any{"Type": "bind", "Source": parts[0], "Destination": parts[1], "RW": len(parts) < 3 || !slices.Contains(strings.Split(parts[2], ","), "ro")})
 	}
 	for _, mount := range asked.HostConfig.Mounts {
-		shown := InspectedMount{Type: mount.Type, Name: mount.Source, Source: mount.Source, Destination: mount.Target, RW: !mount.ReadOnly}
-		if mount.Type == string(model.Bind) {
-			shown.Propagation = "rprivate"
-			if mount.BindOptions != nil && mount.BindOptions.Propagation != "" {
-				shown.Propagation = mount.BindOptions.Propagation
-			}
-		}
-		raw.Mounts = append(raw.Mounts, shown)
+		mounts = append(mounts, map[string]any{"Type": mount.Type, "Name": mount.Source, "Source": mount.Source, "Destination": mount.Target, "RW": !mount.ReadOnly})
 	}
-	raw.NetworkSettings.Networks = asked.NetworkingConfig.EndpointsConfig
-	// The MAC asked for, wherever this version takes it, shown where this
-	// version shows it.
-	for _, endpoint := range raw.NetworkSettings.Networks {
-		raw.Config.MacAddress = cmp.Or(raw.Config.MacAddress, endpoint.MacAddress)
+	hostConfig := whole["HostConfig"]
+	delete(whole, "HostConfig")
+	delete(whole, "NetworkingConfig")
+	shown, _ := json.Marshal(map[string]any{
+		"Name": "/" + name, "Config": whole, "HostConfig": hostConfig, "Mounts": mounts,
+		"NetworkSettings": map[string]any{"Networks": asked.NetworkingConfig.EndpointsConfig},
+	})
+	var raw Inspected
+	if err := json.Unmarshal(shown, &raw); err != nil {
+		return model.ContainerSpec{}, err
 	}
-	if atLeast(version, apiInspectEndpointMAC) {
-		raw.Config.MacAddress = ""
-	}
-	return raw.Spec(), nil
+	spec := raw.Spec()
+	spec.Inspected = nil
+	return spec, nil
 }
 
-// tooNew is the first field of a create or connect body that version does
-// not know, or "": the fake refuses those, so a test proves none is sent.
-func tooNew(body []byte, version string) string {
+// misplacedMAC is a MAC address where version does not take one, or "":
+// the fake refuses it, so a test proves none is sent there.
+func misplacedMAC(body []byte, version string) string {
 	var asked struct {
-		MacAddress  string
-		Healthcheck map[string]any
-		HostConfig  struct {
-			Annotations map[string]string
-			Umask       *uint32
-			Mounts      []HostMount
-		}
+		MacAddress       string
 		NetworkingConfig struct {
-			EndpointsConfig map[string]InspectedNetwork
+			EndpointsConfig map[string]struct{ MacAddress string }
 		}
-		EndpointConfig *InspectedNetwork
+		EndpointConfig struct{ MacAddress string }
 	}
 	json.Unmarshal(body, &asked)
-	// A field set in body, known from since, and no longer from until.
-	type known struct {
-		set                bool
-		name, since, until string
+	switch {
+	case asked.MacAddress != "" && atLeast(version, apiInspectEndpointMAC):
+		return "Config.MacAddress"
+	case asked.EndpointConfig.MacAddress != "" && !atLeast(version, apiEndpointMAC):
+		return "EndpointSettings.MacAddress"
 	}
-	var fields []known
-	field := func(set bool, name, since, until string) { fields = append(fields, known{set, name, since, until}) }
-	field(asked.MacAddress != "", "Config.MacAddress", "", apiInspectEndpointMAC)
-	_, startInterval := asked.Healthcheck["StartInterval"]
-	field(startInterval, "Healthcheck.StartInterval", apiStartInterval, "")
-	field(asked.HostConfig.Annotations != nil, "HostConfig.Annotations", apiAnnotations, "")
-	field(asked.HostConfig.Umask != nil, "HostConfig.Umask", apiUmask, "")
-	for _, mount := range asked.HostConfig.Mounts {
-		field(mount.Type == string(model.Image), "Mount type image", apiImageMount, "")
-		if options := mount.BindOptions; options != nil {
-			field(options.NonRecursive, "BindOptions.NonRecursive", apiBindNonRecursive, "")
-			field(options.CreateMountpoint, "BindOptions.CreateMountpoint", apiCreateMountpoint, "")
-			field(options.ReadOnlyNonRecursive || options.ReadOnlyForceRecursive, "BindOptions.ReadOnly*Recursive", apiReadOnlyRecursive, "")
-		}
-		if options := mount.VolumeOptions; options != nil {
-			field(options.Subpath != "", "VolumeOptions.Subpath", apiVolumeSubpath, "")
-		}
-		if options := mount.TmpfsOptions; options != nil {
-			field(options.Options != nil, "TmpfsOptions.Options", apiTmpfsOptions, "")
-		}
-	}
-	endpoints := slices.Collect(maps.Values(asked.NetworkingConfig.EndpointsConfig))
-	if asked.EndpointConfig != nil {
-		endpoints = append(endpoints, *asked.EndpointConfig)
-	}
-	for _, endpoint := range endpoints {
-		field(endpoint.MacAddress != "", "EndpointSettings.MacAddress", apiEndpointMAC, "")
-		field(endpoint.GwPriority != 0, "EndpointSettings.GwPriority", apiGwPriority, "")
-	}
-	for _, f := range fields {
-		if f.set && (f.since != "" && !atLeast(version, f.since) || f.until != "" && atLeast(version, f.until)) {
-			return f.name
+	for _, endpoint := range asked.NetworkingConfig.EndpointsConfig {
+		if endpoint.MacAddress != "" && !atLeast(version, apiEndpointMAC) {
+			return "EndpointSettings.MacAddress"
 		}
 	}
 	return ""
+}
+
+// typedPayload is a create body for a spec built in Go: how the fake
+// renders its containers, and how a real-Docker test creates one to start
+// from. Tidewaiter itself never builds one - it recreates from inspect.
+func typedPayload(spec model.ContainerSpec) map[string]any {
+	payload := map[string]any{
+		"Image":  spec.Image,
+		"Env":    orEmpty(spec.Env),
+		"Labels": orEmptyMap(spec.Labels),
+	}
+	if spec.Cmd != nil {
+		payload["Cmd"] = spec.Cmd
+	}
+	if spec.Entrypoint != nil {
+		payload["Entrypoint"] = spec.Entrypoint
+	}
+	if len(spec.Exposed) > 0 {
+		payload["ExposedPorts"] = set(spec.Exposed)
+	}
+	if len(spec.Volumes) > 0 {
+		payload["Volumes"] = set(spec.Volumes)
+	}
+	setIf(payload, "User", spec.User)
+	setIf(payload, "WorkingDir", spec.WorkingDir)
+	setIf(payload, "StopSignal", spec.StopSignal)
+	if spec.StopTimeout != nil {
+		payload["StopTimeout"] = *spec.StopTimeout
+	}
+	if check := spec.Healthcheck; check != nil {
+		healthcheck := map[string]any{}
+		if len(check.Test) > 0 {
+			healthcheck["Test"] = check.Test
+		}
+		for key, value := range map[string]int64{
+			"Interval": int64(check.Interval), "Timeout": int64(check.Timeout), "Retries": int64(check.Retries),
+			"StartPeriod": int64(check.StartPeriod), "StartInterval": int64(check.StartInterval),
+		} {
+			if value != 0 {
+				healthcheck[key] = value
+			}
+		}
+		payload["Healthcheck"] = healthcheck
+	}
+	binds, mounts := []string{}, []map[string]any{}
+	for _, mount := range spec.Mounts {
+		if mount.Type == model.Bind {
+			bind := mount.Source + ":" + mount.Target
+			if mount.ReadOnly {
+				bind += ":ro"
+			}
+			binds = append(binds, bind)
+			continue
+		}
+		long := map[string]any{"Type": mount.Type, "Target": mount.Target, "ReadOnly": mount.ReadOnly}
+		if mount.Type == model.Volume {
+			long["Source"] = mount.Source
+		}
+		mounts = append(mounts, long)
+	}
+	bindings := map[string][]map[string]string{}
+	for _, port := range spec.Bindings {
+		key := strconv.Itoa(port.ContainerPort) + "/" + string(port.Protocol)
+		binding := map[string]string{"HostIp": port.HostIP, "HostPort": ""}
+		switch {
+		case port.HostRange != "":
+			binding["HostPort"] = port.HostRange
+		case port.HostPort != 0:
+			binding["HostPort"] = strconv.Itoa(port.HostPort)
+		}
+		if !slices.ContainsFunc(bindings[key], func(other map[string]string) bool { return maps.Equal(other, binding) }) {
+			bindings[key] = append(bindings[key], binding)
+		}
+	}
+	host := map[string]any{"Binds": binds, "Mounts": mounts, "PortBindings": bindings, "Privileged": spec.Privileged}
+	if policy := spec.RestartPolicy; policy != nil {
+		host["RestartPolicy"] = map[string]any{"Name": policy.Name, "MaximumRetryCount": policy.MaximumRetryCount}
+	}
+	if len(spec.CapAdd) > 0 {
+		host["CapAdd"] = spec.CapAdd
+	}
+	if len(spec.CapDrop) > 0 {
+		host["CapDrop"] = spec.CapDrop
+	}
+	setIf(host, "NetworkMode", spec.NetworkMode)
+	if len(spec.Devices) > 0 {
+		host["Devices"] = spec.Devices
+	}
+	if len(spec.ExtraHosts) > 0 {
+		host["ExtraHosts"] = spec.ExtraHosts
+	}
+	if len(spec.Sysctls) > 0 {
+		host["Sysctls"] = spec.Sysctls
+	}
+	payload["HostConfig"] = host
+	if len(spec.Networks) > 0 {
+		primary := spec.Networks[0]
+		payload["NetworkingConfig"] = map[string]any{"EndpointsConfig": map[string]any{primary.Name: typedEndpoint(primary)}}
+	}
+	return payload
+}
+
+func setIf(into map[string]any, key, value string) {
+	if value != "" {
+		into[key] = value
+	}
+}
+
+// typedEndpoint is the endpoint settings of a network attachment built in
+// Go.
+func typedEndpoint(network model.NetworkAttachment) map[string]any {
+	endpoint := map[string]any{}
+	if len(network.Aliases) > 0 {
+		endpoint["Aliases"] = network.Aliases
+	}
+	ipam := map[string]any{}
+	setIf(ipam, "IPv4Address", network.IPv4Address)
+	setIf(ipam, "IPv6Address", network.IPv6Address)
+	if len(ipam) > 0 {
+		endpoint["IPAMConfig"] = ipam
+	}
+	return endpoint
+}
+
+// inspected is spec with the inspect Docker would show of it, as a
+// recreate reads it.
+func inspected(t *testing.T, spec model.ContainerSpec, version string) model.ContainerSpec {
+	t.Helper()
+	var raw Inspected
+	if err := json.Unmarshal([]byte(jsonOf(inspectOf(model.RunningContainer{ID: "0123456789abcdef", Spec: spec}, inspectExtra{}, version))), &raw); err != nil {
+		t.Fatal(err)
+	}
+	raw.APIVersion = version
+	spec.Inspected = raw.Spec().Inspected
+	return spec
 }
 
 func (f *fakeDocker) image(w http.ResponseWriter, r *http.Request) {
@@ -441,10 +569,11 @@ func (f *fakeDocker) image(w http.ResponseWriter, r *http.Request) {
 // imageConfigOf is an image's Config as /images/{name}/json shows it: the
 // same shape as a container's, so written the way a create of it would be.
 func imageConfigOf(image ImageDefaults) map[string]any {
-	config := CreatePayload(model.ContainerSpec{
+	config := typedPayload(model.ContainerSpec{
 		Env: image.Env, Cmd: image.Cmd, Entrypoint: image.Entrypoint, Labels: image.Labels, Exposed: image.Exposed,
 		User: image.User, WorkingDir: image.WorkingDir, StopSignal: image.StopSignal, Healthcheck: image.Healthcheck,
-	}, NewestAPI)
+		Volumes: image.Volumes,
+	})
 	delete(config, "HostConfig")
 	delete(config, "Image")
 	return config
@@ -504,6 +633,14 @@ func merged(spec model.ContainerSpec, image ImageDefaults) model.ContainerSpec {
 			spec.Healthcheck = &own
 		}
 	}
+	volumes := slices.Clone(spec.Volumes)
+	for _, volume := range image.Volumes {
+		if !slices.Contains(volumes, volume) {
+			volumes = append(volumes, volume)
+		}
+	}
+	slices.Sort(volumes)
+	spec.Volumes = orEmpty(volumes)
 	spec.User = cmp.Or(spec.User, image.User)
 	spec.WorkingDir = cmp.Or(spec.WorkingDir, image.WorkingDir)
 	spec.StopSignal = cmp.Or(spec.StopSignal, image.StopSignal)
@@ -582,12 +719,12 @@ func (f *fakeDocker) create(w http.ResponseWriter, r *http.Request) {
 		refuse(w, http.StatusBadRequest, fmt.Sprintf("invalid create request: %v", err))
 		return
 	}
-	if field := tooNew(body, requestVersion(r)); field != "" {
-		refuse(w, http.StatusBadRequest, fmt.Sprintf("%s is not in API v%s", field, requestVersion(r)))
+	if field := misplacedMAC(body, requestVersion(r)); field != "" {
+		refuse(w, http.StatusBadRequest, fmt.Sprintf("%s is not taken in API v%s", field, requestVersion(r)))
 		return
 	}
 	name := r.URL.Query().Get("name")
-	spec, err := specOf(name, body, requestVersion(r))
+	spec, err := specOf(name, body)
 	if err != nil {
 		refuse(w, http.StatusBadRequest, err.Error())
 		return
@@ -613,6 +750,7 @@ func (f *fakeDocker) create(w http.ResponseWriter, r *http.Request) {
 	f.running = append(f.running, model.RunningContainer{
 		ID: id, PID: 1000 + len(f.creates), Spec: spec, ImageID: f.imageIDFor(spec.Image), Health: model.NoHealth, Running: true,
 	})
+	f.extras[id] = extraOf(body)
 	answer(w, http.StatusCreated, map[string]any{"Id": id, "Warnings": []string{}})
 }
 
@@ -675,17 +813,19 @@ func (f *fakeDocker) removeImage(w http.ResponseWriter, r *http.Request) {
 func (f *fakeDocker) connect(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		Container      string
-		EndpointConfig InspectedNetwork
+		EndpointConfig map[string]any
 	}
 	data, _ := io.ReadAll(r.Body)
 	if err := json.Unmarshal(data, &body); err != nil {
 		refuse(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	if field := tooNew(data, requestVersion(r)); field != "" {
-		refuse(w, http.StatusBadRequest, fmt.Sprintf("%s is not in API v%s", field, requestVersion(r)))
+	if field := misplacedMAC(data, requestVersion(r)); field != "" {
+		refuse(w, http.StatusBadRequest, fmt.Sprintf("%s is not taken in API v%s", field, requestVersion(r)))
 		return
 	}
+	var endpoint InspectedNetwork
+	json.Unmarshal([]byte(jsonOf(body.EndpointConfig)), &endpoint)
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	index := f.find(body.Container)
@@ -693,9 +833,8 @@ func (f *fakeDocker) connect(w http.ResponseWriter, r *http.Request) {
 		refuse(w, http.StatusNotFound, "No such container: "+body.Container)
 		return
 	}
-	// As inspect shows it from 1.52, where a network's MacAddress is its own.
-	network := networksOf(map[string]InspectedNetwork{r.PathValue("name"): body.EndpointConfig}, "", NewestAPI, "")[0]
-	f.connects = append(f.connects, connected{body.Container, network})
+	network := networksOf(map[string]InspectedNetwork{r.PathValue("name"): endpoint}, "")[0]
+	f.connects = append(f.connects, connected{body.Container, network, body.EndpointConfig})
 	f.running[index].Spec.Networks = append(slices.Clone(f.running[index].Spec.Networks), network)
 	w.WriteHeader(http.StatusOK)
 }
@@ -806,7 +945,7 @@ func spec(name string) model.ContainerSpec {
 	return model.ContainerSpec{
 		Name: name, Image: "app:latest", Env: []string{},
 		Labels: map[string]string{AutoupdateLabel: "registry"}, Mounts: []model.Mount{}, Bindings: []model.PortBinding{},
-		Exposed: []string{}, Networks: []model.NetworkAttachment{}, CapAdd: []string{}, CapDrop: []string{},
+		Exposed: []string{}, Volumes: []string{}, Networks: []model.NetworkAttachment{}, CapAdd: []string{}, CapDrop: []string{},
 		Devices: []model.Device{}, ExtraHosts: []string{}, Sysctls: map[string]string{},
 	}
 }

@@ -8,6 +8,7 @@
 package model
 
 import (
+	"encoding/json"
 	"fmt"
 	"time"
 )
@@ -124,14 +125,17 @@ func (spec ContainerSpec) Published() []PublishedPort {
 type ContainerSpec struct {
 	Name string
 	// The image ref as configured, e.g. "nginx:1.27" - the tag we keep chasing.
-	Image         string
-	Env           []string
-	Cmd           []string
-	Entrypoint    []string
-	Labels        map[string]string
-	Mounts        []Mount
-	Bindings      []PortBinding
-	Exposed       []string
+	Image      string
+	Env        []string
+	Cmd        []string
+	Entrypoint []string
+	Labels     map[string]string
+	Mounts     []Mount
+	Bindings   []PortBinding
+	Exposed    []string
+	// The anonymous volumes its config declares, by path - its image's
+	// VOLUMEs among them.
+	Volumes       []string
 	Networks      []NetworkAttachment
 	NetworkMode   string
 	RestartPolicy *RestartPolicy
@@ -147,14 +151,24 @@ type ContainerSpec struct {
 	// The container's own stop timeout, in seconds, if it set one.
 	StopTimeout *int
 	Healthcheck *Healthcheck
-	// What --tmpfs asked for, by target: options as Docker takes them, such
-	// as "size=64m". Not a Mount: Docker keeps these apart and reports them
-	// only here.
-	Tmpfs map[string]string
-	// HostConfig.Annotations, passed to the runtime.
-	Annotations map[string]string
-	// The initial umask of the container's processes, if it set one.
-	Umask *uint32
+	// What docker inspect said of the container, as it said it, for a
+	// recreate to pass back; nil for a spec no inspect read. The fields above
+	// are what Tidewaiter reads to decide; this is what it recreates from.
+	Inspected *Inspect
+}
+
+// Inspect is the part of a container's docker inspect a recreate passes
+// back to /containers/create, kept as Docker wrote it so that nothing
+// Tidewaiter does not know of is lost on the way.
+type Inspect struct {
+	// The Engine API version it was read in, which is what decides the form
+	// it is in.
+	APIVersion string
+	ID         string
+	Config     map[string]json.RawMessage
+	HostConfig map[string]json.RawMessage
+	// NetworkSettings.Networks: each network's endpoint settings, by name.
+	Endpoints map[string]map[string]json.RawMessage
 }
 
 // MountType is Docker's long-form mount type.
@@ -164,12 +178,11 @@ const (
 	Bind   MountType = "bind"
 	Volume MountType = "volume"
 	Tmpfs  MountType = "tmpfs"
-	// An image's filesystem mounted into the container.
-	Image MountType = "image"
 )
 
-// Mount is faithful to Docker's long form, so bind, volume, tmpfs and image
-// mounts survive a recreate with their options.
+// Mount is a mount as Tidewaiter reads it: enough to tell a named volume
+// from an anonymous one, which a recreate cannot carry. A recreate passes
+// the mounts themselves back as inspect gave them.
 type Mount struct {
 	Type     MountType
 	Source   string
@@ -177,44 +190,6 @@ type Mount struct {
 	ReadOnly bool
 	// A volume with no name - recreate cannot reproduce it faithfully.
 	Anonymous bool
-	// A bind created long-form (--mount, HostConfig.Mounts) rather than with
-	// -v (HostConfig.Binds). Only the long form takes BindOptions, and it
-	// does not create a missing source directory, as a -v bind does. Every
-	// other type is long-form whatever this says.
-	LongForm bool
-	Bind     BindOptions
-	Volume   VolumeOptions
-	Tmpfs    TmpfsOptions
-	Image    ImageOptions
-}
-
-// BindOptions is a bind mount's options. Propagation is "" for Docker's
-// default, rprivate.
-type BindOptions struct {
-	Propagation            string
-	NonRecursive           bool
-	CreateMountpoint       bool
-	ReadOnlyNonRecursive   bool
-	ReadOnlyForceRecursive bool
-}
-
-// VolumeOptions is a named volume's options that belong to the mount rather
-// than to the volume, which already exists.
-type VolumeOptions struct {
-	NoCopy  bool
-	Subpath string
-}
-
-// TmpfsOptions is a long-form tmpfs mount's options.
-type TmpfsOptions struct {
-	SizeBytes int64
-	Mode      uint32
-	Options   [][]string
-}
-
-// ImageOptions is an image mount's options.
-type ImageOptions struct {
-	Subpath string
 }
 
 // NetworkAttachment is a network the container is attached to, with anything
@@ -225,12 +200,6 @@ type NetworkAttachment struct {
 	// A static address, when one was assigned rather than handed out by IPAM.
 	IPv4Address string
 	IPv6Address string
-	// Link-local addresses asked for on top of IPAM's.
-	LinkLocalIPs []string
-	// The MAC address to keep on this network, or "" to let Docker pick one.
-	MacAddress string
-	// Which network gives the default gateway: the highest wins.
-	GwPriority int
 	// The address the container is ACTUALLY reachable at right now, as Docker
 	// reports it under `NetworkSettings.Networks[name].IPAddress` - the
 	// runtime IP IPAM handed out, distinct from the static IPv4Address a user

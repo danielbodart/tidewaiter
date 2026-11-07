@@ -641,7 +641,7 @@ func (s *Source) step(ctx context.Context, step Step) error {
 		_, err := s.docker.Create(ctx, step.Spec)
 		return err
 	case Connect:
-		return s.docker.ConnectNetwork(ctx, step.Container, step.Network)
+		return s.docker.ConnectNetwork(ctx, step.Container, step.Spec, step.Network.Name)
 	case Start:
 		return s.docker.Start(ctx, step.Container)
 	case Remove:

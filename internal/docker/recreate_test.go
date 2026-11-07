@@ -11,11 +11,12 @@ import (
 	"github.com/danielbodart/tidewaiter/internal/model"
 )
 
-// payload is a create payload as Docker receives it: JSON, read back
-// generically, so the tests see exactly what goes on the wire.
+// payload is a create body as Docker receives it: JSON, read back
+// generically, so the tests see exactly what goes on the wire. A spec built
+// in Go is given the inspect Docker would show of it first.
 func payload(t *testing.T, spec model.ContainerSpec) map[string]any {
 	t.Helper()
-	data, err := json.Marshal(CreatePayload(spec, NewestAPI))
+	data, err := json.Marshal(body(t, spec))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -24,6 +25,19 @@ func payload(t *testing.T, spec model.ContainerSpec) map[string]any {
 		t.Fatal(err)
 	}
 	return sent
+}
+
+// body is the create body that recreates spec.
+func body(t *testing.T, spec model.ContainerSpec) map[string]any {
+	t.Helper()
+	if spec.Inspected == nil {
+		spec = inspected(t, spec, NewestAPI)
+	}
+	created, err := CreateBody(spec, NewestAPI)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return created
 }
 
 func jsonOf(value any) string {
@@ -234,7 +248,7 @@ func TestARecreateOnANewImageIsAFreshCreateOfTheContainersOwnSettings(t *testing
 			own := spec("web")
 			change(&own)
 			running := merged(own, v1)
-			recreated, err := specOf("web", []byte(jsonOf(CreatePayload(WithoutImageDefaults(running, v1), NewestAPI))), NewestAPI)
+			recreated, err := specOf("web", []byte(jsonOf(body(t, WithoutImageDefaults(inspected(t, running, NewestAPI), v1)))))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -279,7 +293,7 @@ func TestCreateKeepsTheHostAddressOfEveryBinding(t *testing.T) {
 	spec := raw.Spec()
 	host := payload(t, spec)["HostConfig"].(map[string]any)
 	expectJSON(t, "PortBindings", host["PortBindings"],
-		`{"5432/tcp":[{"HostIp":"127.0.0.1","HostPort":"5432"},{"HostIp":"::1","HostPort":"5432"}],"9187/tcp":[{"HostPort":"9187"}]}`)
+		`{"5432/tcp":[{"HostIp":"127.0.0.1","HostPort":"5432"},{"HostIp":"::1","HostPort":"5432"}],"9187/tcp":[{"HostIp":"","HostPort":"9187"}]}`)
 	// Activity and health still see each port once.
 	if want := []model.PublishedPort{port(5432, 5432, model.TCP), port(9187, 9187, model.TCP)}; !reflect.DeepEqual(spec.Published(), want) {
 		t.Errorf("published %v", spec.Published())
@@ -287,9 +301,9 @@ func TestCreateKeepsTheHostAddressOfEveryBinding(t *testing.T) {
 }
 
 // `-p 80` and `-p 127.0.0.1::81` leave the host port to Docker, and
-// `-p 8000-8010:82` has it pick from a range - as Docker stores them. Each is
-// replayed so Docker picks again, address kept, rather than dropped, which
-// would stop the recreated container publishing the port at all.
+// `-p 8000-8010:82` has it pick from a range - as Docker stores them in
+// HostConfig, which never records the port it picked. Passed back as they
+// are, Docker picks again, address kept, as compose's recreate does.
 func TestCreateReplaysABindingWhoseHostPortDockerPicks(t *testing.T) {
 	var raw Inspected
 	if err := json.Unmarshal([]byte(`{"Name":"/web","Config":{"Image":"alpine"},"HostConfig":{"PortBindings":{
@@ -313,9 +327,9 @@ func TestCreateReplaysABindingWhoseHostPortDockerPicks(t *testing.T) {
 	}
 	host := payload(t, spec)["HostConfig"].(map[string]any)
 	expectJSON(t, "PortBindings", host["PortBindings"],
-		`{"80/tcp":[{}],"81/tcp":[{"HostIp":"127.0.0.1"}],"82/tcp":[{"HostPort":"18000-18010"}],"90/tcp":[{"HostPort":"18100"}],"91/udp":[{"HostPort":"18101"}]}`)
+		`{"80/tcp":[{"HostIp":"","HostPort":""}],"81/tcp":[{"HostIp":"127.0.0.1","HostPort":""}],"82/tcp":[{"HostIp":"","HostPort":"18000-18010"}],"90/tcp":[{"HostIp":"","HostPort":"18100"}],"91/udp":[{"HostIp":"","HostPort":"18101"}]}`)
 	// And read back as Docker would show it, the same bindings again.
-	recreated, err := specOf("web", []byte(jsonOf(CreatePayload(spec, NewestAPI))), NewestAPI)
+	recreated, err := specOf("web", []byte(jsonOf(body(t, spec))))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -355,10 +369,10 @@ func TestCreateCarriesTheHealthcheck(t *testing.T) {
 	expectJSON(t, "Healthcheck", sent["Healthcheck"], `{"Interval":30000000000,"Retries":3,"Test":["CMD-SHELL","curl -f http://localhost/ || exit 1"],"Timeout":3000000000}`)
 }
 
-func TestCreatePutsNamedVolumesInMountsLongFormNotBinds(t *testing.T) {
+func TestCreatePassesMountsAndBindsBackAsInspectGaveThem(t *testing.T) {
 	host := payload(t, fixture(t, "inspect-multinet.json").Spec())["HostConfig"].(map[string]any)
-	expectJSON(t, "Mounts", host["Mounts"], `[{"ReadOnly":false,"Source":"api-data","Target":"/data","Type":"volume"}]`)
-	expectJSON(t, "Binds", host["Binds"], `[]`)
+	expectJSON(t, "Mounts", host["Mounts"], `[{"Source":"api-data","Target":"/data","Type":"volume"}]`)
+	expectJSON(t, "Binds", host["Binds"], `null`)
 }
 
 func TestCreateCarriesCapsSysctlsExtraHostsUserAndWorkingDir(t *testing.T) {
@@ -384,8 +398,9 @@ func TestCreateCarriesDevicesAndPrivileged(t *testing.T) {
 
 func TestCreateAttachesOnlyTheFirstNetworkWithItsAliasesAndAddress(t *testing.T) {
 	sent := payload(t, fixture(t, "inspect-multinet.json").Spec())
-	expectJSON(t, "NetworkingConfig", sent["NetworkingConfig"], `{"EndpointsConfig":{"frontend":{"Aliases":["api"]}}}`)
-	expectJSON(t, "backend", endpointOf(ExtraNetworks(fixture(t, "inspect-multinet.json").Spec())[0], NewestAPI, true), `{"Aliases":["api-internal"],"IPAMConfig":{"IPv4Address":"172.28.0.5"}}`)
+	expectJSON(t, "NetworkingConfig", sent["NetworkingConfig"], `{"EndpointsConfig":{"frontend":{"Aliases":["api"],"IPAMConfig":null}}}`)
+	connect := ConnectBody(fixture(t, "inspect-multinet.json").Spec(), "api", "backend", NewestAPI)
+	expectJSON(t, "backend", connect, `{"Container":"api","EndpointConfig":{"Aliases":["api-internal"],"IPAMConfig":{"IPv4Address":"172.28.0.5"}}}`)
 }
 
 func TestCreateNeverLeaksARuntimeOnlyField(t *testing.T) {
@@ -406,12 +421,13 @@ func TestCreateNeverLeaksARuntimeOnlyField(t *testing.T) {
 func TestARecreatedContainerInspectsAsTheOriginal(t *testing.T) {
 	for _, name := range []string{"inspect-nginx.json", "inspect-multinet.json"} {
 		original := fixture(t, name).Spec()
-		recreated, err := specOf(original.Name, []byte(jsonOf(CreatePayload(original, NewestAPI))), NewestAPI)
+		recreated, err := specOf(original.Name, []byte(jsonOf(body(t, original))))
 		if err != nil {
 			t.Fatal(err)
 		}
 		// Runtime IPs are not recreated, and later networks are connected after.
 		want := original
+		want.Inspected = nil
 		want.Networks = []model.NetworkAttachment{original.Networks[0]}
 		want.Networks[0].IPAddress = ""
 		if !reflect.DeepEqual(recreated, want) {
@@ -452,7 +468,7 @@ func TestPlanSwap(t *testing.T) {
 			{Op: Stop, Container: "web", Grace: 12},
 			{Op: Rename, Container: "web", To: RollbackName("web")},
 			{Op: Create, Spec: newSpec},
-			{Op: Connect, Container: "web", Network: model.NetworkAttachment{Name: "backend"}},
+			{Op: Connect, Container: "web", Network: model.NetworkAttachment{Name: "backend"}, Spec: newSpec},
 			{Op: Start, Container: "web"},
 		}
 		if !reflect.DeepEqual(plan.Swap, want) {

@@ -358,7 +358,7 @@ func TestASwapKeepsPublishingAPortWhoseHostPortDockerPicks(t *testing.T) {
 	w.expect(t, decide.Update)
 
 	sent := read(w.docker, func(f *fakeDocker) map[string]any { return f.payloads[0] })
-	expectJSON(t, "PortBindings", sent["HostConfig"].(map[string]any)["PortBindings"], `{"80/tcp":[{}],"81/tcp":[{"HostIp":"127.0.0.1","HostPort":"18000-18010"}]}`)
+	expectJSON(t, "PortBindings", sent["HostConfig"].(map[string]any)["PortBindings"], `{"80/tcp":[{"HostIp":"","HostPort":""}],"81/tcp":[{"HostIp":"127.0.0.1","HostPort":"18000-18010"}]}`)
 	if after := read(w.docker, func(f *fakeDocker) model.ContainerSpec { return f.running[f.find("web")].Spec }); !reflect.DeepEqual(after.Bindings, ephemeral) {
 		t.Errorf("bindings %+v", after.Bindings)
 	}

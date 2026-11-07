@@ -2,7 +2,7 @@
 # The one place Tidewaiter's build is defined, so CI runs the same commands a
 # developer does. mise.toml's tasks (check, build, dist, release-due) call it;
 # CI's gates call the rest:
-# ./run <version|lint|test|check|build|dist|smoke|install-check|release-due|image>.
+# ./run <version|lint|test|check|e2e|build|dist|smoke|install-check|release-due|image>.
 set -eu
 
 cd "$(dirname "$0")"
@@ -64,6 +64,17 @@ test() {
 check() {
   lint
   test "$@"
+}
+
+# The Docker source against the Docker at DOCKER_HOST (or the default
+# socket): recreates of real containers through Tidewaiter's own swap, read
+# back and compared. It creates tw-e2e-* containers, networks and volumes and
+# removes them, and pulls the two images it swaps between, never anything
+# else.
+e2e() {
+  docker pull -q alpine:latest >/dev/null
+  docker pull -q postgres:18 >/dev/null
+  TIDEWAITER_DOCKER_TESTS=1 go test -count=1 -run Real -v "$@" ./internal/docker/
 }
 
 # Static, so the one binary runs on any distribution, glibc or musl, and in an
@@ -203,11 +214,11 @@ image() {
 command=${1:-build}
 [ $# -gt 0 ] && shift
 case $command in
-  version|lint|test|check|build|dist|smoke|image) "$command" "$@" ;;
+  version|lint|test|check|e2e|build|dist|smoke|image) "$command" "$@" ;;
   install-check) install_check ;;
   release-due) release_due ;;
   *)
-    echo "Error: '$command' is not a command. Try: version, lint, test, check, build, dist, smoke, install-check, release-due, image" >&2
+    echo "Error: '$command' is not a command. Try: version, lint, test, check, e2e, build, dist, smoke, install-check, release-due, image" >&2
     exit 2
     ;;
 esac

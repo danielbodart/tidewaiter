@@ -61,32 +61,48 @@ A malformed label is reported and the default used — one bad label never stops
 
 `tidewaiter.ports` takes a comma-separated list where each term is a port with an optional protocol: `25565/tcp` (TCP only), `19132/udp` (UDP only), or a bare `25565` (both, or whichever the container actually publishes) — e.g. `tidewaiter.ports=25565,19132/udp`.
 
-## What a recreate keeps
+## What a recreate keeps: everything, except…
 
-A swap recreates the container under the same name from what `docker inspect`
-says of it, on the new image. Everything that is the container's own comes
-across: its env and labels, mounts with their options (a bind's propagation and
-`--mount` bind options, a volume's `nocopy` and subpath, a tmpfs's size, mode and
-options, image mounts), `--tmpfs`, port bindings (host address included),
-networks with their aliases, static and link-local addresses, MAC address and
-gateway priority, restart policy, caps, devices, sysctls, extra hosts,
-annotations, umask, user, working dir, stop signal and timeout, and any command,
-entrypoint or healthcheck it was given, start interval included.
+A swap recreates the container under the same name, on the new image, from
+what `docker inspect` says of it - passed back to Docker as Docker wrote it,
+in the same API version, so every setting comes across: env and labels,
+mounts of every kind and their options, `--tmpfs`, port bindings (host
+address included), networks with their aliases, static addresses and MAC
+address, restart policy, caps, devices, sysctls, resource limits, ulimits,
+logging, security options, DNS, `--init`, shm size, annotations, user, working
+dir, stop signal and timeout, command, entrypoint and healthcheck - and
+whatever Docker adds next, with nothing in Tidewaiter to update for it.
 
-A setting newer than the Engine API version Tidewaiter settled on with the
-daemon is left out of the recreate rather than sent to a Docker that doesn't
-know it; in practice the Docker that let you set it speaks a version that
-carries it. A MAC address is kept on the container's own network wherever it
-was asked for, and on Docker 29 and newer, which say only the address in use
-and pick a random one, every network's address is kept, the ones connected
-after the create from API 1.54, the first that applies it there.
+Except, on purpose:
+
+- **What came from the old image** (below): env, labels, command, entrypoint,
+  exposed ports, `VOLUME`s, user, working dir, stop signal and healthcheck
+  fields that equal the old image's are left to the new image.
+- **A default hostname.** Docker names a container after its own short id;
+  the new container gets its own. A hostname you gave it is kept.
+- **Docker's default masked and read-only paths**, which it fills in at
+  create, are left for it to fill in again, so a newer Docker's defaults
+  apply. `--security-opt systempaths=unconfined` is kept.
+- **Where each network attachment is now** - its IP, gateway, endpoint id -
+  is given afresh; what you asked for (static address, aliases, gateway
+  priority, driver options) is kept.
+- **A MAC address** is kept on the container's own network wherever it was
+  asked for. On Docker 29 and newer, which say only the address in use and
+  pick a random one, every network's is kept, a network connected after the
+  create from API 1.54, the first that applies it there. Older Dockers derive
+  an unasked-for MAC from the IP, so one is never pinned there.
+- **A hostname in `container:` network mode**, which is the other
+  container's, and which Docker refuses on create.
+
+A host port Docker picked (`-p 80`, or a range) is picked again: Docker never
+records which it chose in the container's config, so it is not carried.
 
 What it only had from its *old image* does not: inspect shows a container's
 config already merged with its image's, so anything equal to the old image's
 default is left out and Docker fills it from the new image, exactly as a fresh
 `docker run` on the new image would. So a new image's changed `CMD`,
-`ENTRYPOINT`, `ENV`, labels, `EXPOSE`, `WORKDIR`, `USER`, `STOPSIGNAL` and
-`HEALTHCHECK` take effect. It goes entry by entry where Docker merges that way:
+`ENTRYPOINT`, `ENV`, labels, `EXPOSE`, `VOLUME`, `WORKDIR`, `USER`, `STOPSIGNAL`
+and `HEALTHCHECK` take effect. It goes entry by entry where Docker merges that way:
 an env variable or label you set keeps your value, the ones you didn't come from
 the new image, and a healthcheck you tuned (say `--health-interval 5s`) keeps
 that setting while the new image's test takes over.

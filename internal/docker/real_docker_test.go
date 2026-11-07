@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"reflect"
 	"slices"
@@ -23,12 +24,13 @@ import (
 )
 
 // These run against a real Docker, which is the only thing that can say the
-// create payload is one Docker accepts and the inspect mapping reads what
+// create body is one Docker accepts and the inspect mapping reads what
 // Docker really writes. They create containers, so they run only when asked
 // to (TIDEWAITER_DOCKER_TESTS=1), and touch nothing of anyone else's: every
-// container is named tw-e2e-*, carries only the tw-e2e.autoupdate label, and
-// is removed afterwards; images are never pulled, only tagged under
-// tw-e2e-app, which is untagged afterwards.
+// container, network and volume is named tw-e2e-*, carries only the
+// tw-e2e.autoupdate label, and is removed afterwards; images are never pulled by a test (`./run e2e`
+// pulls the two it uses first), only tagged under tw-e2e-app, which is
+// untagged afterwards.
 const e2eLabel = "tw-e2e.autoupdate"
 
 func realDocker(t *testing.T, images ...string) *Client {
@@ -75,6 +77,15 @@ func freePort(t *testing.T) int {
 	return listener.Addr().(*net.TCPAddr).Port
 }
 
+// createTyped creates a container from a spec built in Go, to start a test
+// from: Tidewaiter itself only ever recreates from an inspect.
+func createTyped(t *testing.T, client *Client, spec model.ContainerSpec) {
+	t.Helper()
+	if err := client.quick(t.Context(), http.MethodPost, "/containers/create", url.Values{"name": {spec.Name}}, typedPayload(spec), nil); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func e2eSpec(name, image string, hostPort int) model.ContainerSpec {
 	one := 1
 	s := spec(name)
@@ -95,15 +106,12 @@ func e2eSpec(name, image string, hostPort int) model.ContainerSpec {
 	return s
 }
 
-// Docker reads back what a recreate asked of it as the container that was
-// there.
-func TestARealRecreateIsFaithful(t *testing.T) {
+// The odds and ends a real Docker answers that are not a recreate.
+func TestARealDockerAnswersTheLookupsASwapMakes(t *testing.T) {
 	client := realDocker(t, "alpine:latest")
 	ctx := t.Context()
-	name := e2eName(t, client, "faithful")
-	if _, err := client.Create(ctx, e2eSpec(name, "alpine:latest", freePort(t))); err != nil {
-		t.Fatal(err)
-	}
+	name := e2eName(t, client, "lookups")
+	createTyped(t, client, e2eSpec(name, "alpine:latest", freePort(t)))
 	if err := client.Start(ctx, name); err != nil {
 		t.Fatal(err)
 	}
@@ -114,32 +122,6 @@ func TestARealRecreateIsFaithful(t *testing.T) {
 	if !original.Running || original.PID == 0 || original.Spec.Labels[e2eLabel] != "local" || original.Spec.Published()[0].ContainerPort != 8080 {
 		t.Fatalf("inspected %+v", original)
 	}
-
-	// Recreated from what inspect said, under another name and host port.
-	copied := e2eName(t, client, "copy")
-	again := original.Spec
-	again.Name = copied
-	again.Bindings = bound(port(freePort(t), 8080, model.TCP))
-	if _, err := client.Create(ctx, again); err != nil {
-		t.Fatal(err)
-	}
-	recreated, err := client.Inspect(ctx, copied)
-	if err != nil {
-		t.Fatal(err)
-	}
-	// Not started, so it has no runtime address yet.
-	want := again
-	for i := range want.Networks {
-		want.Networks[i].IPAddress = ""
-	}
-	got := recreated.Spec
-	for i := range got.Networks {
-		got.Networks[i].IPAddress = ""
-	}
-	if !reflect.DeepEqual(got, want) {
-		t.Errorf("recreated as\n%+v\nwant\n%+v", got, want)
-	}
-
 	if driver, err := client.NetworkDriver(ctx, "bridge"); err != nil || driver != "bridge" {
 		t.Errorf("bridge's driver: %q, %v", driver, err)
 	}
@@ -193,9 +175,7 @@ func swapReally(t *testing.T, change func(*model.ContainerSpec)) swapped {
 	created := e2eSpec(s.name, "tw-e2e-app:latest", freePort(t))
 	created.Labels[HealthTimeoutLabel] = "4"
 	change(&created)
-	if _, err := client.Create(ctx, created); err != nil {
-		t.Fatal(err)
-	}
+	createTyped(t, client, created)
 	if err := client.Start(ctx, s.name); err != nil {
 		t.Fatal(err)
 	}
@@ -275,11 +255,15 @@ func TestARealBindingWhoseHostPortDockerPicksIsReplayed(t *testing.T) {
 	for _, what := range []string{"ephemeral", "ephemeral-copy"} {
 		created := e2eSpec(e2eName(t, client, what), "alpine:latest", 0)
 		created.Bindings, created.Exposed = bindings, []string{"80/tcp", "81/tcp", "82/udp"}
-		if len(specs) > 0 {
-			created.Bindings = specs[0].Bindings
-		}
-		if _, err := client.Create(ctx, created); err != nil {
-			t.Fatal(err)
+		if len(specs) == 0 {
+			createTyped(t, client, created)
+		} else {
+			// Recreated from what inspect said of the first.
+			again := specs[0]
+			again.Name = created.Name
+			if _, err := client.Create(ctx, again); err != nil {
+				t.Fatal(err)
+			}
 		}
 		inspected, err := client.Inspect(ctx, created.Name)
 		if err != nil {

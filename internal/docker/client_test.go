@@ -136,6 +136,7 @@ func TestSpecReadsTheRestOfWhatARecreateNeeds(t *testing.T) {
 		Labels:     map[string]string{"tidewaiter.autoupdate": "registry", "com.docker.compose.project": "site"},
 		Mounts:     spec.Mounts, Bindings: spec.Bindings, Networks: spec.Networks,
 		Exposed:       []string{"80/tcp"},
+		Volumes:       []string{},
 		NetworkMode:   "bridge",
 		RestartPolicy: &model.RestartPolicy{Name: "unless-stopped"},
 		CapAdd:        []string{}, CapDrop: []string{}, Devices: []model.Device{}, ExtraHosts: []string{}, Sysctls: map[string]string{},
@@ -145,6 +146,7 @@ func TestSpecReadsTheRestOfWhatARecreateNeeds(t *testing.T) {
 			Test:     []string{"CMD-SHELL", "curl -f http://localhost/ || exit 1"},
 			Interval: 30 * time.Second, Timeout: 3 * time.Second, Retries: 3,
 		},
+		Inspected: spec.Inspected,
 	}
 	if !reflect.DeepEqual(spec, want) {
 		t.Errorf("got  %+v\nwant %+v", spec, want)
