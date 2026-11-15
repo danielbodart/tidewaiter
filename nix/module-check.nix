@@ -7,6 +7,9 @@ let
 
   system = pkgs.nixos {
     imports = [ self.nixosModules.default ];
+    # A stand-in: what is checked is what the module renders, and the
+    # release's binary exists only on a release tag (flake.nix).
+    services.tidewaiter.package = pkgs.writeShellScriptBin "tidewaiter" "";
     boot.loader.grub.enable = false;
     fileSystems."/" = {
       device = "none";
@@ -46,6 +49,9 @@ let
   # costs nothing.
   bare = pkgs.nixos {
     imports = [ self.nixosModules.default ];
+    # A stand-in: what is checked is what the module renders, and the
+    # release's binary exists only on a release tag (flake.nix).
+    services.tidewaiter.package = pkgs.writeShellScriptBin "tidewaiter" "";
     boot.loader.grub.enable = false;
     fileSystems."/" = {
       device = "none";
@@ -57,6 +63,9 @@ let
   # Both rebooting: autoUpgrade's would not wait for anyone, so it is refused.
   clash = pkgs.nixos {
     imports = [ self.nixosModules.default ];
+    # A stand-in: what is checked is what the module renders, and the
+    # release's binary exists only on a release tag (flake.nix).
+    services.tidewaiter.package = pkgs.writeShellScriptBin "tidewaiter" "";
     boot.loader.grub.enable = false;
     fileSystems."/" = {
       device = "none";

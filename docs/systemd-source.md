@@ -652,13 +652,13 @@ they are idle".
 
 ### Flake
 
-`flake.nix`, one input (`nixpkgs`, `nixos-unstable` for its
-`buildGo127Module` - see open question 6), for `x86_64-linux` and
-`aarch64-linux`, laid out as Portical's does:
+`flake.nix`, one input (`nixpkgs`, nixos-26.05; it was `nixos-unstable` for
+its `buildGo127Module` - see open question 6), for `x86_64-linux` and
+`aarch64-linux` (and, for the package, `armv7l-linux`), laid out as
+Portical's does:
 
 ```
 flake.nix
-nix/package.nix        # buildGo127Module, go test in checkPhase
 nix/module.nix         # services.tidewaiter + systemd.services.<n>.tidewaiter
 nix/module-check.nix   # evaluation-only assertions on a configuration
 nix/vm-test.nix        # the NixOS VM test (section 11)
@@ -666,20 +666,20 @@ nix/vm-test.nix        # the NixOS VM test (section 11)
 
 Outputs:
 
-- `packages.<system>.default` - the same static `go build` as `./run build`,
-  by `buildGo127Module`, with the version from `MAJOR`, `self.revCount` and
-  `self.lastModifiedDate` (the `./run` scheme with the date for the run
-  number) linked in with `-X`. godbus and gokit are vendored by
-  `vendorHash`, so the build itself fetches nothing; its source is `go.mod`,
-  `go.sum`, the `.go` files and the tests' `testdata`. `makeWrapper`
+- `packages.<system>.default` (and `.tidewaiter`) - since 2026-11-15, not a
+  build from source but the release's own static binary, the one `mise run
+  dist` built in CI, fetched by the URL and hash in `nix/release.json`. That
+  file is only on a release tag, whose commit is a child of the released
+  `master` commit (ci.yml's release job); on `master` there is no package.
+  (It was `buildGo127Module` with a `vendorHash`.) `makeWrapper`
   *suffixes* `PATH` with `nix` (nix-env, nix-store) - all it runs, as the
   conntrack table and the sockets are read over netlink - so the host's own
   come first: the module puts `config.nix.package` on the services' `path`
   rather than overriding the package. systemd and logind are only spoken to
   over the bus.
-- `checks.<system>` - `package` (whose check phase is `go test`, the tests
-  needing a bus, Docker, cgroupfs or netlink permission skipping in the
-  sandbox), `module`, `vm`.
+- `checks.<system>` - `module` (with a stand-in package, so it runs on
+  `master` too) and, where there is a package, `vm`. `go test` is `mise run
+  check`'s.
 
 - `nixosModules.default`.
 - `formatter.<system>` - `nixfmt`.
@@ -1028,6 +1028,8 @@ check phase, module, VM).
 6. **Which toolchain builds the flake.** Settled by the Go rewrite: `mise.toml`
    and the image pin Go 1.27.3, and the flake builds with nixpkgs-unstable's
    `buildGo127Module`, which refuses anything older than go.mod's `go 1.27`.
+   (Superseded: the flake now installs the release's binary, built by mise's
+   Go, and follows nixos-26.05.)
 
 7. **Unit config changes.** With `restartIfChanged = false`, a change to the
    unit's *own* definition (a new flag in `ExecStart`) waits for the next

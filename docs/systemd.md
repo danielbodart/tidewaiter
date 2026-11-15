@@ -24,7 +24,10 @@ Tidewaiter in Docker](docker.md) is simpler.
 
 ```nix
 {
-  inputs.tidewaiter.url = "github:danielbodart/tidewaiter";
+  # A release tag: its flake has the package, which is that release's own
+  # binary; master's has none.
+  inputs.tidewaiter.url = "github:danielbodart/tidewaiter/v<version>";
+  inputs.tidewaiter.inputs.nixpkgs.follows = "nixpkgs";
   # ...
   imports = [ inputs.tidewaiter.nixosModules.default ];
 
@@ -114,7 +117,7 @@ Each pass, Tidewaiter reboots (through logind, as `systemctl reboot` does) when 
 - **every managed unit and container** has been idle for its whole `idleSamples`, Docker's included, and activity read once more right before the reboot still says so;
 - **nothing is being swapped**.
 
-A window busy from start to end simply passes, and the next night's is tried the same way. What it is waiting for is in the journal (once per change) and in `tidewaiter status`. The module refuses `autoReboot` together with `autoUpgrade.allowReboot`, since the two would fight. Both the wait and the reboot are proven by the VM test (`nix build .#checks.x86_64-linux.vm`).
+A window busy from start to end simply passes, and the next night's is tried the same way. What it is waiting for is in the journal (once per change) and in `tidewaiter status`. The module refuses `autoReboot` together with `autoUpgrade.allowReboot`, since the two would fight. Both the wait and the reboot are proven by the VM test (`nix build .#checks.x86_64-linux.vm`, after `mise run dist` and `./run nix-local-release`).
 
 ## Without NixOS
 
