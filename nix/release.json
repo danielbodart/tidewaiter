@@ -1,0 +1,17 @@
+{
+  "version": "1.57.9",
+  "assets": {
+    "x86_64-linux": {
+      "url": "https://github.com/danielbodart/tidewaiter/releases/download/v1.57.9/tidewaiter-linux-x64",
+      "hash": "sha256-s5TGsft0SY0aK7Ob2zXqymY9NUQ/Nw30NaoO53h8uGI="
+    },
+    "aarch64-linux": {
+      "url": "https://github.com/danielbodart/tidewaiter/releases/download/v1.57.9/tidewaiter-linux-arm64",
+      "hash": "sha256-099J8jgXlORtFqm1ulJsZFFj39p5XxV7ovQC2GiybWU="
+    },
+    "armv7l-linux": {
+      "url": "https://github.com/danielbodart/tidewaiter/releases/download/v1.57.9/tidewaiter-linux-armv7",
+      "hash": "sha256-JhH40KxVdmgbrfIEtb77N98+WpIruxDa3AEDSsM1xIw="
+    }
+  }
+}
